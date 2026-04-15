@@ -23,7 +23,7 @@ load_dotenv()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-MONGO_URI   = "mongodb+srv://ravindraacharya0512:ZKWbloCMIzsi3xyV@cluster0.ynaiaut.mongodb.net/"
+MONGO_URI   = os.getenv("MONGODB_URL")
 DB_NAME     = "SurveyDataBase"
 JWT_SECRET  = os.getenv("JWT_SECRET")
 JWT_ALG     = "HS256"

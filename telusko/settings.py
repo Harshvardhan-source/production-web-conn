@@ -104,8 +104,8 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # MongoDB connection (update with your actual credentials)
-MONGODB_URL = "mongodb+srv://ravindraacharya0512:ZKWbloCMIzsi3xyV@cluster0.ynaiaut.mongodb.net/"
-MONGODB_URL_2 = "mongodb+srv://vickyhooda799_db_user:LgAvVKcZE7gM0ess@cluster0.kkin5ww.mongodb.net/"
+MONGODB_URL =  os.getenv("MONGODB_URL")
+MONGODB_URL_2 =  os.getenv("MONGODB_URL_2")
 # Large file upload support
 DATA_UPLOAD_MAX_MEMORY_SIZE = 104857600   # 100 MB
 FILE_UPLOAD_MAX_MEMORY_SIZE = 104857600   # 100 MB
