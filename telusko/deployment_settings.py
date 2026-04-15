@@ -1,5 +1,4 @@
 import os
-import dj_database_url
 from .settings import *
 from .settings import BASE_DIR  
 
@@ -38,8 +37,12 @@ STORAGES = {
 }
 
 DATABASES = {
-    'default': dj_database_url.config( default=os.getenv('MONGODB_URL')),
-    'second_db': dj_database_url.config(
-        default=os.getenv('MONGODB_URL_2')
-    )
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+    }
 }
+
+# MongoDB URLs (used directly by pymongo, not Django ORM)
+MONGODB_URL = os.getenv('MONGODB_URL')
+MONGODB_URL_2 = os.getenv('MONGODB_URL_2')
