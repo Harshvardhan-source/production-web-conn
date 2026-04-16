@@ -47,3 +47,4 @@ urlpatterns = [
     # Wards
     path('wards/',                   views.api_wards,              name='api_wards'),
 ]
+

@@ -346,6 +346,14 @@ def _registration_analytics(db=None):
                     {'$group': {'_id': '$House No'}},
                     {'$count': 'n'},
                 ],
+
+                # Houses with more than 15 members (constituency-level)
+                'large_families': [
+                    {'$match': {'House No': {'$exists': True, '$ne': None}}},
+                    {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
+                    {'$match': {'count': {'$gt': 15}}},
+                    {'$count': 'n'},
+                ],
             }
         }
     ]
@@ -370,6 +378,7 @@ def _registration_analytics(db=None):
     # ── Unpack voter results ──────────────────────────────────────────────────
     total_voters  = v_result['total'][0]['n'] if v_result['total'] else 0
     unique_houses = v_result['house_count'][0]['n'] if v_result['house_count'] else 0
+    large_family_count = v_result['large_families'][0]['n'] if v_result.get('large_families') else 0
  
     gender_map_v = {g['_id']: g['n'] for g in v_result['genders']}
     voter_male   = gender_map_v.get('M', 0)
@@ -390,16 +399,17 @@ def _registration_analytics(db=None):
             percentages[WARD_NAMES[wn]] = round(count / total * 100, 1)
  
     result = {
-        'totalReg':      total_reg,
-        'totalVoters':   total_voters,
-        'houseCount':    unique_houses,
-        'regMale':       reg_male,
-        'regFemale':     reg_female,
-        'voterMale':     voter_male,
-        'voterFemale':   voter_female,
-        'regReligion':   reg_religion,
-        'voterReligion': voter_religion,
-        'wardCoverage':  percentages,
+        'totalReg':        total_reg,
+        'totalVoters':     total_voters,
+        'houseCount':      unique_houses,
+        'largeFamilyCount': large_family_count,
+        'regMale':         reg_male,
+        'regFemale':       reg_female,
+        'voterMale':       voter_male,
+        'voterFemale':     voter_female,
+        'regReligion':     reg_religion,
+        'voterReligion':   voter_religion,
+        'wardCoverage':    percentages,
     }
  
     # ── Store in cache ────────────────────────────────────────────────────────
@@ -502,37 +512,101 @@ def api_ward_dashboard(request):
         rmap        = {r['_id']: r['n'] for r in s_res['religions']}
         reg_religion= {r: rmap.get(r, 0) for r in religions}
 
-        # ── 3. Coverage ───────────────────────────────────────────────────────
+        # ── 3. Large families in this ward from 2025 voter list ──────────────
+        WARD_BOOTHS = {
+            "ALAPE NORTH": [44,189,191,190,192,197,45],
+            "ALAPE SOUTH": [188,187,186,185,184,209,210],
+            "ATHAVARA": [152,151,242,243,221,222,153],
+            "BAJAL": [202,201,203,204,206,205,207,208],
+            "BEJAI": [15,16,18,19,23,21,20],
+            "BENDOOR": [162,163,134,136,129,167],
+            "BENGRE": [94,95,96,99,97,100,98,101,103,102],
+            "BOLAR": [237,238,236,230,231,225],
+            "BOLOOR": [93,92,91,82,79,78],
+            "BUNDER": [115,116,117,118,112,119],
+            "CENTRAL": [120,121,124,123,122],
+            "CONTONMENT": [150,137,145,146,141],
+            "COURT": [143,127,126,125,142],
+            "DEREBAIL NAIRUTHYA": [4,90,89,86,85,87,88,10],
+            "DEREBAIL SOUTH": [17,11,12,8,9,14,13],
+            "DEREBAIL WEST": [5,1,2,3,7,6],
+            "DONGARAKERY": [114,73,74,111,108,113,71],
+            "FALNIR": [159,161,160,158,168,169,171,170],
+            "HOIGE BAZAR": [239,235,232,229,233],
+            "JAPPIMOGAR": [213,217,214,218,212,211,215,216,244],
+            "JEPPU": [240,219,220,241,156,157,155,154],
+            "KADRI NORTH": [62,63,30,27,28,29],
+            "KADRI SOUTH": [59,61,60,57],
+            "KAMBALA": [69,68,67,66,70],
+            "KANKANADY": [176,175,182,181,177,178,179,180],
+            "KANNUR": [193,198,195,199,196,200,194],
+            "KODIALBAIL": [65,64,26,24,25,22],
+            "KUDROLI": [107,106,109,110,104,105],
+            "MANGALADEVI": [147,228,227,226,223,224],
+            "MANNAGDDA": [77,76,80,81,83,84,72,75],
+            "MAROLI": [46,47,48,50,52,49,51],
+            "MILAGRESS": [140,138,139,164,165,166],
+            "PADAV CENTRAL": [35,34,38,41,39,43,42],
+            "PADAV-EAST": [37,36,40],
+            "PADAV-WEST": [33,32,56,53,54,31,55],
+            "PORT": [148,149,144,234],
+            "SHIVABAGH": [128,130,58,135,131],
+            "VALENCIA": [173,172,183,174,132,133],
+        }
+
+        # Find booths for this ward (match ward_name case-insensitively)
+        ward_name_upper = ward_name.upper().strip()
+        ward_booths_list = []
+        for wname, booths in WARD_BOOTHS.items():
+            if wname.upper() == ward_name_upper:
+                ward_booths_list = booths
+                break
+
+        # Convert booth ints to strings for matching (2025 list may store as string)
+        booth_strs = [str(b) for b in ward_booths_list]
+        booth_ints = ward_booths_list
+
+        large_family_count = 0
+        if ward_booths_list:
+            lf_pipeline = [
+                {'$match': {'Part No': {'$in': booth_strs + [str(b) for b in booth_ints]}}},
+                {'$match': {'House No': {'$exists': True, '$ne': None}}},
+                {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
+                {'$match': {'count': {'$gt': 15}}},
+                {'$count': 'n'},
+            ]
+            lf_result = list(db['2025'].aggregate(lf_pipeline))
+            large_family_count = lf_result[0]['n'] if lf_result else 0
+
+        # ── 4. Coverage ───────────────────────────────────────────────────────
         denom        = total_voters or 1
         coverage_pct = round(total_reg / denom * 100, 1)
 
         result = {
-            'wardName':       ward_name,
-            'wardNumber':     ward,
-            'districtId':     district_id,
-            'constituencyId': const_id,
-            # From WardReference (authoritative voter counts)
-            'totalVoters':    total_voters,
-            'totalMale':      total_male,
-            'totalFemale':    total_female,
-            'totalTrans':     total_trans,
-            'totalHindu':     total_hindu,
-            'totalMuslim':    total_muslim,
-            'totalChristian': total_chr,
-            # Religion pie for chart
+            'wardName':         ward_name,
+            'wardNumber':       ward,
+            'districtId':       district_id,
+            'constituencyId':   const_id,
+            'totalVoters':      total_voters,
+            'totalMale':        total_male,
+            'totalFemale':      total_female,
+            'totalTrans':       total_trans,
+            'totalHindu':       total_hindu,
+            'totalMuslim':      total_muslim,
+            'totalChristian':   total_chr,
             'voterReligion': {
-                'Hindu':    total_hindu,
-                'Muslim':   total_muslim,
-                'Christian':total_chr,
+                'Hindu':     total_hindu,
+                'Muslim':    total_muslim,
+                'Christian': total_chr,
             },
-            # From SurveyRecords
-            'totalReg':       total_reg,
-            'regMale':        reg_male,
-            'regFemale':      reg_female,
-            'regReligion':    reg_religion,
-            'houseCount':     house_count,
-            'wardCoverage':   {ward_name: coverage_pct},
-            'coveragePct':    coverage_pct,
+            'totalReg':         total_reg,
+            'regMale':          reg_male,
+            'regFemale':        reg_female,
+            'regReligion':      reg_religion,
+            'houseCount':       house_count,
+            'largeFamilyCount': large_family_count,
+            'wardCoverage':     {ward_name: coverage_pct},
+            'coveragePct':      coverage_pct,
         }
 
         _ward_dash_cache[ward] = {'data': result, 'ts': _t.time()}
@@ -2712,4 +2786,3 @@ def api_me(request):
     if user:
         return JsonResponse({'loggedIn': True, 'username': user['username'], 'email': user['email']})
     return JsonResponse({'loggedIn': False}, status=401)
-
