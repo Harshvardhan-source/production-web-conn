@@ -617,6 +617,162 @@ def api_ward_dashboard(request):
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
 
 
+
+
+_large_families_cache = {}   # { 'data': [...], 'ts': float }
+_LF_CACHE_TTL = 300           # 5 minutes
+ 
+@require_http_methods(['GET'])
+def api_large_families(request):
+    """
+    GET /api/large-families/
+    Returns every house with >15 members, grouped by ward.
+ 
+    Response shape:
+    {
+      "success": true,
+      "total": 42,
+      "byWard": [
+        {
+          "wardNumber": "27",
+          "wardName": "Boloor",
+          "count": 5,
+          "houses": [
+            { "houseNo": "12A", "memberCount": 18, "booth": "79" },
+            ...
+          ]
+        },
+        ...
+      ]
+    }
+    """
+    import time as _t
+    global _large_families_cache
+ 
+    # ── Cache hit ─────────────────────────────────────────────────────────────
+    cached = _large_families_cache.get('data')
+    if cached and (_t.time() - _large_families_cache.get('ts', 0)) < _LF_CACHE_TTL:
+        return JsonResponse({'success': True, 'total': _large_families_cache['total'], 'byWard': cached})
+ 
+    try:
+        db = get_db()
+ 
+        WARD_NAMES_LOCAL = {
+            '21':'Padav West','24':'Derebail South','25':'Derebail North',
+            '26':'Derebail Nairuthya','27':'Boloor','28':'Mannagudda',
+            '29':'Kambala','30':'Kodialbail','31':'Bejai',
+            '32':'Kadri North','33':'Kadri South','34':'Shivabagh',
+            '35':'Padav Central','36':'Padav East','37':'Maroli',
+            '38':'Bendoor','39':'Falnir','40':'Court',
+            '41':'Central','42':'Dongarakery','43':'Kudroli',
+            '44':'Bunder','45':'Port','46':'Contonment',
+            '47':'Millagres','48':'Valancia','49':'Kankanady',
+            '50':'Alape South','51':'Alape North','52':'Kannur',
+            '53':'Bajal','54':'Jappimogaru','55':'Attavara',
+            '56':'Mangaladevi','57':'Hoige Bazar','58':'Bolar',
+            '59':'Jeppu','60':'Bengre',
+        }
+ 
+        # Build booth → ward-number lookup from WardReference booths mapping
+        # (same WARD_BOOTHS_MAP used in Dashboard.jsx)
+        WARD_BOOTHS = {
+            "21": [33,32,56,53,54,31,55],       # PADAV-WEST → 21
+            "24": [17,11,12,8,9,14,13],          # DEREBAIL SOUTH
+            "25": [5,1,2,3,7,6],                 # DEREBAIL NORTH / WEST
+            "26": [4,90,89,86,85,87,88,10],      # DEREBAIL NAIRUTHYA
+            "27": [93,92,91,82,79,78],           # BOLOOR
+            "28": [77,76,80,81,83,84,72,75],     # MANNAGUDDA
+            "29": [69,68,67,66,70],              # KAMBALA
+            "30": [65,64,26,24,25,22],           # KODIALBAIL
+            "31": [15,16,18,19,23,21,20],        # BEJAI
+            "32": [62,63,30,27,28,29],           # KADRI NORTH
+            "33": [59,61,60,57],                 # KADRI SOUTH
+            "34": [128,130,58,135,131],          # SHIVABAGH
+            "35": [35,34,38,41,39,43,42],        # PADAV CENTRAL
+            "36": [37,36,40],                    # PADAV EAST
+            "37": [46,47,48,50,52,49,51],        # MAROLI
+            "38": [162,163,134,136,129,167],     # BENDOOR
+            "39": [159,161,160,158,168,169,171,170], # FALNIR
+            "40": [143,127,126,125,142],         # COURT
+            "41": [120,121,124,123,122],         # CENTRAL
+            "42": [114,73,74,111,108,113,71],    # DONGARAKERY
+            "43": [107,106,109,110,104,105],     # KUDROLI
+            "44": [115,116,117,118,112,119],     # BUNDER
+            "45": [148,149,144,234],             # PORT
+            "46": [150,137,145,146,141],         # CONTONMENT
+            "47": [140,138,139,164,165,166],     # MILAGRESS
+            "48": [173,172,183,174,132,133],     # VALENCIA
+            "49": [176,175,182,181,177,178,179,180], # KANKANADY
+            "50": [188,187,186,185,184,209,210], # ALAPE SOUTH
+            "51": [44,189,191,190,192,197,45],   # ALAPE NORTH
+            "52": [193,198,195,199,196,200,194], # KANNUR
+            "53": [202,201,203,204,206,205,207,208], # BAJAL
+            "54": [213,217,214,218,212,211,215,216,244], # JAPPIMOGAR
+            "55": [152,151,242,243,221,222,153], # ATHAVARA
+            "56": [147,228,227,226,223,224],     # MANGALADEVI
+            "57": [239,235,232,229,233],         # HOIGE BAZAR
+            "58": [237,238,236,230,231,225],     # BOLAR
+            "59": [240,219,220,241,156,157,155,154], # JEPPU
+            "60": [94,95,96,99,97,100,98,101,103,102], # BENGRE
+        }
+ 
+        # Invert: booth_str → ward_number
+        booth_to_ward = {}
+        for ward_no, booths in WARD_BOOTHS.items():
+            for b in booths:
+                booth_to_ward[str(b)] = ward_no
+ 
+        # Single aggregation: group by house, keep booth, filter >15 members
+        pipeline = [
+            {'$match': {'House No': {'$exists': True, '$ne': None, '$ne': ''}}},
+            {'$group': {
+                '_id': '$House No',
+                'count': {'$sum': 1},
+                # Grab one Part No per house to determine ward
+                'booth': {'$first': '$Part No'},
+            }},
+            {'$match': {'count': {'$gt': 15}}},
+            {'$sort': {'count': -1}},
+        ]
+ 
+        raw = list(db['2025'].aggregate(pipeline))
+ 
+        # Group results by ward
+        ward_map = {}   # ward_number → { wardName, houses: [] }
+        for doc in raw:
+            booth = str(doc.get('booth', '') or '')
+            ward_no = booth_to_ward.get(booth, 'Unknown')
+            if ward_no not in ward_map:
+                ward_map[ward_no] = {
+                    'wardNumber': ward_no,
+                    'wardName': WARD_NAMES_LOCAL.get(ward_no, f'Ward {ward_no}'),
+                    'houses': [],
+                }
+            ward_map[ward_no]['houses'].append({
+                'houseNo': doc['_id'],
+                'memberCount': doc['count'],
+                'booth': booth,
+            })
+ 
+        by_ward = sorted(
+            [{'wardNumber': v['wardNumber'], 'wardName': v['wardName'],
+              'count': len(v['houses']), 'houses': v['houses']}
+             for v in ward_map.values()],
+            key=lambda x: -x['count']
+        )
+ 
+        total = sum(w['count'] for w in by_ward)
+        _large_families_cache['data'] = by_ward
+        _large_families_cache['total'] = total
+        _large_families_cache['ts'] = _t.time()
+ 
+        return JsonResponse({'success': True, 'total': total, 'byWard': by_ward})
+ 
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+ 
+
 # ─── SURVEY ───────────────────────────────────────────────────────────────────
 
 @require_http_methods(['GET'])
