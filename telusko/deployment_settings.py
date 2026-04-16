@@ -76,3 +76,7 @@ DATABASES = {
 # ── MongoDB (from Render env vars) ────────────────────────────────────────────
 MONGODB_URL   = os.getenv('MONGODB_URL')
 MONGODB_URL_2 = os.getenv('MONGODB_URL_2')
+
+
+GCS_BUCKET_NAME = os.getenv('GCS_BUCKET_NAME')
+GCS_CREDENTIALS_JSON = os.getenv('GCS_CREDENTIALS_JSON')

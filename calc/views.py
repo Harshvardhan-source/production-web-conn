@@ -967,6 +967,46 @@ def api_save_future_voters(request):
 
 # ─── DECEASED ─────────────────────────────────────────────────────────────────
 
+# ── GCS helper — uploads a file-like object, returns public URL ───────────────
+# Reads credentials from env vars set on Render:
+#   GCS_BUCKET_NAME          e.g. "your-project.appspot.com"
+#   GOOGLE_APPLICATION_CREDENTIALS_JSON  — full JSON of the service account key
+#                                           (paste the entire JSON as one line)
+
+def _upload_to_gcs(file_obj, destination_blob_name):
+    """
+    Upload a Django UploadedFile / InMemoryUploadedFile to GCS.
+    Returns the public HTTPS URL, or raises on error.
+    """
+    import os, json as _json
+    from google.cloud import storage as _gcs
+    from google.oauth2 import service_account as _sa
+
+    bucket_name = os.environ.get('GCS_BUCKET_NAME', '')
+    creds_json  = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON', '')
+
+    if not bucket_name:
+        raise ValueError('GCS_BUCKET_NAME env var is not set')
+    if not creds_json:
+        raise ValueError('GOOGLE_APPLICATION_CREDENTIALS_JSON env var is not set')
+
+    creds_dict  = _json.loads(creds_json)
+    credentials = _sa.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=['https://www.googleapis.com/auth/cloud-platform'],
+    )
+    client = _gcs.Client(credentials=credentials)
+    bucket = client.bucket(bucket_name)
+    blob   = bucket.blob(destination_blob_name)
+
+    # Reset read position in case Django already read part of the file
+    file_obj.seek(0)
+    blob.upload_from_file(file_obj, content_type=file_obj.content_type or 'application/octet-stream')
+    blob.make_public()
+
+    return blob.public_url
+
+
 @csrf_exempt
 @require_http_methods(['POST'])
 def api_save_deceased(request):
@@ -981,42 +1021,46 @@ def api_save_deceased(request):
         return JsonResponse({'success': False, 'message': 'No deceased data provided.'}, status=400)
 
     import os, uuid
-    BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    UPLOAD_DIR = os.path.join(BASE_DIR, 'deceased_certificates')
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
 
     records = []
     for rec in deceased:
         if not rec.get('name', '').strip():
             continue
 
-        saved_filename = None
-        file_index     = rec.get('fileIndex')
+        certificate_url  = None   # GCS public URL — stored in Mongo
+        certificate_name = None   # original filename — stored for reference
 
+        file_index = rec.get('fileIndex')
         if file_index is not None:
             file_key = f'cert_{file_index}'
             uploaded = request.FILES.get(file_key)
             if uploaded:
-                ext            = os.path.splitext(uploaded.name)[1].lower()
-                saved_filename = f"{uuid.uuid4().hex}{ext}"
-                dest           = os.path.join(UPLOAD_DIR, saved_filename)
-                with open(dest, 'wb') as f:
-                    for chunk in uploaded.chunks():
-                        f.write(chunk)
-                print(f"[api_save_deceased] Saved certificate file: {saved_filename}")
+                ext  = os.path.splitext(uploaded.name)[1].lower() or '.jpg'
+                uid  = uuid.uuid4().hex
+                # GCS path: deceased_certificates/<uid><ext>
+                blob_name = f"deceased_certificates/{uid}{ext}"
+                try:
+                    certificate_url  = _upload_to_gcs(uploaded, blob_name)
+                    certificate_name = uploaded.name
+                    print(f"[api_save_deceased] Uploaded to GCS: {certificate_url}")
+                except Exception as gcs_err:
+                    # Non-fatal — save the record even if upload fails, log the error
+                    print(f"[api_save_deceased] GCS upload failed: {gcs_err}")
+                    traceback.print_exc()
 
         records.append({
-            'name':              rec.get('name', '').strip(),
-            'voterid':           rec.get('voterid', ''),
-            'gender':            rec.get('gender', ''),
-            'ageAtDeath':        rec.get('ageAtDeath', ''),
-            'dob':               rec.get('dob', ''),
-            'dateOfDeath':       rec.get('dateOfDeath', ''),
-            'deathCertificate':  rec.get('deathCertificate', ''),
-            'certificateFile':   saved_filename,
-            'houseNumber':       rec.get('houseNumber', ''),
-            'address':           rec.get('address', ''),
-            'Time_stamp':        datetime.utcnow(),
+            'name':                rec.get('name', '').strip(),
+            'voterid':             rec.get('voterid', ''),
+            'gender':              rec.get('gender', ''),
+            'ageAtDeath':          rec.get('ageAtDeath', ''),
+            'dob':                 rec.get('dob', ''),
+            'dateOfDeath':         rec.get('dateOfDeath', ''),
+            'deathCertificate':    rec.get('deathCertificate', ''),  # certificate number
+            'certificateFileUrl':  certificate_url,    # ← GCS public URL
+            'certificateFileName': certificate_name,   # ← original filename
+            'houseNumber':         rec.get('houseNumber', ''),
+            'address':             rec.get('address', ''),
+            'Time_stamp':          datetime.utcnow(),
         })
 
     if not records:
@@ -1025,7 +1069,10 @@ def api_save_deceased(request):
     db = get_survey_db()
     db['Deceased'].insert_many(records)
     print(f"[api_save_deceased] Saved {len(records)} deceased record(s).")
-    return JsonResponse({'success': True, 'saved': len(records)})
+
+    # Return the URLs so the frontend can confirm uploads succeeded
+    urls = [r['certificateFileUrl'] for r in records if r['certificateFileUrl']]
+    return JsonResponse({'success': True, 'saved': len(records), 'certificateUrls': urls})
 
 
 # ─── SCHEMES ──────────────────────────────────────────────────────────────────
