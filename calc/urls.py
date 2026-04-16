@@ -43,8 +43,8 @@ urlpatterns = [
     
     path('update-voter/',  views.api_update_voter,  name='api_update_voter'),
     path('update-survey/', views.api_update_survey, name='api_update_survey'),
+    path('large-families/', views.api_large_families, name='api_large_families'),
     
     # Wards
     path('wards/',                   views.api_wards,              name='api_wards'),
 ]
-
