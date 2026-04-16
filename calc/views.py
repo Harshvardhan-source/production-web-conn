@@ -1280,15 +1280,16 @@ def _fuzzy_match_from_candidates(candidates, name_field, rel_field,
 _XLSX_CACHE_LOCK   = threading.Lock()
 _XLSX_DF           = None   # pd.DataFrame, set on first load
 _XLSX_COLS         = {}     # {role: actual_col_name}
-_XLSX_HOUSE_IDX    = {}     # {house_upper: [row_indices]}
+_XLSX_HOUSE_IDX    = {} 
 
+# {house_upper: [row_indices]}
 def _get_xlsx():
     """Load and cache the 2002 Excel file. Thread-safe. Returns (df, cols, house_idx)."""
     global _XLSX_DF, _XLSX_COLS, _XLSX_HOUSE_IDX
     if _XLSX_DF is not None:
         return _XLSX_DF, _XLSX_COLS, _XLSX_HOUSE_IDX
     with _XLSX_CACHE_LOCK:
-        if _XLSX_DF is not None:          # double-check after acquiring lock
+        if _XLSX_DF is not None:
             return _XLSX_DF, _XLSX_COLS, _XLSX_HOUSE_IDX
         import os as _ose
         path = _ose.path.join(
@@ -1307,7 +1308,6 @@ def _get_xlsx():
                 'gender': 'Gender' if 'Gender' in df.columns else None,
                 'age':    'Age'    if 'Age'    in df.columns else None,
             }
-            # Build house index once — O(n) build, O(1) lookups forever after
             hidx = {}
             if cols['house']:
                 for i, v in enumerate(df[cols['house']]):
@@ -1322,6 +1322,8 @@ def _get_xlsx():
             return None, {}, {}
 
 
+# ── Pre-load Excel at Django startup — prevents gunicorn timeout on first request
+threading.Thread(target=_get_xlsx, daemon=True).start()   # ← ADD THIS LINE
 # ── Lookup helpers ────────────────────────────────────────────────────────────
 
 def _find_voter_in_2025(col, voterid, name, house, relation=''):
