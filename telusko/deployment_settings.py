@@ -46,3 +46,14 @@ DATABASES = {
 # MongoDB URLs (used directly by pymongo, not Django ORM)
 MONGODB_URL = os.getenv('MONGODB_URL')
 MONGODB_URL_2 = os.getenv('MONGODB_URL_2')
+
+CORS_ALLOWED_ORIGINS = [
+    'https://frontend-production-web.onrender.com',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+]
+CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_HEADERS = [
+    'accept', 'accept-encoding', 'authorization', 'content-type',
+    'dnt', 'origin', 'user-agent', 'x-csrftoken', 'x-requested-with',
+]
