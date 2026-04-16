@@ -11,12 +11,13 @@ urlpatterns = [
 
     # Dashboard
     path('dashboard/',               views.api_dashboard,          name='api_dashboard'),
+    path('ward-dashboard/',          views.api_ward_dashboard,     name='api_ward_dashboard'),  # ← ADDED
 
     # Survey
     path('serial-number/',           views.api_serial_number,      name='api_serial_number'),
     path('save-survey/',             views.api_save_survey,        name='api_save_survey'),
-    path('save-future-voters/',      views.api_save_future_voters,   name='api_save_future_voters'),
-    path('save-deceased/',           views.api_save_deceased,        name='api_save_deceased'),
+    path('save-future-voters/',      views.api_save_future_voters, name='api_save_future_voters'),
+    path('save-deceased/',           views.api_save_deceased,      name='api_save_deceased'),
 
     # Schemes
     path('scheme-voter-list/',       views.api_scheme_voter_list,  name='api_scheme_voter_list'),
@@ -25,6 +26,8 @@ urlpatterns = [
     # Data
     path('data/',                    views.api_data_view,          name='api_data_view'),
     path('upload-voter-list/',       views.api_upload_voter_list,  name='api_upload_voter_list'),
+    path('update-voter/',            views.api_update_voter,       name='api_update_voter'),
+    path('update-survey/',           views.api_update_survey,      name='api_update_survey'),
 
     # Voters
     path('voters/',                  views.api_voter_search,       name='api_voter_search'),
@@ -37,12 +40,7 @@ urlpatterns = [
     path('sir-bulk/',                views.api_sir_bulk,           name='api_sir_bulk'),
     path('sir/records/',             views.api_sir_records,        name='api_sir_records'),
     path('sir/stats/',               views.api_sir_stats,          name='api_sir_stats'),
-    
-    # Add these two lines to api/urls.py urlpatterns list:
-    
-    path('update-voter/',  views.api_update_voter,  name='api_update_voter'),
-    path('update-survey/', views.api_update_survey, name='api_update_survey'),
-    
+
     # Wards
     path('wards/',                   views.api_wards,              name='api_wards'),
 ]
