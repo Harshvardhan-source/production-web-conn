@@ -11,6 +11,7 @@ urlpatterns = [
 
     # Dashboard
     path('dashboard/',               views.api_dashboard,          name='api_dashboard'),
+    path('ward-dashboard/',          views.api_ward_dashboard,     name='api_ward_dashboard'),
 
     # Survey
     path('serial-number/',           views.api_serial_number,      name='api_serial_number'),

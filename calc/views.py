@@ -413,6 +413,136 @@ def api_dashboard(request):
     stats = _registration_analytics(db)
     return JsonResponse({'success': True, **stats})
 
+
+# ─── WARD DASHBOARD ───────────────────────────────────────────────────────────
+# GET /api/ward-dashboard/?ward=<number>
+# Reads WardReference collection directly — totalCount, totalMale, totalFemale,
+# totalTrans, totalHindu, totalMuslim, totalChristian, districtId, constituencyId
+
+_ward_dash_cache = {}   # { ward_str: {'data': {...}, 'ts': float} }
+_WARD_CACHE_TTL  = 300  # 5 minutes
+
+
+@require_http_methods(['GET'])
+def api_ward_dashboard(request):
+    import time as _t
+    ward = request.GET.get('ward', '').strip()
+    if not ward:
+        return JsonResponse({'success': False, 'message': 'ward parameter required'}, status=400)
+
+    # Cache hit
+    cached = _ward_dash_cache.get(ward)
+    if cached and (_t.time() - cached['ts']) < _WARD_CACHE_TTL:
+        return JsonResponse({'success': True, **cached['data']})
+
+    try:
+        db       = get_db()
+        ward_int = int(ward) if ward.isdigit() else None
+
+        # ── 1. WardReference — primary source of voter demographic totals ────
+        ref = db['WardReference'].find_one(
+            {'number': ward_int} if ward_int is not None else {'number': ward}
+        ) or {}
+
+        WARD_NAMES_LOCAL = {
+            '21':'Padav West','24':'Derebail South','25':'Derebail North',
+            '26':'Derebail Nairuthya','27':'Boloor','28':'Mannagudda',
+            '29':'Kambala','30':'Kodialbail','31':'Bejai',
+            '32':'Kadri North','33':'Kadri South','34':'Shivabagh',
+            '35':'Padav Central','36':'Padav East','37':'Maroli',
+            '38':'Bendoor','39':'Falnir','40':'Court',
+            '41':'Central','42':'Dongarakery','43':'Kudroli',
+            '44':'Bunder','45':'Port','46':'Contonment',
+            '47':'Millagres','48':'Valancia','49':'Kankanady',
+            '50':'Alape South','51':'Alape North','52':'Kannur',
+            '53':'Bajal','54':'Jappimogaru','55':'Attavara',
+            '56':'Mangaladevi','57':'Hoige Bazar','58':'Bolar',
+            '59':'Jeppu','60':'Bengre',
+        }
+
+        ward_name    = ref.get('name') or WARD_NAMES_LOCAL.get(ward, f'Ward {ward}')
+        district_id  = ref.get('districtId')
+        const_id     = ref.get('constituencyId')
+        total_voters = ref.get('totalCount',    0) or 0
+        total_male   = ref.get('totalMale',     0) or 0
+        total_female = ref.get('totalFemale',   0) or 0
+        total_trans  = ref.get('totalTrans',    0) or 0
+        total_hindu  = ref.get('totalHindu',    0) or 0
+        total_muslim = ref.get('totalMuslim',   0) or 0
+        total_chr    = ref.get('totalChristian',0) or 0
+
+        # ── 2. SurveyRecords — how many surveyed for this ward ────────────────
+        survey_db    = get_survey_db()
+        ward_filters = [{'wardNumber': ward}]
+        if ward_int is not None:
+            ward_filters.append({'wardNumber': ward_int})
+
+        pipeline = [
+            {'$match': {'$or': ward_filters}},
+            {'$facet': {
+                'total':     [{'$count': 'n'}],
+                'genders':   [{'$group': {'_id': '$gender',   'n': {'$sum': 1}}}],
+                'religions': [{'$group': {'_id': '$religion', 'n': {'$sum': 1}}}],
+                'houses':    [
+                    {'$match': {'houseNumber': {'$exists': True, '$ne': None, '$ne': ''}}},
+                    {'$group': {'_id': '$houseNumber'}},
+                    {'$count': 'n'},
+                ],
+            }}
+        ]
+        s_res       = list(survey_db['SurveyRecords'].aggregate(pipeline))[0]
+        total_reg   = s_res['total'][0]['n']  if s_res['total']  else 0
+        house_count = s_res['houses'][0]['n'] if s_res['houses'] else 0
+
+        gmap        = {g['_id']: g['n'] for g in s_res['genders']}
+        reg_male    = gmap.get('Male',   0)
+        reg_female  = gmap.get('Female', 0)
+
+        religions   = ['Hindu', 'Muslim', 'Christian', 'Jain', 'Buddhist', 'Sikh']
+        rmap        = {r['_id']: r['n'] for r in s_res['religions']}
+        reg_religion= {r: rmap.get(r, 0) for r in religions}
+
+        # ── 3. Coverage ───────────────────────────────────────────────────────
+        denom        = total_voters or 1
+        coverage_pct = round(total_reg / denom * 100, 1)
+
+        result = {
+            'wardName':       ward_name,
+            'wardNumber':     ward,
+            'districtId':     district_id,
+            'constituencyId': const_id,
+            # From WardReference (authoritative voter counts)
+            'totalVoters':    total_voters,
+            'totalMale':      total_male,
+            'totalFemale':    total_female,
+            'totalTrans':     total_trans,
+            'totalHindu':     total_hindu,
+            'totalMuslim':    total_muslim,
+            'totalChristian': total_chr,
+            # Religion pie for chart
+            'voterReligion': {
+                'Hindu':    total_hindu,
+                'Muslim':   total_muslim,
+                'Christian':total_chr,
+            },
+            # From SurveyRecords
+            'totalReg':       total_reg,
+            'regMale':        reg_male,
+            'regFemale':      reg_female,
+            'regReligion':    reg_religion,
+            'houseCount':     house_count,
+            'wardCoverage':   {ward_name: coverage_pct},
+            'coveragePct':    coverage_pct,
+        }
+
+        _ward_dash_cache[ward] = {'data': result, 'ts': _t.time()}
+        return JsonResponse({'success': True, **result})
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+
 # ─── SURVEY ───────────────────────────────────────────────────────────────────
 
 @require_http_methods(['GET'])
@@ -2582,3 +2712,4 @@ def api_me(request):
     if user:
         return JsonResponse({'loggedIn': True, 'username': user['username'], 'email': user['email']})
     return JsonResponse({'loggedIn': False}, status=401)
+
