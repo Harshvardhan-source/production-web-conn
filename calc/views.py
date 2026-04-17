@@ -1481,16 +1481,17 @@ def api_house_search(request):
             continue
         vid = str(d.get('Epic NO', '')).strip()
         member = {
-            'name':     str(d.get('Name', '')).strip(),
-            'relation': str(d.get('Relation Name', '')).strip(),
-            'voterid':  vid,
-            'gender':   str(d.get('Gender', '')),
-            'age':      d.get('Age', ''),
-            'booth':    str(d.get('Booth No', '')),
-            'ward':     str(d.get('Part No', '')),
-            'house_no': hn,
-            'address':  str(d.get('Address', '')),
-            'surveyed': False,
+            'name':      str(d.get('Name', '')).strip(),
+            'relation':  str(d.get('Relation Name', '')).strip(),
+            'voterid':   vid,
+            'gender':    str(d.get('Gender', '')),
+            'age':       d.get('Age', ''),
+            'booth':     str(d.get('Booth No', '')),
+            'ward':      str(d.get('Part No', '')),
+            'house_no':  hn,
+            'address':   str(d.get('Address', '')),            # voter's own address from 2025 DB
+            'serial_no': d.get('Serial No') or d.get('Sl No', ''),  # voter's serial from 2025 roll
+            'surveyed':  False,
         }
         house_map.setdefault(hn, []).append(member)
         if vid:
@@ -3073,3 +3074,5 @@ def api_me(request):
     if user:
         return JsonResponse({'loggedIn': True, 'username': user['username'], 'email': user['email']})
     return JsonResponse({'loggedIn': False}, status=401)
+
+
