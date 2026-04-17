@@ -435,12 +435,28 @@ def _registration_analytics(db=None):
     rel_map_v      = {g['_id']: g['n'] for g in v_result['religions']}
     voter_religion = {name: rel_map_v.get(code, 0) for code, name in religion_map.items()}
  
-    # ── Ward coverage (uses WardReference + ward_counts from survey) ──────────
+    # ── Ward coverage — use ward-booth-2026 as primary electors source ─────────
+    wb2026_docs = list(db['ward-booth-2026'].find({}, {'Ward No': 1, 'Total Electors (E)': 1}))
+    wb2026_totals = {}
+    for d in wb2026_docs:
+        try:
+            wn  = str(int(str(d.get('Ward No', '')).strip()))
+            tot = int(str(d.get('Total Electors (E)', 0)).replace(',', '').strip())
+            wb2026_totals[wn] = tot
+        except Exception:
+            pass
+
+    # Sum 2026 total electors across all wards (override VoterList count if available)
+    total_voters_2026 = sum(wb2026_totals.values())
+    if total_voters_2026:
+        total_voters = total_voters_2026
+
     ward_ref   = list(coll_ward.find({}, {'number': 1, 'totalCount': 1}))
     percentages = {}
     for ref in ward_ref:
         wn    = str(ref.get('number', ''))
-        total = ref.get('totalCount', 0)
+        # Prefer 2026 electors count; fall back to WardReference totalCount
+        total = wb2026_totals.get(wn) or ref.get('totalCount', 0)
         count = ward_counts.get(wn, 0)
         if total and wn in WARD_NUM_TO_NAME:
             percentages[WARD_NUM_TO_NAME[wn]] = round(count / total * 100, 1)
@@ -496,22 +512,51 @@ def api_ward_dashboard(request):
         db       = get_db()
         ward_int = int(ward) if ward.isdigit() else None
 
-        # ── 1. WardReference — primary source of voter demographic totals ────
+        # ── 1. ward-booth-2026 — authoritative 2026 voter totals ─────────────
+        wb_coll = db['ward-booth-2026']
+        wb_filt = {'$or': [{'Ward No': ward_int}, {'Ward No': ward}]} if ward_int is not None else {'Ward No': ward}
+        wb_doc  = wb_coll.find_one(wb_filt) or {}
+
+        # ── 2. WardReference — fallback / supplemental demographics ──────────
         ref = db['WardReference'].find_one(
             {'number': ward_int} if ward_int is not None else {'number': ward}
         ) or {}
 
         # Use module-level WARD_NUM_TO_NAME — no local copy needed
-        ward_name    = ref.get('name') or WARD_NUM_TO_NAME.get(ward, WARD_NUM_TO_NAME.get(str(ward), f'Ward {ward}'))
+        ward_name    = wb_doc.get('Ward Name') or ref.get('name') or WARD_NUM_TO_NAME.get(ward, WARD_NUM_TO_NAME.get(str(ward), f'Ward {ward}'))
         district_id  = ref.get('districtId')
         const_id     = ref.get('constituencyId')
-        total_voters = ref.get('totalCount',    0) or 0
-        total_male   = ref.get('totalMale',     0) or 0
-        total_female = ref.get('totalFemale',   0) or 0
-        total_trans  = ref.get('totalTrans',    0) or 0
-        total_hindu  = ref.get('totalHindu',    0) or 0
-        total_muslim = ref.get('totalMuslim',   0) or 0
-        total_chr    = ref.get('totalChristian',0) or 0
+
+        # 2026 data takes priority over WardReference for voter totals
+        def _num(val):
+            """Coerce string/None → int."""
+            if val is None: return 0
+            try: return int(str(val).replace(',', '').strip())
+            except: return 0
+
+        total_voters  = _num(wb_doc.get('Total Electors (E)'))     or _num(ref.get('totalCount'))
+        total_male    = _num(ref.get('totalMale'))
+        total_female  = _num(ref.get('totalFemale'))
+        total_trans   = _num(ref.get('totalTrans'))
+        total_hindu   = _num(ref.get('totalHindu'))
+        total_muslim  = _num(ref.get('totalMuslim'))
+        total_chr     = _num(ref.get('totalChristian'))
+
+        # 2026-specific fields
+        wb2026 = {
+            'totalElectors':   _num(wb_doc.get('Total Electors (E)')),
+            'cutoffElectors':  _num(wb_doc.get('Cutoff Elec (D)')),
+            'bloMapped':       _num(wb_doc.get('BLO Mapped')),
+            'totalMapped':     _num(wb_doc.get('Total Mapped (H)')),
+            'pctBloMapped':    wb_doc.get('% BLO Mapped (HøD)', ''),
+            'ageCutoff':       _num(wb_doc.get('Ageò Cutoff (J)')),
+            'progeny18':       _num(wb_doc.get('Progeny >18 (K)')),
+            'pctProgeny':      wb_doc.get('% Progeny (KøJ)', ''),
+            'electorsMapped':  _num(wb_doc.get('Electors Mapped (M)')),
+            'pctTotal':        wb_doc.get('% Total (MøE)', ''),
+            'supervisors':     wb_doc.get('Supervisors', ''),
+            'boothCount':      _num(wb_doc.get('Count')),
+        } if wb_doc else {}
 
         # ── 2. SurveyRecords — how many surveyed for this ward ────────────────
         survey_db    = get_survey_db()
@@ -594,6 +639,7 @@ def api_ward_dashboard(request):
             'largeFamilyCount': large_family_count,
             'wardCoverage':     {ward_name: coverage_pct},
             'coveragePct':      coverage_pct,
+            'ward2026':         wb2026,   # 2026 BLO/mapping data from ward-booth-2026
         }
 
         _ward_dash_cache[ward] = {'data': result, 'ts': _t.time()}
@@ -605,6 +651,76 @@ def api_ward_dashboard(request):
 
 
 
+
+# ─── WARD-BOOTH-2026 ─────────────────────────────────────────────────────────
+# GET /api/ward-booth-2026/           → all wards (full list)
+# GET /api/ward-booth-2026/?ward=21   → single ward by Ward No
+#
+# Reads from SurveyDataBase['ward-booth-2026'].
+# Fields from collection (as seen in MongoDB):
+#   Ward No, Ward Name, Booths (Part Nos.), Count,
+#   Total Electors (E), Cutoff Elec (D), BLO Mapped, Total Mapped (H),
+#   % BLO Mapped (HøD), Ageò Cutoff (J), Progeny >18 (K), % Progeny (KøJ),
+#   Electors Mapped (M), % Total (MøE), Supervisors
+
+_wb2026_cache = {}          # { 'all': {...}, '<ward>': {...} }
+_WB2026_TTL   = 600         # 10 minutes — rarely changes
+
+
+def _clean_wb2026_doc(doc):
+    """Strip _id and normalise numeric strings → numbers."""
+    doc.pop('_id', None)
+    for k, v in list(doc.items()):
+        if isinstance(v, str):
+            s = v.strip().replace('%', '').replace(',', '')
+            try:
+                doc[k] = float(s) if '.' in s else int(s)
+            except ValueError:
+                pass   # keep as string
+    return doc
+
+
+@require_http_methods(['GET'])
+def api_ward_booth_2026(request):
+    import time as _t
+    ward_param = request.GET.get('ward', '').strip()
+    cache_key  = ward_param or 'all'
+
+    cached = _wb2026_cache.get(cache_key)
+    if cached and (_t.time() - cached['ts']) < _WB2026_TTL:
+        return JsonResponse({'success': True, **cached['data']})
+
+    try:
+        db   = get_db()   # SurveyDataBase on original cluster
+        coll = db['ward-booth-2026']
+
+        if ward_param:
+            # Single ward — try numeric and string match
+            filt = {}
+            if ward_param.isdigit():
+                filt = {'$or': [{'Ward No': int(ward_param)}, {'Ward No': ward_param}]}
+            else:
+                filt = {'Ward Name': {'$regex': f'^{re.escape(ward_param)}$', '$options': 'i'}}
+
+            doc = coll.find_one(filt)
+            if not doc:
+                return JsonResponse({'success': False, 'message': f'Ward {ward_param} not found in ward-booth-2026'}, status=404)
+
+            data = {'ward': _clean_wb2026_doc(doc)}
+        else:
+            # All wards — sorted by Ward No
+            docs = list(coll.find({}, {'_id': 0}).sort('Ward No', 1))
+            data = {'wards': [_clean_wb2026_doc(d) for d in docs], 'total': len(docs)}
+
+        _wb2026_cache[cache_key] = {'data': data, 'ts': _t.time()}
+        return JsonResponse({'success': True, **data})
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 _large_families_cache = {}   # { 'data': [...], 'ts': float }
 _LF_CACHE_TTL = 300           # 5 minutes
@@ -2996,5 +3112,3 @@ def api_me(request):
     if user:
         return JsonResponse({'loggedIn': True, 'username': user['username'], 'email': user['email']})
     return JsonResponse({'loggedIn': False}, status=401)
-
-
