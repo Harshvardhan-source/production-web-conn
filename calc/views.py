@@ -21,6 +21,67 @@ import ast
 import jwt as pyjwt
 import threading
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# WARD REFERENCE — SINGLE SOURCE OF TRUTH
+# All ward/booth lookups in this file use these dicts.  Never duplicate locally.
+# ═══════════════════════════════════════════════════════════════════════════════
+WARD_FULL_DATA = {
+    21: {"name": "PADAVU",              "booths": [31, 32, 33, 55, 56, 57, 58]},
+    24: {"name": "DEREBAIL SOUTH",      "booths": [9, 11, 13, 17]},
+    25: {"name": "DEREBAIL WEST",       "booths": [1, 2, 3, 5, 6, 7, 8]},
+    26: {"name": "DEREBAIL SOUTH WEST", "booths": [4, 10, 89, 90, 91, 92, 94]},
+    27: {"name": "BOLOOR",              "booths": [82, 83, 84, 88, 93, 95, 96, 97]},
+    28: {"name": "MANNAGUDDA",          "booths": [12, 75, 78, 79, 80, 81, 85, 86, 87]},
+    29: {"name": "KAMBLA",              "booths": [68, 69, 71, 72, 73]},
+    30: {"name": "KODIALBAIL",          "booths": [14, 22, 24, 25, 26, 66, 67, 70]},
+    31: {"name": "BEJAI",               "booths": [15, 16, 18, 19, 20, 21, 23]},
+    32: {"name": "KADRI NORTH",         "booths": [27, 28, 29, 30, 63]},
+    33: {"name": "KADRI SOUTH",         "booths": [59, 61, 62, 64, 65]},
+    34: {"name": "SHIVBHAG",            "booths": [45, 60, 134, 135, 136, 139]},
+    35: {"name": "PADAVU CENTRAL",      "booths": [34, 35, 39, 40, 43, 44]},
+    36: {"name": "PADAVU POORVA",       "booths": [36, 37, 38, 41, 42]},
+    37: {"name": "MAROLI",              "booths": [48, 49, 50, 51, 52, 53, 54]},
+    38: {"name": "BENDUR",              "booths": [133, 138, 140, 166, 167, 171]},
+    39: {"name": "FALNIR",              "booths": [162, 163, 164, 165, 172, 173, 174, 175]},
+    40: {"name": "COURT",               "booths": [129, 130, 131, 132, 146, 147]},
+    41: {"name": "CENTRAL",             "booths": [124, 125, 126, 127, 128]},
+    42: {"name": "DONGERKERY",          "booths": [74, 76, 77, 112, 115, 117, 118]},
+    43: {"name": "KUDROLI",             "booths": [108, 109, 110, 111, 113, 114]},
+    44: {"name": "NAVAYATH",            "booths": [116, 119, 120, 121, 122, 123]},
+    45: {"name": "PORT",                "booths": [148, 151, 152, 153, 238, 239]},
+    46: {"name": "CANTONMENT",          "booths": [141, 145, 149, 150]},
+    47: {"name": "MILAGRIS",            "booths": [142, 143, 144, 168, 169, 170]},
+    48: {"name": "VALENCIA",            "booths": [137, 176, 177, 178, 187]},
+    49: {"name": "KANKANADY",           "booths": [179, 180, 181, 182, 183, 184, 185, 186]},
+    50: {"name": "ALAPE DAKSHINA",      "booths": [188, 189, 190, 191, 192, 213, 214, 215]},
+    51: {"name": "ALAPE UTTARA",        "booths": [46, 47, 193, 194, 195, 196, 202]},
+    52: {"name": "KANNUR",              "booths": [197, 198, 199, 200, 201, 203, 204, 205]},
+    53: {"name": "BAJAL",               "booths": [206, 207, 208, 209, 210, 211, 212]},
+    54: {"name": "JEPPINAMUGER",        "booths": [216, 217, 218, 219, 220, 221, 222, 223, 249]},
+    55: {"name": "ATTAVARA",            "booths": [154, 155, 156, 157, 226, 227, 247, 248]},
+    56: {"name": "MANGALADEVI",         "booths": [228, 229, 231, 232, 233]},
+    57: {"name": "HOIGE BAZAR",         "booths": [235, 237, 240, 244]},
+    58: {"name": "BOLAR",               "booths": [230, 234, 236, 241, 242, 243]},
+    59: {"name": "JEPPU",               "booths": [158, 159, 160, 161, 224, 225, 245, 246]},
+    60: {"name": "BENGRE",              "booths": [98, 99, 100, 101, 102, 103, 104, 105, 106, 107]},
+}
+
+# Derived lookups — computed once at import time, O(1) access everywhere
+# ward_number (int/str) → name
+WARD_NUM_TO_NAME = {str(k): v["name"] for k, v in WARD_FULL_DATA.items()}
+WARD_NUM_TO_NAME.update({k: v["name"] for k, v in WARD_FULL_DATA.items()})  # int keys too
+
+# booth (int/str) → ward_number (str)
+BOOTH_TO_WARD = {}
+for _wnum, _wdata in WARD_FULL_DATA.items():
+    for _b in _wdata["booths"]:
+        BOOTH_TO_WARD[str(_b)] = str(_wnum)
+        BOOTH_TO_WARD[_b]      = str(_wnum)
+
+# ward_name (upper) → list of booth ints
+WARD_NAME_TO_BOOTHS = {v["name"].upper(): v["booths"] for v in WARD_FULL_DATA.values()}
+# ═══════════════════════════════════════════════════════════════════════════════
+
 # ── Fuzzy name matching — handles transliteration variants like
 #    Vishvanath/Vishwanath, Lakshmi/Laxmi, Srinivas/Sreenivas ─────────────────
 try:
@@ -281,22 +342,8 @@ def _registration_analytics(db=None):
     coll_survey = survey_db['SurveyRecords']
     coll_voter  = db['2025']
     coll_ward   = db['WardReference']
- 
-    WARD_NAMES = {
-        '21': 'Padav West',         '24': 'Derebail South',    '25': 'Derebail North',
-        '26': 'Derebail Nairuthya', '27': 'Boloor',            '28': 'Mannagudda',
-        '29': 'Kambala',            '30': 'Kodialbail',        '31': 'Bejai',
-        '32': 'Kadri North',        '33': 'Kadri South',       '34': 'Shivabagh',
-        '35': 'Padav Central',      '36': 'Padav East',        '37': 'Maroli',
-        '38': 'Bendoor',            '39': 'Falnir',            '40': 'Court',
-        '41': 'Central',            '42': 'Dongarakery',       '43': 'Kudroli',
-        '44': 'Bunder',             '45': 'Port',              '46': 'Contonment',
-        '47': 'Millagres',          '48': 'Valancia',          '49': 'Kankanady',
-        '50': 'Alape South',        '51': 'Alape North',       '52': 'Kannur',
-        '53': 'Bajal',              '54': 'Jappimogaru',       '55': 'Attavara',
-        '56': 'Mangaladevi',        '57': 'Hoige Bazar',       '58': 'Bolar',
-        '59': 'Jeppu',              '60': 'Bengre',
-    }
+
+    # Use module-level WARD_NUM_TO_NAME — no local copy needed
  
     # ── Single aggregation pipeline for SurveyRecords ────────────────────────
     # Replaces: count_documents x7 + find(wardNumber) — all in ONE round-trip
@@ -395,8 +442,8 @@ def _registration_analytics(db=None):
         wn    = str(ref.get('number', ''))
         total = ref.get('totalCount', 0)
         count = ward_counts.get(wn, 0)
-        if total and wn in WARD_NAMES:
-            percentages[WARD_NAMES[wn]] = round(count / total * 100, 1)
+        if total and wn in WARD_NUM_TO_NAME:
+            percentages[WARD_NUM_TO_NAME[wn]] = round(count / total * 100, 1)
  
     result = {
         'totalReg':        total_reg,
@@ -454,23 +501,8 @@ def api_ward_dashboard(request):
             {'number': ward_int} if ward_int is not None else {'number': ward}
         ) or {}
 
-        WARD_NAMES_LOCAL = {
-            '21':'Padav West','24':'Derebail South','25':'Derebail North',
-            '26':'Derebail Nairuthya','27':'Boloor','28':'Mannagudda',
-            '29':'Kambala','30':'Kodialbail','31':'Bejai',
-            '32':'Kadri North','33':'Kadri South','34':'Shivabagh',
-            '35':'Padav Central','36':'Padav East','37':'Maroli',
-            '38':'Bendoor','39':'Falnir','40':'Court',
-            '41':'Central','42':'Dongarakery','43':'Kudroli',
-            '44':'Bunder','45':'Port','46':'Contonment',
-            '47':'Millagres','48':'Valancia','49':'Kankanady',
-            '50':'Alape South','51':'Alape North','52':'Kannur',
-            '53':'Bajal','54':'Jappimogaru','55':'Attavara',
-            '56':'Mangaladevi','57':'Hoige Bazar','58':'Bolar',
-            '59':'Jeppu','60':'Bengre',
-        }
-
-        ward_name    = ref.get('name') or WARD_NAMES_LOCAL.get(ward, f'Ward {ward}')
+        # Use module-level WARD_NUM_TO_NAME — no local copy needed
+        ward_name    = ref.get('name') or WARD_NUM_TO_NAME.get(ward, WARD_NUM_TO_NAME.get(str(ward), f'Ward {ward}'))
         district_id  = ref.get('districtId')
         const_id     = ref.get('constituencyId')
         total_voters = ref.get('totalCount',    0) or 0
@@ -513,54 +545,9 @@ def api_ward_dashboard(request):
         reg_religion= {r: rmap.get(r, 0) for r in religions}
 
         # ── 3. Large families in this ward from 2025 voter list ──────────────
-        WARD_BOOTHS = {
-            "ALAPE NORTH": [44,189,191,190,192,197,45],
-            "ALAPE SOUTH": [188,187,186,185,184,209,210],
-            "ATHAVARA": [152,151,242,243,221,222,153],
-            "BAJAL": [202,201,203,204,206,205,207,208],
-            "BEJAI": [15,16,18,19,23,21,20],
-            "BENDOOR": [162,163,134,136,129,167],
-            "BENGRE": [94,95,96,99,97,100,98,101,103,102],
-            "BOLAR": [237,238,236,230,231,225],
-            "BOLOOR": [93,92,91,82,79,78],
-            "BUNDER": [115,116,117,118,112,119],
-            "CENTRAL": [120,121,124,123,122],
-            "CONTONMENT": [150,137,145,146,141],
-            "COURT": [143,127,126,125,142],
-            "DEREBAIL NAIRUTHYA": [4,90,89,86,85,87,88,10],
-            "DEREBAIL SOUTH": [17,11,12,8,9,14,13],
-            "DEREBAIL WEST": [5,1,2,3,7,6],
-            "DONGARAKERY": [114,73,74,111,108,113,71],
-            "FALNIR": [159,161,160,158,168,169,171,170],
-            "HOIGE BAZAR": [239,235,232,229,233],
-            "JAPPIMOGAR": [213,217,214,218,212,211,215,216,244],
-            "JEPPU": [240,219,220,241,156,157,155,154],
-            "KADRI NORTH": [62,63,30,27,28,29],
-            "KADRI SOUTH": [59,61,60,57],
-            "KAMBALA": [69,68,67,66,70],
-            "KANKANADY": [176,175,182,181,177,178,179,180],
-            "KANNUR": [193,198,195,199,196,200,194],
-            "KODIALBAIL": [65,64,26,24,25,22],
-            "KUDROLI": [107,106,109,110,104,105],
-            "MANGALADEVI": [147,228,227,226,223,224],
-            "MANNAGDDA": [77,76,80,81,83,84,72,75],
-            "MAROLI": [46,47,48,50,52,49,51],
-            "MILAGRESS": [140,138,139,164,165,166],
-            "PADAV CENTRAL": [35,34,38,41,39,43,42],
-            "PADAV-EAST": [37,36,40],
-            "PADAV-WEST": [33,32,56,53,54,31,55],
-            "PORT": [148,149,144,234],
-            "SHIVABAGH": [128,130,58,135,131],
-            "VALENCIA": [173,172,183,174,132,133],
-        }
-
-        # Find booths for this ward (match ward_name case-insensitively)
-        ward_name_upper = ward_name.upper().strip()
-        ward_booths_list = []
-        for wname, booths in WARD_BOOTHS.items():
-            if wname.upper() == ward_name_upper:
-                ward_booths_list = booths
-                break
+        # Use module-level WARD_NAME_TO_BOOTHS — no local copy needed
+        ward_name_upper  = ward_name.upper().strip()
+        ward_booths_list = WARD_NAME_TO_BOOTHS.get(ward_name_upper, [])
 
         # Convert booth ints to strings for matching (2025 list may store as string)
         booth_strs = [str(b) for b in ward_booths_list]
@@ -657,70 +644,7 @@ def api_large_families(request):
     try:
         db = get_db()
  
-        WARD_NAMES_LOCAL = {
-            '21':'Padav West','24':'Derebail South','25':'Derebail North',
-            '26':'Derebail Nairuthya','27':'Boloor','28':'Mannagudda',
-            '29':'Kambala','30':'Kodialbail','31':'Bejai',
-            '32':'Kadri North','33':'Kadri South','34':'Shivabagh',
-            '35':'Padav Central','36':'Padav East','37':'Maroli',
-            '38':'Bendoor','39':'Falnir','40':'Court',
-            '41':'Central','42':'Dongarakery','43':'Kudroli',
-            '44':'Bunder','45':'Port','46':'Contonment',
-            '47':'Millagres','48':'Valancia','49':'Kankanady',
-            '50':'Alape South','51':'Alape North','52':'Kannur',
-            '53':'Bajal','54':'Jappimogaru','55':'Attavara',
-            '56':'Mangaladevi','57':'Hoige Bazar','58':'Bolar',
-            '59':'Jeppu','60':'Bengre',
-        }
- 
-        # Build booth → ward-number lookup from WardReference booths mapping
-        # (same WARD_BOOTHS_MAP used in Dashboard.jsx)
-        WARD_BOOTHS = {
-            "21": [33,32,56,53,54,31,55],       # PADAV-WEST → 21
-            "24": [17,11,12,8,9,14,13],          # DEREBAIL SOUTH
-            "25": [5,1,2,3,7,6],                 # DEREBAIL NORTH / WEST
-            "26": [4,90,89,86,85,87,88,10],      # DEREBAIL NAIRUTHYA
-            "27": [93,92,91,82,79,78],           # BOLOOR
-            "28": [77,76,80,81,83,84,72,75],     # MANNAGUDDA
-            "29": [69,68,67,66,70],              # KAMBALA
-            "30": [65,64,26,24,25,22],           # KODIALBAIL
-            "31": [15,16,18,19,23,21,20],        # BEJAI
-            "32": [62,63,30,27,28,29],           # KADRI NORTH
-            "33": [59,61,60,57],                 # KADRI SOUTH
-            "34": [128,130,58,135,131],          # SHIVABAGH
-            "35": [35,34,38,41,39,43,42],        # PADAV CENTRAL
-            "36": [37,36,40],                    # PADAV EAST
-            "37": [46,47,48,50,52,49,51],        # MAROLI
-            "38": [162,163,134,136,129,167],     # BENDOOR
-            "39": [159,161,160,158,168,169,171,170], # FALNIR
-            "40": [143,127,126,125,142],         # COURT
-            "41": [120,121,124,123,122],         # CENTRAL
-            "42": [114,73,74,111,108,113,71],    # DONGARAKERY
-            "43": [107,106,109,110,104,105],     # KUDROLI
-            "44": [115,116,117,118,112,119],     # BUNDER
-            "45": [148,149,144,234],             # PORT
-            "46": [150,137,145,146,141],         # CONTONMENT
-            "47": [140,138,139,164,165,166],     # MILAGRESS
-            "48": [173,172,183,174,132,133],     # VALENCIA
-            "49": [176,175,182,181,177,178,179,180], # KANKANADY
-            "50": [188,187,186,185,184,209,210], # ALAPE SOUTH
-            "51": [44,189,191,190,192,197,45],   # ALAPE NORTH
-            "52": [193,198,195,199,196,200,194], # KANNUR
-            "53": [202,201,203,204,206,205,207,208], # BAJAL
-            "54": [213,217,214,218,212,211,215,216,244], # JAPPIMOGAR
-            "55": [152,151,242,243,221,222,153], # ATHAVARA
-            "56": [147,228,227,226,223,224],     # MANGALADEVI
-            "57": [239,235,232,229,233],         # HOIGE BAZAR
-            "58": [237,238,236,230,231,225],     # BOLAR
-            "59": [240,219,220,241,156,157,155,154], # JEPPU
-            "60": [94,95,96,99,97,100,98,101,103,102], # BENGRE
-        }
- 
-        # Invert: booth_str → ward_number
-        booth_to_ward = {}
-        for ward_no, booths in WARD_BOOTHS.items():
-            for b in booths:
-                booth_to_ward[str(b)] = ward_no
+        # Use module-level WARD_NUM_TO_NAME and BOOTH_TO_WARD — no local copies needed
  
         # Single aggregation: group by house, keep booth, filter >15 members
         pipeline = [
@@ -741,11 +665,11 @@ def api_large_families(request):
         ward_map = {}   # ward_number → { wardName, houses: [] }
         for doc in raw:
             booth = str(doc.get('booth', '') or '')
-            ward_no = booth_to_ward.get(booth, 'Unknown')
+            ward_no = BOOTH_TO_WARD.get(booth, 'Unknown')
             if ward_no not in ward_map:
                 ward_map[ward_no] = {
                     'wardNumber': ward_no,
-                    'wardName': WARD_NAMES_LOCAL.get(ward_no, f'Ward {ward_no}'),
+                    'wardName': WARD_NUM_TO_NAME.get(ward_no, f'Ward {ward_no}'),
                     'houses': [],
                 }
             ward_map[ward_no]['houses'].append({
@@ -2833,46 +2757,12 @@ def api_update_survey(request):
 
 @require_http_methods(['GET'])
 def api_wards(request):
-    wards = [
-        {'name': 'Padav West',          'number': 21},
-        {'name': 'Derebail South',       'number': 24},
-        {'name': 'Derebail North',       'number': 25},
-        {'name': 'Derebail Nairuthya',   'number': 2},
-        {'name': 'Boloor',               'number': 27},
-        {'name': 'Mannagudda',           'number': 28},
-        {'name': 'Kambala',              'number': 29},
-        {'name': 'Kodialbail',           'number': 30},
-        {'name': 'Bejai',                'number': 1},
-        {'name': 'Kadri North',          'number': 32},
-        {'name': 'Kadri South',          'number': 33},
-        {'name': 'Shivabagh',            'number': 34},
-        {'name': 'Padav Central',        'number': 35},
-        {'name': 'Padav East',           'number': 36},
-        {'name': 'Maroli',               'number': 37},
-        {'name': 'Bendoor',              'number': 38},
-        {'name': 'Falnir',               'number': 39},
-        {'name': 'Court',                'number': 40},
-        {'name': 'Central',              'number': 41},
-        {'name': 'Dongarakery',          'number': 42},
-        {'name': 'Kudroli',              'number': 43},
-        {'name': 'Bunder',               'number': 44},
-        {'name': 'Port',                 'number': 45},
-        {'name': 'Contonment',           'number': 46},
-        {'name': 'Millagres',            'number': 47},
-        {'name': 'Valancia',             'number': 48},
-        {'name': 'Kankanady',            'number': 49},
-        {'name': 'Alape South',          'number': 50},
-        {'name': 'Alape North',          'number': 51},
-        {'name': 'Kannur',               'number': 52},
-        {'name': 'Bajal',                'number': 53},
-        {'name': 'Jappimogaru',          'number': 54},
-        {'name': 'Attavara',             'number': 55},
-        {'name': 'Mangaladevi',          'number': 56},
-        {'name': 'Hoige Bazar',          'number': 57},
-        {'name': 'Bolar',                'number': 58},
-        {'name': 'Jeppu',                'number': 59},
-        {'name': 'Bengre',               'number': 60},
-    ]
+    # Derived from module-level WARD_FULL_DATA — single source of truth
+    wards = sorted(
+        [{'name': v['name'].title(), 'number': k, 'booths': v['booths']}
+         for k, v in WARD_FULL_DATA.items()],
+        key=lambda x: x['number']
+    )
     return JsonResponse({'success': True, 'wards': wards})
 
 
