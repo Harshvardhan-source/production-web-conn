@@ -536,16 +536,24 @@ def api_ward_dashboard(request):
         return JsonResponse({'success': True, **cached['data']})
 
     try:
-        db       = get_survey_db()
-        ward_int = int(ward) if ward.isdigit() else None
+        # ── Two separate DB handles — collections live on different clusters ──
+        # survey_db: ward-booth-2026, ward-booth-details, SurveyRecords
+        # main_db:   WardReference, 2025 voter list
+        survey_db = get_survey_db()
+        main_db   = get_db()
+        ward_int  = int(ward) if ward.isdigit() else None
 
-        # ── 1. ward-booth-2026 — authoritative 2026 voter totals ─────────────
-        wb_coll = db['ward-booth-2026']
+        # ── 1. ward-booth-2026 — authoritative 2026 electors/mapping data ────
+        #    Lives on survey cluster (added by user to SurveyDataBase)
         wb_filt = {'$or': [{'Ward No': ward_int}, {'Ward No': ward}]} if ward_int is not None else {'Ward No': ward}
-        wb_doc  = wb_coll.find_one(wb_filt) or {}
+        wb_doc  = survey_db['ward-booth-2026'].find_one(wb_filt) or {}
 
-        # ── 2. WardReference — fallback / supplemental demographics ──────────
-        ref = db['WardReference'].find_one(
+        # ── 1b. ward-booth-details — supplemental details if present ─────────
+        wbd_doc = survey_db['ward-booth-details'].find_one(wb_filt) or {}
+
+        # ── 2. WardReference — demographics (Male/Female/Hindu/Muslim/Christian)
+        #    Lives on MAIN cluster — was the bug: get_survey_db() has no WardReference
+        ref = main_db['WardReference'].find_one(
             {'number': ward_int} if ward_int is not None else {'number': ward}
         ) or {}
 
@@ -640,8 +648,7 @@ def api_ward_dashboard(request):
             'boothCount':      _get_wb_field(wb_doc, 'Count'),
         } if wb_doc else {}
 
-        # ── 2. SurveyRecords — how many surveyed for this ward ────────────────
-        survey_db    = get_survey_db()
+        # ── 3. SurveyRecords — how many surveyed for this ward ────────────────
         ward_filters = [{'wardNumber': ward}]
         if ward_int is not None:
             ward_filters.append({'wardNumber': ward_int})
@@ -689,7 +696,7 @@ def api_ward_dashboard(request):
                 {'$match': {'count': {'$gt': 15}}},
                 {'$count': 'n'},
             ]
-            lf_result = list(db['2025'].aggregate(lf_pipeline))
+            lf_result = list(main_db['2025'].aggregate(lf_pipeline))
             large_family_count = lf_result[0]['n'] if lf_result else 0
 
         # ── 4. Coverage ───────────────────────────────────────────────────────
