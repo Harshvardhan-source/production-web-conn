@@ -536,7 +536,7 @@ def api_ward_dashboard(request):
         return JsonResponse({'success': True, **cached['data']})
 
     try:
-        db       = get_db()
+        db       = get_survey_db()
         ward_int = int(ward) if ward.isdigit() else None
 
         # ── 1. ward-booth-2026 — authoritative 2026 voter totals ─────────────
@@ -773,7 +773,7 @@ def api_ward_booth_2026(request):
         return JsonResponse({'success': True, **cached['data']})
 
     try:
-        db   = get_db()   # SurveyDataBase on original cluster
+        db   = get_survey_db()   # SurveyDataBase on original cluster
         coll = db['ward-booth-2026']
 
         if ward_param:
