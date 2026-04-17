@@ -435,55 +435,12 @@ def _registration_analytics(db=None):
     rel_map_v      = {g['_id']: g['n'] for g in v_result['religions']}
     voter_religion = {name: rel_map_v.get(code, 0) for code, name in religion_map.items()}
  
-    # ── Ward coverage — use ward-booth-2026 as primary electors source ─────────
-    #
-    # FIX: field name 'Total Electors (E)' may contain unicode/special chars in
-    # MongoDB that differ from the Python literal — causing .get() to return None
-    # and silently falling back to the stale WardReference.totalCount.
-    # Solution: scan all keys that START with 'Total Electors' so any variant
-    # (unicode parentheses, invisible chars, etc.) is matched correctly.
-    def _extract_total_electors(doc):
-        """Return Total Electors value from a ward-booth-2026 doc robustly."""
-        # 1. Try exact key first (fast path — works when field name matches exactly)
-        v = doc.get('Total Electors (E)')
-        if v not in (None, '', 0):
-            try:
-                return int(str(v).replace(',', '').strip())
-            except (ValueError, TypeError):
-                pass
-        # 2. Scan all keys — handles unicode variants of parentheses / spaces
-        for k, val in doc.items():
-            if k.startswith('Total Electors'):
-                try:
-                    result = int(str(val).replace(',', '').strip())
-                    if result:
-                        return result
-                except (ValueError, TypeError):
-                    pass
-        return 0
-
-    wb2026_docs = list(db['ward-booth-2026'].find({}))
-    wb2026_totals = {}
-    for d in wb2026_docs:
-        try:
-            wn  = str(int(str(d.get('Ward No', '')).strip()))
-            tot = _extract_total_electors(d)
-            if tot:
-                wb2026_totals[wn] = tot
-        except Exception:
-            pass
-
-    # Sum 2026 total electors across all wards (override VoterList count if available)
-    total_voters_2026 = sum(wb2026_totals.values())
-    if total_voters_2026:
-        total_voters = total_voters_2026
-
+    # ── Ward coverage (uses WardReference + ward_counts from survey) ──────────
     ward_ref   = list(coll_ward.find({}, {'number': 1, 'totalCount': 1}))
     percentages = {}
     for ref in ward_ref:
         wn    = str(ref.get('number', ''))
-        # Prefer 2026 electors count; fall back to WardReference totalCount
-        total = wb2026_totals.get(wn) or ref.get('totalCount', 0)
+        total = ref.get('totalCount', 0)
         count = ward_counts.get(wn, 0)
         if total and wn in WARD_NUM_TO_NAME:
             percentages[WARD_NUM_TO_NAME[wn]] = round(count / total * 100, 1)
@@ -536,137 +493,28 @@ def api_ward_dashboard(request):
         return JsonResponse({'success': True, **cached['data']})
 
     try:
-        # survey_db → survey cluster: ward-booth-2026, SurveyRecords
-        # main_db   → main cluster:   WardReference, 2025 voter list
-        import re as _re
+        db       = get_db()
+        ward_int = int(ward) if ward.isdigit() else None
 
-        survey_db = get_survey_db()
-        main_db   = get_db()
-        ward_int  = int(ward) if ward.isdigit() else None
-
-        # ── 1. ward-booth-2026 on survey cluster ─────────────────────────────
-        wb_filt = (
-            {'$or': [{'Ward No': ward_int}, {'Ward No': ward}, {'Ward No': str(ward_int)}]}
-            if ward_int is not None else {'Ward No': ward}
-        )
-        wb_doc = survey_db['ward-booth-2026'].find_one(wb_filt) or {}
-        # Fallback: full scan in case find_one missed due to type/Unicode mismatch
-        if not wb_doc and ward_int is not None:
-            for _d in survey_db['ward-booth-2026'].find():
-                if str(_d.get('Ward No', '')).strip() == str(ward_int):
-                    wb_doc = _d
-                    break
-
-        # ── 2. WardReference on main cluster (gender/religion demographics) ──
-        ref = main_db['WardReference'].find_one(
+        # ── 1. WardReference — primary source of voter demographic totals ────
+        ref = db['WardReference'].find_one(
             {'number': ward_int} if ward_int is not None else {'number': ward}
         ) or {}
 
-        ward_name   = (wb_doc.get('Ward Name') or '').strip() or ref.get('name') or WARD_NUM_TO_NAME.get(ward, WARD_NUM_TO_NAME.get(str(ward), f'Ward {ward}'))
-        district_id = ref.get('districtId')
-        const_id    = ref.get('constituencyId')
+        # Use module-level WARD_NUM_TO_NAME — no local copy needed
+        ward_name    = ref.get('name') or WARD_NUM_TO_NAME.get(ward, WARD_NUM_TO_NAME.get(str(ward), f'Ward {ward}'))
+        district_id  = ref.get('districtId')
+        const_id     = ref.get('constituencyId')
+        total_voters = ref.get('totalCount',    0) or 0
+        total_male   = ref.get('totalMale',     0) or 0
+        total_female = ref.get('totalFemale',   0) or 0
+        total_trans  = ref.get('totalTrans',    0) or 0
+        total_hindu  = ref.get('totalHindu',    0) or 0
+        total_muslim = ref.get('totalMuslim',   0) or 0
+        total_chr    = ref.get('totalChristian',0) or 0
 
-        # ── Field helpers ─────────────────────────────────────────────────────
-        def _num(val):
-            if val is None: return 0
-            try: return int(str(val).replace(',', '').strip())
-            except: return 0
-
-        def _alphanum(s):
-            """Strip ALL non-alphanumeric chars, lowercase — Unicode-invariant."""
-            return _re.sub(r'[^a-z0-9]', '', str(s).lower())
-
-        def _core(candidate):
-            """
-            Extract searchable core from a candidate key name:
-            '% BLO Mapped (HøD)'  → 'blo mapped'
-            'Total Electors (E)'  → 'total electors'
-            'Ageò Cutoff (J)'     → 'ageò cutoff' → normalized → 'agecutoff'
-            """
-            s = candidate.lstrip('%').strip()
-            s = _re.split(r'\s*[\(\[{]', s)[0].strip()
-            return s.lower()
-
-        def _get_wb_field(doc, *candidates):
-            """
-            Read a numeric field from a ward-booth-2026 document.
-            Strategy:
-              1. Exact key match — fast path for plain ASCII keys
-              2. Normalized match — strips ALL non-alphanumeric chars from both
-                 the search term and the actual stored key before comparing.
-                 Handles fullwidth parens, non-breaking spaces, Unicode letter
-                 variants and any other invisible characters MongoDB may store.
-            For % fields: only matches keys that start with '%'.
-            """
-            if not doc: return 0
-            # 1. Exact
-            for key in candidates:
-                v = doc.get(key)
-                if v not in (None, ''):
-                    try: return int(str(v).replace(',', '').strip())
-                    except (ValueError, TypeError): pass
-            # 2. Normalized
-            for candidate in candidates:
-                norm  = _alphanum(_core(candidate))
-                if not norm: continue
-                want_pct = candidate.strip().startswith('%')
-                for k, val in doc.items():
-                    if want_pct != k.strip().startswith('%'): continue
-                    if norm in _alphanum(k) and val not in (None, ''):
-                        try:
-                            r = int(str(val).replace(',', '').strip())
-                            if r: return r
-                        except (ValueError, TypeError): pass
-            return 0
-
-        def _get_wb_str(doc, *candidates):
-            """Same as _get_wb_field but returns the raw string value."""
-            if not doc: return ''
-            for key in candidates:
-                v = doc.get(key)
-                if v not in (None, ''): return str(v).strip()
-            for candidate in candidates:
-                norm = _alphanum(_core(candidate))
-                if not norm: continue
-                want_pct = candidate.strip().startswith('%')
-                for k, val in doc.items():
-                    if want_pct != k.strip().startswith('%'): continue
-                    if norm in _alphanum(k) and val not in (None, ''):
-                        return str(val).strip()
-            return ''
-
-        # ── Total Voters = Total Electors from ward-booth-2026 ONLY ──────────
-        total_voters = _get_wb_field(wb_doc, 'Total Electors (E)', 'Total Electors')
-        if wb_doc and not total_voters:
-            import sys
-            print(f'[ward-{ward}] wb_doc found but Total Electors=0. Keys: {list(wb_doc.keys())}', file=sys.stderr)
-
-        # Gender/religion from WardReference (ward-booth-2026 has no gender split)
-        total_male   = _num(ref.get('totalMale'))
-        total_female = _num(ref.get('totalFemale'))
-        total_trans  = _num(ref.get('totalTrans'))
-        total_hindu  = _num(ref.get('totalHindu'))
-        total_muslim = _num(ref.get('totalMuslim'))
-        total_chr    = _num(ref.get('totalChristian'))
-
-        # ── 2026-specific mapping fields ──────────────────────────────────────
-        wb2026 = {
-            'totalElectors':  total_voters,
-            'cutoffElectors': _get_wb_field(wb_doc, 'Cutoff Elec (D)',    'Cutoff Elec'),
-            'bloMapped':      _get_wb_field(wb_doc, 'BLO Mapped'),
-            'totalMapped':    _get_wb_field(wb_doc, 'Total Mapped (H)',    'Total Mapped'),
-            'pctBloMapped':   _get_wb_str  (wb_doc, '% BLO Mapped (HøD)', '% BLO Mapped'),
-            'ageCutoff':      _get_wb_field(wb_doc, 'Ageò Cutoff (J)',     'Age Cutoff',   'Ageo Cutoff'),
-            'progeny18':      _get_wb_field(wb_doc, 'Progeny >18 (K)',     'Progeny >18'),
-            'pctProgeny':     _get_wb_str  (wb_doc, '% Progeny (KøJ)',     '% Progeny'),
-            'electorsMapped': _get_wb_field(wb_doc, 'Electors Mapped (M)', 'Electors Mapped'),
-            'pctTotal':       _get_wb_str  (wb_doc, '% Total (MøE)',       '% Total'),
-            'supervisors':    (wb_doc.get('Supervisors') or '').strip(),
-            'boothCount':     _get_wb_field(wb_doc, 'Count'),
-            'boothList':      (wb_doc.get('Booths (Part Nos.)') or '').strip(),
-        } if wb_doc else {}
-
-        # ── SurveyRecords — surveyed count for this ward ───────────────────────
+        # ── 2. SurveyRecords — how many surveyed for this ward ────────────────
+        survey_db    = get_survey_db()
         ward_filters = [{'wardNumber': ward}]
         if ward_int is not None:
             ward_filters.append({'wardNumber': ward_int})
@@ -714,7 +562,7 @@ def api_ward_dashboard(request):
                 {'$match': {'count': {'$gt': 15}}},
                 {'$count': 'n'},
             ]
-            lf_result = list(main_db['2025'].aggregate(lf_pipeline))
+            lf_result = list(db['2025'].aggregate(lf_pipeline))
             large_family_count = lf_result[0]['n'] if lf_result else 0
 
         # ── 4. Coverage ───────────────────────────────────────────────────────
@@ -746,7 +594,6 @@ def api_ward_dashboard(request):
             'largeFamilyCount': large_family_count,
             'wardCoverage':     {ward_name: coverage_pct},
             'coveragePct':      coverage_pct,
-            'ward2026':         wb2026,   # 2026 BLO/mapping data from ward-booth-2026
         }
 
         _ward_dash_cache[ward] = {'data': result, 'ts': _t.time()}
@@ -758,76 +605,6 @@ def api_ward_dashboard(request):
 
 
 
-
-# ─── WARD-BOOTH-2026 ─────────────────────────────────────────────────────────
-# GET /api/ward-booth-2026/           → all wards (full list)
-# GET /api/ward-booth-2026/?ward=21   → single ward by Ward No
-#
-# Reads from SurveyDataBase['ward-booth-2026'].
-# Fields from collection (as seen in MongoDB):
-#   Ward No, Ward Name, Booths (Part Nos.), Count,
-#   Total Electors (E), Cutoff Elec (D), BLO Mapped, Total Mapped (H),
-#   % BLO Mapped (HøD), Ageò Cutoff (J), Progeny >18 (K), % Progeny (KøJ),
-#   Electors Mapped (M), % Total (MøE), Supervisors
-
-_wb2026_cache = {}          # { 'all': {...}, '<ward>': {...} }
-_WB2026_TTL   = 600         # 10 minutes — rarely changes
-
-
-def _clean_wb2026_doc(doc):
-    """Strip _id and normalise numeric strings → numbers."""
-    doc.pop('_id', None)
-    for k, v in list(doc.items()):
-        if isinstance(v, str):
-            s = v.strip().replace('%', '').replace(',', '')
-            try:
-                doc[k] = float(s) if '.' in s else int(s)
-            except ValueError:
-                pass   # keep as string
-    return doc
-
-
-@require_http_methods(['GET'])
-def api_ward_booth_2026(request):
-    import time as _t
-    ward_param = request.GET.get('ward', '').strip()
-    cache_key  = ward_param or 'all'
-
-    cached = _wb2026_cache.get(cache_key)
-    if cached and (_t.time() - cached['ts']) < _WB2026_TTL:
-        return JsonResponse({'success': True, **cached['data']})
-
-    try:
-        db   = get_survey_db()   # SurveyDataBase on original cluster
-        coll = db['ward-booth-2026']
-
-        if ward_param:
-            # Single ward — try numeric and string match
-            filt = {}
-            if ward_param.isdigit():
-                filt = {'$or': [{'Ward No': int(ward_param)}, {'Ward No': ward_param}]}
-            else:
-                filt = {'Ward Name': {'$regex': f'^{re.escape(ward_param)}$', '$options': 'i'}}
-
-            doc = coll.find_one(filt)
-            if not doc:
-                return JsonResponse({'success': False, 'message': f'Ward {ward_param} not found in ward-booth-2026'}, status=404)
-
-            data = {'ward': _clean_wb2026_doc(doc)}
-        else:
-            # All wards — sorted by Ward No
-            docs = list(coll.find({}, {'_id': 0}).sort('Ward No', 1))
-            data = {'wards': [_clean_wb2026_doc(d) for d in docs], 'total': len(docs)}
-
-        _wb2026_cache[cache_key] = {'data': data, 'ts': _t.time()}
-        return JsonResponse({'success': True, **data})
-
-    except Exception as exc:
-        traceback.print_exc()
-        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 _large_families_cache = {}   # { 'data': [...], 'ts': float }
 _LF_CACHE_TTL = 300           # 5 minutes
@@ -3219,3 +2996,5 @@ def api_me(request):
     if user:
         return JsonResponse({'loggedIn': True, 'username': user['username'], 'email': user['email']})
     return JsonResponse({'loggedIn': False}, status=401)
+
+
