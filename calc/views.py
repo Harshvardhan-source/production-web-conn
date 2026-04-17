@@ -1003,7 +1003,7 @@ def _upload_to_gcs(file_obj, destination_blob_name):
     file_obj.seek(0)
     blob.upload_from_file(file_obj, content_type=file_obj.content_type or 'application/octet-stream')
     blob.make_public()
-
+    print(f"[GCS] Uploaded '{file_obj.name}' to '{destination_blob_name}', public URL: {blob.public_url}")
     return blob.public_url
 
 
