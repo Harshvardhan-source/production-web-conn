@@ -1034,6 +1034,7 @@ def api_save_deceased(request):
         if file_index is not None:
             file_key = f'cert_{file_index}'
             uploaded = request.FILES.get(file_key)
+            print(f"[api_save_deceased] file_index={file_index}, file_key={file_key}, found={uploaded is not None}, FILES_keys={list(request.FILES.keys())}")
             if uploaded:
                 ext  = os.path.splitext(uploaded.name)[1].lower() or '.jpg'
                 uid  = uuid.uuid4().hex
@@ -1042,11 +1043,18 @@ def api_save_deceased(request):
                 try:
                     certificate_url  = _upload_to_gcs(uploaded, blob_name)
                     certificate_name = uploaded.name
-                    print(f"[api_save_deceased] Uploaded to GCS: {certificate_url}")
+                    print(f"[api_save_deceased] ✓ Uploaded to GCS: {certificate_url}")
                 except Exception as gcs_err:
-                    # Non-fatal — save the record even if upload fails, log the error
-                    print(f"[api_save_deceased] GCS upload failed: {gcs_err}")
+                    print(f"[api_save_deceased] ✗ GCS upload failed: {gcs_err}")
                     traceback.print_exc()
+                    # Return failure so frontend shows the error clearly
+                    return JsonResponse({
+                        'success': False,
+                        'message': f'GCS certificate upload failed: {str(gcs_err)}. Check GCS_BUCKET_NAME and GOOGLE_APPLICATION_CREDENTIALS_JSON env vars on Render.',
+                        'gcs_error': str(gcs_err),
+                    }, status=500)
+            else:
+                print(f"[api_save_deceased] ⚠ file_key '{file_key}' not found in request.FILES — boundary issue or file not attached")
 
         records.append({
             'name':                rec.get('name', '').strip(),
