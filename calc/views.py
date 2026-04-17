@@ -536,35 +536,16 @@ def api_ward_dashboard(request):
         return JsonResponse({'success': True, **cached['data']})
 
     try:
-        # survey_db : ward-booth-2026, ward-booth-details, SurveyRecords
-        # main_db   : WardReference (demographics), 2025 voter list
-        survey_db = get_survey_db()
-        main_db   = get_db()
-        ward_int  = int(ward) if ward.isdigit() else None
+        db       = get_survey_db()
+        ward_int = int(ward) if ward.isdigit() else None
 
-        # ── 1. ward-booth-2026 — authoritative 2026 electors data ────────────
-        #    Stored in survey cluster (_get_survey_client → SurveyDataBase)
-        wb_filt = {}
-        if ward_int is not None:
-            wb_filt = {'$or': [{'Ward No': ward_int}, {'Ward No': ward}, {'Ward No': str(ward_int)}]}
-        else:
-            wb_filt = {'Ward No': ward}
-        wb_doc  = survey_db['ward-booth-2026'].find_one(wb_filt) or {}
+        # ── 1. ward-booth-2026 — authoritative 2026 voter totals ─────────────
+        wb_coll = db['ward-booth-2026']
+        wb_filt = {'$or': [{'Ward No': ward_int}, {'Ward No': ward}]} if ward_int is not None else {'Ward No': ward}
+        wb_doc  = wb_coll.find_one(wb_filt) or {}
 
-        # If filter missed (unicode/type mismatch), do a full-collection scan
-        if not wb_doc and ward_int is not None:
-            for doc in survey_db['ward-booth-2026'].find():
-                raw = doc.get('Ward No')
-                if raw is not None and str(raw).strip() == str(ward_int):
-                    wb_doc = doc
-                    break
-
-        # ── 1b. ward-booth-details (same survey cluster) ─────────────────────
-        wbd_doc = survey_db['ward-booth-details'].find_one(wb_filt) or {}
-
-        # ── 2. WardReference — gender/religion demographics ──────────────────
-        #    Stored on main cluster (_get_main_client → SurveyDataBase)
-        ref = main_db['WardReference'].find_one(
+        # ── 2. WardReference — fallback / supplemental demographics ──────────
+        ref = db['WardReference'].find_one(
             {'number': ward_int} if ward_int is not None else {'number': ward}
         ) or {}
 
@@ -580,31 +561,14 @@ def api_ward_dashboard(request):
             try: return int(str(val).replace(',', '').strip())
             except: return 0
 
-        def _search_term(candidate):
-            """
-            Extract a normalised search term from a candidate key string.
-            Strips everything from the first bracket/paren so that
-            'Total Electors (E)' → 'total electors'
-            Works even if the stored key uses special Unicode brackets.
-            """
-            import re as _re
-            # Remove anything in brackets/parens and special chars, lowercase
-            base = _re.split(r'[\(\[\{%>]', candidate)[0].strip().lower()
-            # Collapse whitespace
-            return ' '.join(base.split())
-
         def _get_wb_field(doc, *candidates):
             """
             Fetch a numeric field from a ward-booth-2026 doc robustly.
-            Strategy (in order):
-              1. Exact key match (fastest)
-              2. Case-insensitive exact match
-              3. Fuzzy substring match — handles invisible Unicode, special
-                 bracket variants (U+FF08/FF09 etc.) in stored field names
+            Tries each candidate key exactly, then falls back to a prefix scan.
+            This handles MongoDB field names that contain unicode characters
+            (e.g. special parentheses, invisible chars) that differ from the
+            Python string literal and cause .get() to silently return None.
             """
-            if not doc:
-                return 0
-            # 1. Exact match
             for key in candidates:
                 v = doc.get(key)
                 if v not in (None, ''):
@@ -612,14 +576,11 @@ def api_ward_dashboard(request):
                         return int(str(v).replace(',', '').strip())
                     except (ValueError, TypeError):
                         pass
-            # 2 & 3. Case-insensitive / fuzzy substring scan
-            for candidate in candidates:
-                term = _search_term(candidate)
-                if not term:
-                    continue
+            # Prefix scan fallback — matches any key starting with the first candidate
+            prefix = candidates[0].split('(')[0].strip() if candidates else ''
+            if prefix:
                 for k, val in doc.items():
-                    k_norm = k.strip().lower()
-                    if term in k_norm and val not in (None, ''):
+                    if k.startswith(prefix) and val not in (None, ''):
                         try:
                             result = int(str(val).replace(',', '').strip())
                             if result:
@@ -629,22 +590,15 @@ def api_ward_dashboard(request):
             return 0
 
         def _get_wb_str(doc, *candidates):
-            """Same as _get_wb_field but returns a string (for % fields)."""
-            if not doc:
-                return ''
-            # 1. Exact match
+            """Same as _get_wb_field but returns a string value (for pct fields)."""
             for key in candidates:
                 v = doc.get(key)
                 if v not in (None, ''):
                     return str(v).strip()
-            # 2 & 3. Fuzzy substring scan
-            for candidate in candidates:
-                term = _search_term(candidate)
-                if not term:
-                    continue
+            prefix = candidates[0].split('(')[0].strip() if candidates else ''
+            if prefix:
                 for k, val in doc.items():
-                    k_norm = k.strip().lower()
-                    if term in k_norm and val not in (None, ''):
+                    if k.startswith(prefix) and val not in (None, ''):
                         return str(val).strip()
             return ''
 
@@ -662,10 +616,7 @@ def api_ward_dashboard(request):
                 file=sys.stderr
             )
 
-        # Total Voters = Total Electors from ward-booth-2026 ONLY
-        # Never fall back to WardReference.totalCount (stale data)
-        total_voters  = total_electors_2026
-        # Gender/religion demographics from WardReference (ward-booth-2026 has no gender split)
+        total_voters  = total_electors_2026 or _num(ref.get('totalCount'))
         total_male    = _num(ref.get('totalMale'))
         total_female  = _num(ref.get('totalFemale'))
         total_trans   = _num(ref.get('totalTrans'))
@@ -689,7 +640,8 @@ def api_ward_dashboard(request):
             'boothCount':      _get_wb_field(wb_doc, 'Count'),
         } if wb_doc else {}
 
-        # ── 3. SurveyRecords — how many surveyed for this ward ────────────────
+        # ── 2. SurveyRecords — how many surveyed for this ward ────────────────
+        survey_db    = get_survey_db()
         ward_filters = [{'wardNumber': ward}]
         if ward_int is not None:
             ward_filters.append({'wardNumber': ward_int})
@@ -737,7 +689,7 @@ def api_ward_dashboard(request):
                 {'$match': {'count': {'$gt': 15}}},
                 {'$count': 'n'},
             ]
-            lf_result = list(main_db['2025'].aggregate(lf_pipeline))
+            lf_result = list(db['2025'].aggregate(lf_pipeline))
             large_family_count = lf_result[0]['n'] if lf_result else 0
 
         # ── 4. Coverage ───────────────────────────────────────────────────────
