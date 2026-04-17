@@ -536,112 +536,137 @@ def api_ward_dashboard(request):
         return JsonResponse({'success': True, **cached['data']})
 
     try:
-        db       = get_survey_db()
-        ward_int = int(ward) if ward.isdigit() else None
+        # survey_db → survey cluster: ward-booth-2026, SurveyRecords
+        # main_db   → main cluster:   WardReference, 2025 voter list
+        import re as _re
 
-        # ── 1. ward-booth-2026 — authoritative 2026 voter totals ─────────────
-        wb_coll = db['ward-booth-2026']
-        wb_filt = {'$or': [{'Ward No': ward_int}, {'Ward No': ward}]} if ward_int is not None else {'Ward No': ward}
-        wb_doc  = wb_coll.find_one(wb_filt) or {}
+        survey_db = get_survey_db()
+        main_db   = get_db()
+        ward_int  = int(ward) if ward.isdigit() else None
 
-        # ── 2. WardReference — fallback / supplemental demographics ──────────
-        ref = db['WardReference'].find_one(
+        # ── 1. ward-booth-2026 on survey cluster ─────────────────────────────
+        wb_filt = (
+            {'$or': [{'Ward No': ward_int}, {'Ward No': ward}, {'Ward No': str(ward_int)}]}
+            if ward_int is not None else {'Ward No': ward}
+        )
+        wb_doc = survey_db['ward-booth-2026'].find_one(wb_filt) or {}
+        # Fallback: full scan in case find_one missed due to type/Unicode mismatch
+        if not wb_doc and ward_int is not None:
+            for _d in survey_db['ward-booth-2026'].find():
+                if str(_d.get('Ward No', '')).strip() == str(ward_int):
+                    wb_doc = _d
+                    break
+
+        # ── 2. WardReference on main cluster (gender/religion demographics) ──
+        ref = main_db['WardReference'].find_one(
             {'number': ward_int} if ward_int is not None else {'number': ward}
         ) or {}
 
-        # Use module-level WARD_NUM_TO_NAME — no local copy needed
-        ward_name    = wb_doc.get('Ward Name') or ref.get('name') or WARD_NUM_TO_NAME.get(ward, WARD_NUM_TO_NAME.get(str(ward), f'Ward {ward}'))
-        district_id  = ref.get('districtId')
-        const_id     = ref.get('constituencyId')
+        ward_name   = (wb_doc.get('Ward Name') or '').strip() or ref.get('name') or WARD_NUM_TO_NAME.get(ward, WARD_NUM_TO_NAME.get(str(ward), f'Ward {ward}'))
+        district_id = ref.get('districtId')
+        const_id    = ref.get('constituencyId')
 
-        # 2026 data takes priority over WardReference for voter totals
+        # ── Field helpers ─────────────────────────────────────────────────────
         def _num(val):
-            """Coerce string/None → int."""
             if val is None: return 0
             try: return int(str(val).replace(',', '').strip())
             except: return 0
 
+        def _alphanum(s):
+            """Strip ALL non-alphanumeric chars, lowercase — Unicode-invariant."""
+            return _re.sub(r'[^a-z0-9]', '', str(s).lower())
+
+        def _core(candidate):
+            """
+            Extract searchable core from a candidate key name:
+            '% BLO Mapped (HøD)'  → 'blo mapped'
+            'Total Electors (E)'  → 'total electors'
+            'Ageò Cutoff (J)'     → 'ageò cutoff' → normalized → 'agecutoff'
+            """
+            s = candidate.lstrip('%').strip()
+            s = _re.split(r'\s*[\(\[{]', s)[0].strip()
+            return s.lower()
+
         def _get_wb_field(doc, *candidates):
             """
-            Fetch a numeric field from a ward-booth-2026 doc robustly.
-            Tries each candidate key exactly, then falls back to a prefix scan.
-            This handles MongoDB field names that contain unicode characters
-            (e.g. special parentheses, invisible chars) that differ from the
-            Python string literal and cause .get() to silently return None.
+            Read a numeric field from a ward-booth-2026 document.
+            Strategy:
+              1. Exact key match — fast path for plain ASCII keys
+              2. Normalized match — strips ALL non-alphanumeric chars from both
+                 the search term and the actual stored key before comparing.
+                 Handles fullwidth parens, non-breaking spaces, Unicode letter
+                 variants and any other invisible characters MongoDB may store.
+            For % fields: only matches keys that start with '%'.
             """
+            if not doc: return 0
+            # 1. Exact
             for key in candidates:
                 v = doc.get(key)
                 if v not in (None, ''):
-                    try:
-                        return int(str(v).replace(',', '').strip())
-                    except (ValueError, TypeError):
-                        pass
-            # Prefix scan fallback — matches any key starting with the first candidate
-            prefix = candidates[0].split('(')[0].strip() if candidates else ''
-            if prefix:
+                    try: return int(str(v).replace(',', '').strip())
+                    except (ValueError, TypeError): pass
+            # 2. Normalized
+            for candidate in candidates:
+                norm  = _alphanum(_core(candidate))
+                if not norm: continue
+                want_pct = candidate.strip().startswith('%')
                 for k, val in doc.items():
-                    if k.startswith(prefix) and val not in (None, ''):
+                    if want_pct != k.strip().startswith('%'): continue
+                    if norm in _alphanum(k) and val not in (None, ''):
                         try:
-                            result = int(str(val).replace(',', '').strip())
-                            if result:
-                                return result
-                        except (ValueError, TypeError):
-                            pass
+                            r = int(str(val).replace(',', '').strip())
+                            if r: return r
+                        except (ValueError, TypeError): pass
             return 0
 
         def _get_wb_str(doc, *candidates):
-            """Same as _get_wb_field but returns a string value (for pct fields)."""
+            """Same as _get_wb_field but returns the raw string value."""
+            if not doc: return ''
             for key in candidates:
                 v = doc.get(key)
-                if v not in (None, ''):
-                    return str(v).strip()
-            prefix = candidates[0].split('(')[0].strip() if candidates else ''
-            if prefix:
+                if v not in (None, ''): return str(v).strip()
+            for candidate in candidates:
+                norm = _alphanum(_core(candidate))
+                if not norm: continue
+                want_pct = candidate.strip().startswith('%')
                 for k, val in doc.items():
-                    if k.startswith(prefix) and val not in (None, ''):
+                    if want_pct != k.strip().startswith('%'): continue
+                    if norm in _alphanum(k) and val not in (None, ''):
                         return str(val).strip()
             return ''
 
-        # ── Read Total Electors from ward-booth-2026 (robust field scan) ────────
-        # Previously: _num(wb_doc.get('Total Electors (E)')) — silently returned 0
-        # if the stored key had unicode variants, causing fallback to stale WardReference.
-        total_electors_2026 = _get_wb_field(wb_doc, 'Total Electors (E)', 'Total Electors') if wb_doc else 0
-        print(total_electors_2026)
-        # Log a warning if 2026 data exists but electors came up zero (field name mismatch)
-        if wb_doc and not total_electors_2026:
+        # ── Total Voters = Total Electors from ward-booth-2026 ONLY ──────────
+        total_voters = _get_wb_field(wb_doc, 'Total Electors (E)', 'Total Electors')
+        if wb_doc and not total_voters:
             import sys
-            print(
-                f'[WARN ward-{ward}] ward-booth-2026 doc found but Total Electors resolved to 0. '
-                f'Actual keys: {list(wb_doc.keys())}',
-                file=sys.stderr
-            )
+            print(f'[ward-{ward}] wb_doc found but Total Electors=0. Keys: {list(wb_doc.keys())}', file=sys.stderr)
 
-        total_voters  = total_electors_2026 or _num(ref.get('totalCount'))
-        total_male    = _num(ref.get('totalMale'))
-        total_female  = _num(ref.get('totalFemale'))
-        total_trans   = _num(ref.get('totalTrans'))
-        total_hindu   = _num(ref.get('totalHindu'))
-        total_muslim  = _num(ref.get('totalMuslim'))
-        total_chr     = _num(ref.get('totalChristian'))
+        # Gender/religion from WardReference (ward-booth-2026 has no gender split)
+        total_male   = _num(ref.get('totalMale'))
+        total_female = _num(ref.get('totalFemale'))
+        total_trans  = _num(ref.get('totalTrans'))
+        total_hindu  = _num(ref.get('totalHindu'))
+        total_muslim = _num(ref.get('totalMuslim'))
+        total_chr    = _num(ref.get('totalChristian'))
 
-        # 2026-specific fields — all read via robust helper to avoid silent misses
+        # ── 2026-specific mapping fields ──────────────────────────────────────
         wb2026 = {
-            'totalElectors':   total_electors_2026,
-            'cutoffElectors':  _get_wb_field(wb_doc, 'Cutoff Elec (D)', 'Cutoff Elec'),
-            'bloMapped':       _get_wb_field(wb_doc, 'BLO Mapped'),
-            'totalMapped':     _get_wb_field(wb_doc, 'Total Mapped (H)', 'Total Mapped'),
-            'pctBloMapped':    _get_wb_str(wb_doc,   '% BLO Mapped (HøD)', '% BLO Mapped'),
-            'ageCutoff':       _get_wb_field(wb_doc, 'Ageò Cutoff (J)', 'Age Cutoff', 'Ageo Cutoff'),
-            'progeny18':       _get_wb_field(wb_doc, 'Progeny >18 (K)', 'Progeny >18'),
-            'pctProgeny':      _get_wb_str(wb_doc,   '% Progeny (KøJ)', '% Progeny'),
-            'electorsMapped':  _get_wb_field(wb_doc, 'Electors Mapped (M)', 'Electors Mapped'),
-            'pctTotal':        _get_wb_str(wb_doc,   '% Total (MøE)', '% Total'),
-            'supervisors':     wb_doc.get('Supervisors', '') if wb_doc else '',
-            'boothCount':      _get_wb_field(wb_doc, 'Count'),
+            'totalElectors':  total_voters,
+            'cutoffElectors': _get_wb_field(wb_doc, 'Cutoff Elec (D)',    'Cutoff Elec'),
+            'bloMapped':      _get_wb_field(wb_doc, 'BLO Mapped'),
+            'totalMapped':    _get_wb_field(wb_doc, 'Total Mapped (H)',    'Total Mapped'),
+            'pctBloMapped':   _get_wb_str  (wb_doc, '% BLO Mapped (HøD)', '% BLO Mapped'),
+            'ageCutoff':      _get_wb_field(wb_doc, 'Ageò Cutoff (J)',     'Age Cutoff',   'Ageo Cutoff'),
+            'progeny18':      _get_wb_field(wb_doc, 'Progeny >18 (K)',     'Progeny >18'),
+            'pctProgeny':     _get_wb_str  (wb_doc, '% Progeny (KøJ)',     '% Progeny'),
+            'electorsMapped': _get_wb_field(wb_doc, 'Electors Mapped (M)', 'Electors Mapped'),
+            'pctTotal':       _get_wb_str  (wb_doc, '% Total (MøE)',       '% Total'),
+            'supervisors':    (wb_doc.get('Supervisors') or '').strip(),
+            'boothCount':     _get_wb_field(wb_doc, 'Count'),
+            'boothList':      (wb_doc.get('Booths (Part Nos.)') or '').strip(),
         } if wb_doc else {}
 
-        # ── 2. SurveyRecords — how many surveyed for this ward ────────────────
-        survey_db    = get_survey_db()
+        # ── SurveyRecords — surveyed count for this ward ───────────────────────
         ward_filters = [{'wardNumber': ward}]
         if ward_int is not None:
             ward_filters.append({'wardNumber': ward_int})
@@ -689,7 +714,7 @@ def api_ward_dashboard(request):
                 {'$match': {'count': {'$gt': 15}}},
                 {'$count': 'n'},
             ]
-            lf_result = list(db['2025'].aggregate(lf_pipeline))
+            lf_result = list(main_db['2025'].aggregate(lf_pipeline))
             large_family_count = lf_result[0]['n'] if lf_result else 0
 
         # ── 4. Coverage ───────────────────────────────────────────────────────
@@ -766,7 +791,6 @@ def _clean_wb2026_doc(doc):
 def api_ward_booth_2026(request):
     import time as _t
     ward_param = request.GET.get('ward', '').strip()
-    print(ward_param)
     cache_key  = ward_param or 'all'
 
     cached = _wb2026_cache.get(cache_key)
