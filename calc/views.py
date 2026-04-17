@@ -1267,11 +1267,9 @@ def api_data_view(request):
 
         # ── Collection and field setup per view type ──────────────────────────
         if view_type == 'voter':
-            # 2025 voter roll — SurveyDataBase.2025
-            per_page  = min(int(request.GET.get('per_page', 200)), 200)
-            db        = get_db()
-            coll      = db['2025']
-            # Fetch all displayable fields
+            per_page = min(int(request.GET.get('per_page', 200)), 200)
+            db       = get_db()
+            coll     = db['2025']
             PROJ = {
                 'Name': 1, 'Epic NO': 1, 'House No': 1,
                 'Gender': 1, 'Age': 1, 'Booth No': 1, 'Part No': 1,
@@ -1289,11 +1287,44 @@ def api_data_view(request):
                 ]}
             else:
                 query = {}
-        else:
-            per_page  = min(int(request.GET.get('per_page', 100)), 500)
-            db        = get_survey_db()
-            coll      = db['SurveyRecords']
-            PROJ      = None
+
+        elif view_type == 'future_voters':
+            per_page = min(int(request.GET.get('per_page', 100)), 500)
+            db       = get_survey_db()
+            coll     = db['FutureVoters']
+            PROJ     = None
+            if search:
+                regex = {'$regex': search, '$options': 'i'}
+                query = {'$or': [
+                    {'name':        regex},
+                    {'houseNumber': regex},
+                    {'wardNumber':  regex},
+                    {'gender':      regex},
+                ]}
+            else:
+                query = {}
+
+        elif view_type == 'deceased':
+            per_page = min(int(request.GET.get('per_page', 100)), 500)
+            db       = get_survey_db()
+            coll     = db['Deceased']
+            PROJ     = None
+            if search:
+                regex = {'$regex': search, '$options': 'i'}
+                query = {'$or': [
+                    {'name':        regex},
+                    {'voterid':     regex},
+                    {'houseNumber': regex},
+                    {'gender':      regex},
+                ]}
+            else:
+                query = {}
+
+        else:  # survey (default)
+            per_page = min(int(request.GET.get('per_page', 100)), 500)
+            db       = get_survey_db()
+            coll     = db['SurveyRecords']
+            PROJ     = None
             if search:
                 regex = {'$regex': search, '$options': 'i'}
                 query = {'$or': [
@@ -1306,17 +1337,16 @@ def api_data_view(request):
             else:
                 query = {}
 
-        total = coll.count_documents(query)
-        skip  = (page - 1) * per_page
+        total  = coll.count_documents(query)
+        skip   = (page - 1) * per_page
         cursor = coll.find(query, PROJ) if PROJ else coll.find(query)
-        docs  = list(cursor.skip(skip).limit(per_page))
+        docs   = list(cursor.skip(skip).limit(per_page))
 
-        if view_type == 'survey':
-            data = [bson_clean(d, keep_id=True) for d in docs]
-           
-        else:
+        if view_type == 'voter':
             data = [bson_clean(d) for d in docs]
-        
+        else:
+            data = [bson_clean(d, keep_id=True) for d in docs]
+
         all_keys, seen = [], set()
         for d in data:
             for k in d.keys():
@@ -1325,9 +1355,14 @@ def api_data_view(request):
                     all_keys.append(k)
 
         display_cols = [k for k in all_keys if k != '_id']
-        print(data)
-        # Debug info: tell frontend what collection was queried
-        coll_name = '2025' if view_type == 'voter' else 'SurveyRecords'
+
+        coll_name = {
+            'voter':         '2025',
+            'survey':        'SurveyRecords',
+            'future_voters': 'FutureVoters',
+            'deceased':      'Deceased',
+        }.get(view_type, view_type)
+
         return JsonResponse({
             'success':    True,
             'data':       data,
@@ -1347,9 +1382,6 @@ def api_data_view(request):
             'message': f'Data fetch error: {str(exc)}',
             'data': [], 'columns': [], 'total': 0, 'page': 1, 'pages': 1
         }, status=500)
-
-
-# ─── VOTER SEARCH ─────────────────────────────────────────────────────────────
 
 @require_http_methods(['GET'])
 def api_voter_search(request):
