@@ -777,10 +777,34 @@ def api_large_families(request):
 
 @require_http_methods(['GET'])
 def api_serial_number(request):
+    """
+    Returns the next survey serial OR the 2025 voter-roll serial for a specific voter.
+
+    GET /api/serial-number/              → next auto-increment (for SurveyOpt display)
+    GET /api/serial-number/?voterid=XYZ  → Serial No from SurveyDataBase.2025 for that voter
+                                           Falls back to auto-increment if voter not found.
+    """
+    voterid = request.GET.get('voterid', '').strip().upper()
+
+    if voterid:
+        # Try to find the voter in the 2025 roll and return their Serial No
+        voter_2025 = get_db()['2025'].find_one(
+            {'Epic NO': voterid},
+            {'Serial No': 1, 'Sl No': 1}
+        )
+        if voter_2025:
+            serial = voter_2025.get('Serial No') or voter_2025.get('Sl No')
+            if serial:
+                try:
+                    return JsonResponse({'serialNumber': int(serial), 'source': '2025_roll'})
+                except (ValueError, TypeError):
+                    pass   # fall through to auto-increment
+
+    # Default: next auto-increment from SurveyRecords
     db     = get_survey_db()
     latest = db['SurveyRecords'].find_one(sort=[('serialNumber', -1)])
     serial = (int(latest['serialNumber']) + 1) if latest else 1
-    return JsonResponse({'serialNumber': serial})
+    return JsonResponse({'serialNumber': serial, 'source': 'auto'})
 
 
 @csrf_exempt
@@ -803,6 +827,40 @@ def api_save_survey(request):
 
     is_outstation = body.get('outstationResident') == 'Yes'
 
+    # ── 1. Look up voter in 2025 roll ─────────────────────────────────────────
+    voterid     = (body.get('voterid') or '').strip().upper()
+    col_2025    = get_db()['2025']
+    voter_2025  = None
+
+    if voterid:
+        voter_2025 = col_2025.find_one(
+            {'Epic NO': voterid},
+            {'Serial No': 1, 'Sl No': 1, 'Name': 1, 'House No': 1, 'Booth No': 1}
+        )
+
+    # If no voterid, try name + house match as fallback
+    if not voter_2025:
+        first = (body.get('firstName') or '').strip()
+        last  = (body.get('lastName')  or '').strip()
+        house = (body.get('houseNumber') or '').strip()
+        full_name = f"{first} {last}".strip()
+        if full_name and house:
+            voter_2025 = col_2025.find_one(
+                {'Name': {'$regex': f'^{re.escape(full_name)}$', '$options': 'i'}, 'House No': house},
+                {'Serial No': 1, 'Sl No': 1, 'Name': 1, 'House No': 1, 'Booth No': 1}
+            )
+
+    # ── 2. Use 2025 Serial No if found, else keep the submitted serial ────────
+    serial_from_2025 = None
+    if voter_2025:
+        raw_serial = voter_2025.get('Serial No') or voter_2025.get('Sl No')
+        try:
+            serial_from_2025 = int(raw_serial)
+        except (ValueError, TypeError):
+            pass
+
+    final_serial = serial_from_2025 if serial_from_2025 is not None else int(body.get('serialNumber') or 1)
+
     data = {
         # ── Personal ──────────────────────────────────────────────
         'firstName':        body.get('firstName'),
@@ -810,12 +868,13 @@ def api_save_survey(request):
         'lastName':         body.get('lastName'),
         'addharNumber':     body.get('addharNumber'),
         'contactNumber':    body.get('contactNumber'),
-        'serialNumber':     int(body.get('serialNumber') or 1),
+        'serialNumber':     final_serial,           # ← from 2025 roll when available
+        'serialSource':     '2025_roll' if serial_from_2025 is not None else 'manual',
         'dob':              dob_str,
         'age':              age,
         'gender':           body.get('gender'),
         'maritalStatus':    body.get('maritalStatus'),
-        'voterid':          body.get('voterid'),
+        'voterid':          voterid or body.get('voterid'),
 
         # ── Outstation ────────────────────────────────────────────
         'outstationResident': body.get('outstationResident', 'No'),
@@ -863,26 +922,39 @@ def api_save_survey(request):
         'Time_stamp':       datetime.utcnow(),
     }
 
-    db  = get_survey_db()
-    col = db['SurveyRecords']
-    voterid = data.get('voterid', '').strip()
+    survey_db = get_survey_db()
 
-    if voterid:
-        existing = col.find_one({'voterid': voterid}, {'_id': 1})  # projection — fetch only _id, not full doc
+    # ── 3. Duplicate check ────────────────────────────────────────────────────
+    vid_check = data.get('voterid', '') or ''
+    if vid_check.strip():
+        existing = survey_db['SurveyRecords'].find_one({'voterid': vid_check.strip()}, {'_id': 1})
         if existing:
             return JsonResponse(
-                {'success': False, 'message': f'Survey for Voter ID "{voterid}" already exists.'},
+                {'success': False, 'message': f'Survey for Voter ID "{vid_check}" already exists.'},
                 status=409
             )
 
-    col.insert_one(data)
+    # ── 4. Save to correct collection ────────────────────────────────────────
+    # voter_2025 is None  →  not in 2025 voter roll → NotFoundRecordSurvey
+    # voter_2025 found    →  normal path             → SurveyRecords
+    if voter_2025 is None:
+        # Mark the reason and save to the "not found" collection
+        data['notFoundReason'] = (
+            'Voter ID not in 2025 roll' if voterid
+            else 'Name + house not matched in 2025 roll'
+        )
+        survey_db['NotFoundRecordSurvey'].insert_one(data)
+        print(f"[api_save_survey] Voter NOT in 2025 roll — saved to NotFoundRecordSurvey: {voterid or data.get('firstName')}")
+        collection_used = 'NotFoundRecordSurvey'
+    else:
+        survey_db['SurveyRecords'].insert_one(data)
+        print(f"[api_save_survey] Saved to SurveyRecords — serial {final_serial} (from 2025 roll)")
+        collection_used = 'SurveyRecords'
 
-    # ── Auto-run SIR analysis in background (non-blocking) ────────────────
-    # SIR writes to SIR_* collections asynchronously so the save response
-    # is returned to the user immediately without waiting for SIR lookups.
+    # ── 5. Background SIR analysis ────────────────────────────────────────────
     def _sir_bg():
         try:
-            voterid_sir = data.get('voterid', '').strip().upper()
+            voterid_sir = data.get('voterid', '').strip().upper() if data.get('voterid') else ''
             name_sir    = _norm((data.get('firstName', '') + ' ' + data.get('lastName', '')).strip())
             house_sir   = _norm(data.get('houseNumber', ''))
             ward_sir    = data.get('wardNumber', '')
@@ -898,8 +970,12 @@ def api_save_survey(request):
     threading.Thread(target=_sir_bg, daemon=True).start()
 
     return JsonResponse({
-        'success': True,
-        'message': 'Survey saved successfully.',
+        'success':        True,
+        'message':        'Survey saved successfully.',
+        'serialNumber':   final_serial,
+        'serialSource':   data['serialSource'],
+        'collection':     collection_used,
+        'inVoterRoll':    voter_2025 is not None,
     })
 
 
