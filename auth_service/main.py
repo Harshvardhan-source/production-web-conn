@@ -294,6 +294,36 @@ def logout(response: Response):
     return {"success": True}
 
 
+@app.post("/auth/verify-admin")
+def verify_admin(body: LoginBody):
+    """
+    Re-authentication gate for the Admin Panel.
+    Verifies the currently logged-in admin's password without issuing a new token.
+    Returns 200 on success, 401 on wrong password, 403 if not an admin role.
+    """
+    db   = get_db()
+    user = db["UserReg"].find_one({"Email": body.email})
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect password.")
+
+    # Role check — only mla and pa can pass
+    if user.get("role", "") not in ("mla", "pa"):
+        raise HTTPException(status_code=403, detail="You do not have admin privileges.")
+
+    # Password check
+    stored = user.get("Password", "")
+    try:
+        pwd_ok = _bcrypt.checkpw(body.password.encode(), stored.encode())
+    except Exception:
+        pwd_ok = (stored == body.password)
+
+    if not pwd_ok:
+        raise HTTPException(status_code=401, detail="Incorrect password. Please try again.")
+
+    return {"success": True, "message": "Verified."}
+
+
 @app.get("/auth/me")
 def me(response: Response, user: dict = Depends(get_current_user)):
     db      = get_db()
