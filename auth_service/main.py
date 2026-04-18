@@ -335,7 +335,7 @@ def me(response: Response, user: dict = Depends(get_current_user)):
         "success":  True,
         "username": user["username"],
         "email":    user["sub"],
-        "role":     profile.get("role",   ""),   # always return what's in UserReg — never invent a default
+        "role":     profile.get("role",   ""),   # always return exactly what UserReg has
         "ward":     profile.get("ward",   ""),
         "booth":    profile.get("booth",  ""),
         "status":   profile.get("status", "pending"),
