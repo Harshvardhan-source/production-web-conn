@@ -604,17 +604,19 @@ def api_ward_dashboard(request):
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
 
 
+
+
 # ─── BOOTH DASHBOARD ──────────────────────────────────────────────────────────
 # GET /api/booth-dashboard/?ward=21&booth=31
-# Reads WardBoothWise_2026 (ward-booth-details) on survey cluster for 2026 stats.
-# Also queries SurveyRecords for survey coverage at booth level.
+# WardBoothWise_2026  → ORIGINAL cluster, SurveyDataBase  (get_db())
+# SurveyRecords       → SURVEY cluster,   SurveyDataBase  (get_survey_db())
 
-_booth_dash_cache = {}   # { 'ward_booth': {'data': {...}, 'ts': float} }
-_BOOTH_CACHE_TTL  = 300  # 5 minutes
+_booth_dash_cache = {}
+_BOOTH_CACHE_TTL  = 300   # 5 minutes
 
 @require_http_methods(['GET'])
 def api_booth_dashboard(request):
-    import time as _t, re as _re
+    import time as _t
     ward  = request.GET.get('ward',  '').strip()
     booth = request.GET.get('booth', '').strip()
     if not ward or not booth:
@@ -626,45 +628,43 @@ def api_booth_dashboard(request):
         return JsonResponse({'success': True, **cached['data']})
 
     try:
-        # WardBoothWise_2026 → main1 cluster (MainB)
-        # SurveyRecords       → survey cluster
-        main1_db  = get_db1()
-        survey_db = get_survey_db()
+        # WardBoothWise_2026 is in SurveyDataBase on the ORIGINAL cluster
+        main_db   = get_db()           # _get_main_client() → SurveyDataBase
+        survey_db = get_survey_db()    # _get_survey_client() → SurveyDataBase
         ward_int  = int(ward)  if ward.isdigit()  else None
         booth_int = int(booth) if booth.isdigit() else None
 
-        # ── 1. WardBoothWise_2026 — booth-level 2026 electors data ───────────
-        #    Lives on main1 cluster (MainB database, _get_main1_client)
+        # ── 1. WardBoothWise_2026 — booth electors data ───────────────────────
         filt = {}
         if ward_int is not None and booth_int is not None:
             filt = {'$or': [
                 {'wardNumber': ward_int,  'boothNumber': booth_int},
-                {'wardNumber': str(ward), 'boothNumber': booth},
+                {'wardNumber': str(ward), 'boothNumber': str(booth)},
+                {'wardNumber': ward_int,  'boothNumber': str(booth_int)},
             ]}
-        booth_doc = main1_db['WardBoothWise_2026'].find_one(filt) or {}
+        booth_doc = main_db['WardBoothWise_2026'].find_one(filt) or {}
 
-        # Fallback: full scan if type mismatch
-        if not booth_doc and ward_int is not None and booth_int is not None:
-            for _d in main1_db['WardBoothWise_2026'].find():
-                if (str(_d.get('wardNumber','')).strip() == str(ward_int) and
-                    str(_d.get('boothNumber','')).strip() == str(booth_int)):
+        # Fallback: full-collection scan handles any type mismatch
+        if not booth_doc:
+            for _d in main_db['WardBoothWise_2026'].find():
+                if (str(_d.get('wardNumber', '')).strip() == str(ward_int or ward) and
+                        str(_d.get('boothNumber', '')).strip() == str(booth_int or booth)):
                     booth_doc = _d
                     break
 
         def _num(v):
             if v is None: return 0
-            try: return int(str(v).replace(',','').strip())
+            try: return int(str(v).replace(',', '').strip())
             except: return 0
 
         def _flt(v):
             if v is None: return 0.0
-            try: return round(float(str(v).replace('%','').replace(',','').strip()), 2)
+            try: return round(float(str(v).replace('%', '').replace(',', '').strip()), 2)
             except: return 0.0
 
-        ward_name   = (booth_doc.get('wardName') or '').strip() or WARD_NUM_TO_NAME.get(ward, f'Ward {ward}')
-        booth_electors = _num(booth_doc.get('totalElectors'))
+        ward_name = (booth_doc.get('wardName') or '').strip() or WARD_NUM_TO_NAME.get(ward, f'Ward {ward}')
 
-        # ── 2. SurveyRecords — how many surveyed for this booth ───────────────
+        # ── 2. SurveyRecords — surveyed count for this booth ──────────────────
         booth_filters = [{'boothNo': booth}]
         if booth_int is not None:
             booth_filters.append({'boothNo': booth_int})
@@ -685,35 +685,32 @@ def api_booth_dashboard(request):
         total_reg   = s_res['total'][0]['n']  if s_res['total']  else 0
         house_count = s_res['houses'][0]['n'] if s_res['houses'] else 0
         gmap        = {g['_id']: g['n'] for g in s_res['genders']}
-        reg_male    = gmap.get('Male',   0)
-        reg_female  = gmap.get('Female', 0)
 
-        # ── 3. Coverage ───────────────────────────────────────────────────────
-        denom        = booth_electors or 1
-        coverage_pct = round(total_reg / denom * 100, 1)
+        total_electors = _num(booth_doc.get('totalElectors'))
+        coverage_pct   = round(total_reg / (total_electors or 1) * 100, 1)
 
         result = {
-            'wardNumber':       ward,
-            'wardName':         ward_name,
-            'boothNumber':      booth_int or booth,
-            # 2026 electors data
-            'totalElectors':    booth_electors,
-            'cutoffElec':       _num(booth_doc.get('cutoffElec')),
-            'bloMapped':        _num(booth_doc.get('bloMapped')),
-            'totalMapped':      _num(booth_doc.get('totalMapped')),
-            'pctBloMapped':     _flt(booth_doc.get('pctBloMapped')),
-            'ageCutoff':        _num(booth_doc.get('ageCutoff')),
-            'progeny18':        _num(booth_doc.get('progeny18')),
-            'pctProgeny':       _flt(booth_doc.get('pctProgeny')),
-            'electorsMapped':   _num(booth_doc.get('electorsMapped')),
-            'pctElectorsMapped':_flt(booth_doc.get('pctElectorsMapped')),
-            'pctTotalCompleted':_flt(booth_doc.get('pctTotalCompleted')),
-            # Survey coverage
-            'totalReg':         total_reg,
-            'regMale':          reg_male,
-            'regFemale':        reg_female,
-            'houseCount':       house_count,
-            'coveragePct':      coverage_pct,
+            'wardNumber':        ward,
+            'wardName':          ward_name,
+            'boothNumber':       booth_int or booth,
+            # 2026 electors — from WardBoothWise_2026
+            'totalElectors':     total_electors,
+            'cutoffElec':        _num(booth_doc.get('cutoffElec')),
+            'bloMapped':         _num(booth_doc.get('bloMapped')),
+            'totalMapped':       _num(booth_doc.get('totalMapped')),
+            'pctBloMapped':      _flt(booth_doc.get('pctBloMapped')),
+            'ageCutoff':         _num(booth_doc.get('ageCutoff')),
+            'progeny18':         _num(booth_doc.get('progeny18')),
+            'pctProgeny':        _flt(booth_doc.get('pctProgeny')),
+            'electorsMapped':    _num(booth_doc.get('electorsMapped')),
+            'pctElectorsMapped': _flt(booth_doc.get('pctElectorsMapped')),
+            'pctTotalCompleted': _flt(booth_doc.get('pctTotalCompleted')),
+            # Survey coverage — from SurveyRecords
+            'totalReg':          total_reg,
+            'regMale':           gmap.get('Male',   0),
+            'regFemale':         gmap.get('Female', 0),
+            'houseCount':        house_count,
+            'coveragePct':       coverage_pct,
         }
 
         _booth_dash_cache[cache_key] = {'data': result, 'ts': _t.time()}
