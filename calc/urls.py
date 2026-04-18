@@ -48,4 +48,10 @@ urlpatterns = [
     
     # Wards
     path('wards/',                   views.api_wards,              name='api_wards'),
+
+    # Admin — role management & approvals (MLA / PA only)
+    path('admin/users/',             views.api_admin_users,        name='api_admin_users'),
+    path('admin/approve/',           views.api_admin_approve,      name='api_admin_approve'),
+    path('admin/reject/',            views.api_admin_reject,       name='api_admin_reject'),
+    path('admin/update-role/',       views.api_admin_update_role,  name='api_admin_update_role'),
 ]

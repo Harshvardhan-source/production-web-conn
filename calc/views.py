@@ -179,7 +179,10 @@ JWT_SECRET = 'c0bcbb0e7afbdef8e53f9db603fb9140b1c793cd1e3e6379e3648281474e83f470
 JWT_ALG    = 'HS256'
 
 def _user_from_request(request):
-    """Extract & validate JWT from httpOnly cookie or Authorization header."""
+    """
+    Extract JWT → get email → fetch full profile (role/status/ward/booth) from DB.
+    Returns None if token is absent, invalid, or user not found.
+    """
     token = request.COOKIES.get('cc_token')
     if not token:
         auth_header = request.META.get('HTTP_AUTHORIZATION', '')
@@ -189,9 +192,157 @@ def _user_from_request(request):
         return None
     try:
         payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-        return {'username': payload.get('username'), 'email': payload.get('sub')}
+        email = payload.get('sub')
+        if not email:
+            return None
+        return _get_user_profile(email)   # full profile with role/status/ward/booth
     except pyjwt.PyJWTError:
         return None
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RBAC — Role-Based Access Control
+# ───────────────────────────────────────────────────────────────────────────────
+# Roles:
+#   mla          → SuperUser  (full read/write across all wards & booths)
+#   pa           → SuperUser  (full read/write — Office P.A)
+#   corporator   → Write own ward only; read all wards (read-only other wards)
+#   booth_worker → Write own booth only; read all booths/wards
+#
+# Status lifecycle:  pending → approved | rejected
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ROLES_SUPERUSER  = {'mla', 'pa'}
+ROLES_ALL        = {'mla', 'pa', 'corporator', 'booth_worker'}
+
+# Fake/test email domains to reject at registration
+_BLOCKED_DOMAINS = {
+    'test.com','example.com','mailinator.com','guerrillamail.com',
+    'tempmail.com','throwaway.email','yopmail.com','trashmail.com',
+    'dispostable.com','maildrop.cc','sharklasers.com','spam4.me',
+    'fakeinbox.com','getairmail.com','mailnull.com','spamgourmet.com',
+    'trashmail.net','tempinbox.com','tempinbox.co.uk',
+}
+
+_EMAIL_RE = re.compile(
+    r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
+)
+
+
+def _validate_email(email: str) -> str | None:
+    """
+    Returns None if email is valid.
+    Returns an error string if invalid.
+    """
+    if not email or len(email) > 254:
+        return 'Invalid email address.'
+    if not _EMAIL_RE.match(email):
+        return 'Invalid email format.'
+    domain = email.split('@')[-1].lower()
+    if domain in _BLOCKED_DOMAINS:
+        return 'Please use a real email address.'
+    # Reject domains with no dot after the @ part
+    if '.' not in domain:
+        return 'Invalid email domain.'
+    return None
+
+
+# ── User profile cache (email → profile, 60s TTL) ───────────────────────────
+_USER_PROFILE_CACHE: dict = {}
+_UPC_TTL = 60   # seconds
+
+
+def _get_user_profile(email: str) -> dict | None:
+    """Fetch full user profile from UserReg. Cached for 60 s."""
+    now = _time.time()
+    cached = _USER_PROFILE_CACHE.get(email)
+    if cached and (now - cached['ts']) < _UPC_TTL:
+        return cached['data']
+    user = get_db()['UserReg'].find_one({'Email': email})
+    if not user:
+        return None
+    profile = {
+        'username': user.get('Username', ''),
+        'email':    email,
+        'role':     user.get('role',   'booth_worker'),
+        'status':   user.get('status', 'pending'),
+        'ward':     str(user.get('ward',  '') or ''),
+        'booth':    str(user.get('booth', '') or ''),
+    }
+    _USER_PROFILE_CACHE[email] = {'data': profile, 'ts': now}
+    return profile
+
+
+def _invalidate_user_cache(email: str):
+    _USER_PROFILE_CACHE.pop(email, None)
+
+
+# ── Access helpers ────────────────────────────────────────────────────────────
+
+def _is_superuser(user: dict) -> bool:
+    return bool(user) and user.get('role') in ROLES_SUPERUSER
+
+
+def _is_approved(user: dict) -> bool:
+    return bool(user) and user.get('status') == 'approved'
+
+
+def _can_write_ward(user: dict, ward) -> bool:
+    """True if the user may create/update survey records for this ward."""
+    if not user or not _is_approved(user):
+        return False
+    if _is_superuser(user):
+        return True
+    role = user.get('role', '')
+    if role == 'corporator':
+        return str(user.get('ward', '')).upper() == str(ward).upper()
+    # booth_worker has no ward-level write
+    return False
+
+
+def _can_write_booth(user: dict, booth) -> bool:
+    """True if the user may create/update survey records for this booth."""
+    if not user or not _is_approved(user):
+        return False
+    if _is_superuser(user):
+        return True
+    role = user.get('role', '')
+    if role == 'corporator':
+        # Corporator can write to any booth within their ward (ward checked separately)
+        return True
+    if role == 'booth_worker':
+        return str(user.get('booth', '')) == str(booth)
+    return False
+
+
+def _require_approved(view_fn):
+    """Decorator: reject unauthenticated or pending/rejected users."""
+    def wrapper(request, *args, **kwargs):
+        user = _user_from_request(request)
+        if not user:
+            return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+        if not _is_approved(user):
+            return JsonResponse({'success': False, 'message': 'Your account is pending admin approval.'}, status=403)
+        return view_fn(request, *args, **kwargs)
+    wrapper.__name__ = view_fn.__name__
+    return wrapper
+
+
+def _require_superuser(view_fn):
+    """Decorator: only MLA / PA may call this endpoint."""
+    def wrapper(request, *args, **kwargs):
+        user = _user_from_request(request)
+        if not user:
+            return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+        if not _is_approved(user):
+            return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
+        if not _is_superuser(user):
+            return JsonResponse({'success': False, 'message': 'Superuser access required.'}, status=403)
+        return view_fn(request, *args, **kwargs)
+    wrapper.__name__ = view_fn.__name__
+    return wrapper
+
 
 
 def bson_clean(doc, keep_id=False):
@@ -236,29 +387,58 @@ def api_register(request):
         body = request.POST.dict()
 
     username = body.get('username', '').strip()
-    email    = body.get('email', '').strip()
+    email    = body.get('email', '').strip().lower()
     password = body.get('password', '').strip()
+    role     = body.get('role', '').strip().lower()
+    ward     = body.get('ward',  '').strip()    # required for corporator
+    booth    = body.get('booth', '').strip()    # required for booth_worker
 
-    if not (username and email and password):
-        return JsonResponse({'success': False, 'message': 'All fields are required.'}, status=400)
+    # ── Validation ────────────────────────────────────────────────────────────
+    if not (username and email and password and role):
+        return JsonResponse({'success': False, 'message': 'Username, email, password and role are required.'}, status=400)
+
+    err = _validate_email(email)
+    if err:
+        return JsonResponse({'success': False, 'message': err}, status=400)
+
+    if role not in ROLES_ALL:
+        return JsonResponse({'success': False, 'message': f'Invalid role. Must be one of: {", ".join(sorted(ROLES_ALL))}'}, status=400)
+
+    if role == 'corporator' and not ward:
+        return JsonResponse({'success': False, 'message': 'Ward is required for Corporator role.'}, status=400)
+
+    if role == 'booth_worker' and not booth:
+        return JsonResponse({'success': False, 'message': 'Booth number is required for Booth Worker role.'}, status=400)
 
     if len(password) < 8 or not re.search(r'[A-Za-z]', password) or not re.search(r'[0-9]', password):
-        return JsonResponse({'success': False, 'message': 'Password must be 8+ chars with letters and numbers.'}, status=400)
+        return JsonResponse({'success': False, 'message': 'Password must be 8+ characters with letters and numbers.'}, status=400)
 
     db = get_db()
     if db['UserReg'].find_one({'Email': email}):
         return JsonResponse({'success': False, 'message': 'Email already registered.'}, status=400)
 
     db['UserReg'].insert_one({
-        'Time_stamp': datetime.utcnow(),
-        'Username': username,
-        'Email': email,
-        'Password': make_password(password),
+        'Time_stamp':   datetime.utcnow(),
+        'Username':     username,
+        'Email':        email,
+        'Password':     make_password(password),
+        'role':         role,
+        'ward':         ward,
+        'booth':        booth,
+        'status':       'pending',   # all new users require admin approval
+        'requestedAt':  datetime.utcnow(),
+        'approvedAt':   None,
+        'approvedBy':   None,
     })
 
-    request.session['username'] = username
-    request.session['email'] = email
-    return JsonResponse({'success': True, 'username': username, 'email': email})
+    return JsonResponse({
+        'success': True,
+        'message': 'Registration submitted. Your account is pending admin approval.',
+        'username': username,
+        'email':    email,
+        'role':     role,
+        'status':   'pending',
+    })
 
 
 # ── Deprecated: use FastAPI /auth/login instead ─────────────────────────────
@@ -290,12 +470,28 @@ def api_login(request):
     if not pwd_ok:
         return JsonResponse({'success': False, 'message': 'Invalid email or password.'}, status=401)
 
+    # ── Check account status ──────────────────────────────────────────────────
+    status = user.get('status', 'pending')
+    if status == 'pending':
+        return JsonResponse({'success': False, 'message': 'Your account is pending admin approval. Please wait.'}, status=403)
+    if status == 'rejected':
+        return JsonResponse({'success': False, 'message': 'Your registration has been rejected. Contact the admin.'}, status=403)
+
     request.session['username'] = user['Username']
     request.session['email']    = email
 
     # Fetch dashboard stats
     stats = _registration_analytics(db)
-    return JsonResponse({'success': True, 'username': user['Username'], 'email': email, **stats})
+    return JsonResponse({
+        'success':  True,
+        'username': user['Username'],
+        'email':    email,
+        'role':     user.get('role',   'booth_worker'),
+        'ward':     user.get('ward',   ''),
+        'booth':    user.get('booth',  ''),
+        'status':   status,
+        **stats,
+    })
 
 
 # ── Deprecated: use FastAPI /auth/logout instead ────────────────────────────
@@ -876,10 +1072,28 @@ def api_serial_number(request):
 @csrf_exempt
 @require_http_methods(['POST'])
 def api_save_survey(request):
+    # ── RBAC gate ─────────────────────────────────────────────────────────────
+    _user = _user_from_request(request)
+    if not _user:
+        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+    if not _is_approved(_user):
+        return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
+
     try:
         body = json.loads(request.body)
     except Exception:
         body = request.POST.dict()
+
+    # Ward / booth write check (after body is parsed so we have ward/booth)
+    _ward_body  = body.get('wardNumber', '')
+    _booth_body = body.get('boothNo',    '')
+    if not _is_superuser(_user):
+        if _user.get('role') == 'corporator':
+            if not _can_write_ward(_user, _ward_body):
+                return JsonResponse({'success': False, 'message': f'You can only submit surveys for your assigned ward ({_user["ward"]}).'}, status=403)
+        elif _user.get('role') == 'booth_worker':
+            if not _can_write_booth(_user, _booth_body):
+                return JsonResponse({'success': False, 'message': f'You can only submit surveys for your assigned booth ({_user["booth"]}).'}, status=403)
 
     dob_str = body.get('dob')
     age = None
@@ -3128,11 +3342,164 @@ def api_2002_status(request):
     })
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADMIN — User approval panel  (MLA / PA only)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@require_http_methods(['GET'])
+@_require_superuser
+def api_admin_users(request):
+    """
+    GET /api/admin/users/
+    Returns all users grouped by status.
+    Query params: ?status=pending|approved|rejected|all (default=all)
+    """
+    status_filter = request.GET.get('status', 'all').strip().lower()
+    query = {} if status_filter == 'all' else {'status': status_filter}
+
+    users = list(get_db()['UserReg'].find(query, {
+        'Password': 0,  # never return password
+    }).sort('Time_stamp', -1))
+
+    result = []
+    for u in users:
+        result.append({
+            '_id':         str(u['_id']),
+            'username':    u.get('Username', ''),
+            'email':       u.get('Email', ''),
+            'role':        u.get('role',    'booth_worker'),
+            'ward':        u.get('ward',    ''),
+            'booth':       u.get('booth',   ''),
+            'status':      u.get('status',  'pending'),
+            'requestedAt': u.get('requestedAt', u.get('Time_stamp', '')).isoformat() if hasattr(u.get('requestedAt', u.get('Time_stamp', '')), 'isoformat') else str(u.get('requestedAt', '')),
+            'approvedAt':  u.get('approvedAt', '').isoformat() if hasattr(u.get('approvedAt', ''), 'isoformat') else str(u.get('approvedAt', '') or ''),
+            'approvedBy':  u.get('approvedBy', ''),
+        })
+
+    pending  = [u for u in result if u['status'] == 'pending']
+    approved = [u for u in result if u['status'] == 'approved']
+    rejected = [u for u in result if u['status'] == 'rejected']
+    return JsonResponse({
+        'success':  True,
+        'pending':  pending,
+        'approved': approved,
+        'rejected': rejected,
+        'total':    len(result),
+    })
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+@_require_superuser
+def api_admin_approve(request):
+    """
+    POST /api/admin/approve/
+    Body: { "email": "user@domain.com" }
+    Approves a pending user and optionally updates their role/ward/booth.
+    """
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        body = request.POST.dict()
+
+    target_email = body.get('email', '').strip().lower()
+    if not target_email:
+        return JsonResponse({'success': False, 'message': 'email is required.'}, status=400)
+
+    admin = _user_from_request(request)
+    update = {
+        'status':     'approved',
+        'approvedAt': datetime.utcnow(),
+        'approvedBy': admin['email'],
+    }
+    # Optionally update role/ward/booth at approval time
+    if body.get('role')  and body['role']  in ROLES_ALL:  update['role']  = body['role']
+    if body.get('ward'):   update['ward']  = body['ward']
+    if body.get('booth'):  update['booth'] = body['booth']
+
+    result = get_db()['UserReg'].update_one({'Email': target_email}, {'$set': update})
+    if result.matched_count == 0:
+        return JsonResponse({'success': False, 'message': 'User not found.'}, status=404)
+
+    _invalidate_user_cache(target_email)
+    return JsonResponse({'success': True, 'message': f'{target_email} approved.'})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+@_require_superuser
+def api_admin_reject(request):
+    """
+    POST /api/admin/reject/
+    Body: { "email": "user@domain.com", "reason": "..." }
+    """
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        body = request.POST.dict()
+
+    target_email = body.get('email', '').strip().lower()
+    if not target_email:
+        return JsonResponse({'success': False, 'message': 'email is required.'}, status=400)
+
+    admin = _user_from_request(request)
+    result = get_db()['UserReg'].update_one({'Email': target_email}, {'$set': {
+        'status':     'rejected',
+        'rejectedAt': datetime.utcnow(),
+        'rejectedBy': admin['email'],
+        'rejectReason': body.get('reason', ''),
+    }})
+    if result.matched_count == 0:
+        return JsonResponse({'success': False, 'message': 'User not found.'}, status=404)
+
+    _invalidate_user_cache(target_email)
+    return JsonResponse({'success': True, 'message': f'{target_email} rejected.'})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+@_require_superuser
+def api_admin_update_role(request):
+    """
+    POST /api/admin/update-role/
+    Body: { "email": "...", "role": "...", "ward": "...", "booth": "..." }
+    Update a user's role/ward/booth after approval.
+    """
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        body = request.POST.dict()
+
+    target_email = body.get('email', '').strip().lower()
+    new_role     = body.get('role', '').strip().lower()
+    if not target_email or not new_role:
+        return JsonResponse({'success': False, 'message': 'email and role are required.'}, status=400)
+    if new_role not in ROLES_ALL:
+        return JsonResponse({'success': False, 'message': f'Invalid role.'}, status=400)
+
+    update = {'role': new_role, 'ward': body.get('ward', ''), 'booth': body.get('booth', '')}
+    result = get_db()['UserReg'].update_one({'Email': target_email}, {'$set': update})
+    if result.matched_count == 0:
+        return JsonResponse({'success': False, 'message': 'User not found.'}, status=404)
+
+    _invalidate_user_cache(target_email)
+    return JsonResponse({'success': True, 'message': f'Role updated for {target_email}.'})
+
+
 # ─── SESSION CHECK ────────────────────────────────────────────────────────────
 
 @require_http_methods(['GET'])
 def api_me(request):
     user = _user_from_request(request)
     if user:
-        return JsonResponse({'loggedIn': True, 'username': user['username'], 'email': user['email']})
+        return JsonResponse({
+            'loggedIn': True,
+            'username': user['username'],
+            'email':    user['email'],
+            'role':     user.get('role',   'booth_worker'),
+            'ward':     user.get('ward',   ''),
+            'booth':    user.get('booth',  ''),
+            'status':   user.get('status', 'pending'),
+        })
     return JsonResponse({'loggedIn': False}, status=401)
