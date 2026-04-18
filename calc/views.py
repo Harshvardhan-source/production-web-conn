@@ -513,6 +513,32 @@ def api_ward_dashboard(request):
         total_muslim = ref.get('totalMuslim',   0) or 0
         total_chr    = ref.get('totalChristian',0) or 0
 
+        def _num(v):
+            if v is None: return 0
+            try: return int(str(v).replace(',','').strip())
+            except: return 0
+
+        def _flt(v):
+            if v is None: return 0.0
+            try: return round(float(str(v).replace('%','').replace(',','').strip()), 2)
+            except: return 0.0
+
+        # 2026 mapping stats stored directly in WardReference (after data update)
+        ward_ref_2026 = {
+            'boothList':      (ref.get('boothList') or '').strip(),
+            'boothCount':     _num(ref.get('boothCount')),
+            'totalElectors':  _num(ref.get('totalCount')),
+            'cutoffElec':     _num(ref.get('cutoffElec')),
+            'bloMapped':      _num(ref.get('bloMapped')),
+            'totalMapped':    _num(ref.get('totalMapped')),
+            'pctBloMapped':   _flt(ref.get('pctBloMapped')),
+            'ageCutoff':      _num(ref.get('ageCutoff')),
+            'progeny18':      _num(ref.get('progeny18')),
+            'pctProgeny':     _flt(ref.get('pctProgeny')),
+            'electorsMapped': _num(ref.get('electorsMapped')),
+            'pctTotal':       _flt(ref.get('pctTotal')),
+        }
+
         # ── 2. SurveyRecords — how many surveyed for this ward ────────────────
         survey_db    = get_survey_db()
         ward_filters = [{'wardNumber': ward}]
@@ -594,6 +620,7 @@ def api_ward_dashboard(request):
             'largeFamilyCount': large_family_count,
             'wardCoverage':     {ward_name: coverage_pct},
             'coveragePct':      coverage_pct,
+            'ward2026':         ward_ref_2026,
         }
 
         _ward_dash_cache[ward] = {'data': result, 'ts': _t.time()}
