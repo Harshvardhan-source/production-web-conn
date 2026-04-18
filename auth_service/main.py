@@ -169,23 +169,10 @@ def get_current_user(token: str = Depends(_token_from_request)) -> dict:
 
 # ─── Pydantic schemas ─────────────────────────────────────────────────────────
 
-# ── Blocked email domains ─────────────────────────────────────────────────────
-_BLOCKED_DOMAINS = {
-    "test.com","example.com","mailinator.com","guerrillamail.com",
-    "tempmail.com","throwaway.email","yopmail.com","trashmail.com",
-    "dispostable.com","maildrop.cc","sharklasers.com","spam4.me",
-    "fakeinbox.com","getairmail.com","mailnull.com","spamgourmet.com",
-}
-ROLES_ALL = {"mla", "pa", "corporator", "booth_worker"}
-
-
 class RegisterBody(BaseModel):
     username: str
     email:    EmailStr
     password: str
-    role:     str
-    ward:     Optional[str] = ""
-    booth:    Optional[str] = ""
 
     @field_validator("username")
     @classmethod
@@ -199,22 +186,6 @@ class RegisterBody(BaseModel):
     def password_strength(cls, v):
         if len(v) < 8 or not re.search(r"[A-Za-z]", v) or not re.search(r"[0-9]", v):
             raise ValueError("Password must be 8+ chars with letters and numbers.")
-        return v
-
-    @field_validator("email")
-    @classmethod
-    def email_domain_ok(cls, v):
-        domain = v.split("@")[-1].lower()
-        if domain in _BLOCKED_DOMAINS:
-            raise ValueError("Please use a real email address.")
-        return v.lower()
-
-    @field_validator("role")
-    @classmethod
-    def role_ok(cls, v):
-        v = v.strip().lower()
-        if v not in ROLES_ALL:
-            raise ValueError(f"Invalid role. Must be one of: {', '.join(sorted(ROLES_ALL))}")
         return v
 
 
@@ -239,48 +210,29 @@ def health():
 
 @app.post("/auth/register", status_code=201)
 def register(body: RegisterBody, response: Response):
-    db = get_db()
+    db = get_db()   # raises HTTP 503 if MongoDB is not connected
 
     if db["UserReg"].find_one({"Email": body.email}, {"_id": 1}):
         raise HTTPException(status_code=409, detail="Email already registered.")
 
-    # Validate required fields by role
-    if body.role == "corporator" and not (body.ward or "").strip():
-        raise HTTPException(status_code=422, detail="Ward is required for Corporator role.")
-    if body.role == "booth_worker" and not (body.booth or "").strip():
-        raise HTTPException(status_code=422, detail="Booth number is required for Booth Worker role.")
-
     hashed = _bcrypt.hashpw(body.password.encode(), _bcrypt.gensalt(rounds=10)).decode()
 
     db["UserReg"].insert_one({
-        "Time_stamp":  datetime.utcnow(),
-        "Username":    body.username,
-        "Email":       body.email,
-        "Password":    hashed,
-        "role":        body.role,
-        "ward":        body.ward  or "",
-        "booth":       body.booth or "",
-        "status":      "pending",     # all new users need admin approval
-        "requestedAt": datetime.utcnow(),
-        "approvedAt":  None,
-        "approvedBy":  None,
+        "Time_stamp": datetime.utcnow(),
+        "Username":   body.username,
+        "Email":      body.email,
+        "Password":   hashed,
     })
 
-    # Do NOT set a cookie or return a token — user must wait for approval
-    return {
-        "success":  True,
-        "username": body.username,
-        "email":    body.email,
-        "role":     body.role,
-        "status":   "pending",
-        "message":  "Registration submitted. Pending admin approval.",
-    }
+    token = create_token(body.username, body.email)
+    _set_cookie(response, token)
+    return {"success": True, "username": body.username, "email": body.email, "token": token}
 
 
 @app.post("/auth/login")
 def login(body: LoginBody, response: Response):
     db   = get_db()
-    user = db["UserReg"].find_one({"Email": body.email})
+    user = db["UserReg"].find_one({"Email": body.email}, {"Username": 1, "Password": 1})
 
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password.")
@@ -298,31 +250,9 @@ def login(body: LoginBody, response: Response):
     if not pwd_ok:
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-    # ── Check approval status ─────────────────────────────────────────────────
-    status = user.get("status", "pending")
-    if status == "pending":
-        raise HTTPException(
-            status_code=403,
-            detail="Your account is pending admin approval. Please wait.",
-        )
-    if status == "rejected":
-        raise HTTPException(
-            status_code=403,
-            detail="Your registration has been rejected. Please contact the admin.",
-        )
-
     token = create_token(user["Username"], body.email)
     _set_cookie(response, token)
-    return {
-        "success":  True,
-        "username": user["Username"],
-        "email":    body.email,
-        "role":     user.get("role",  "booth_worker"),
-        "ward":     user.get("ward",  ""),
-        "booth":    user.get("booth", ""),
-        "status":   status,
-        "token":    token,
-    }
+    return {"success": True, "username": user["Username"], "email": body.email, "token": token}
 
 
 @app.post("/auth/logout")
@@ -332,9 +262,12 @@ def logout(response: Response):
 
 
 @app.get("/auth/me")
-def me(user: dict = Depends(get_current_user)):
+def me(response: Response, user: dict = Depends(get_current_user)):
     db      = get_db()
     profile = db["UserReg"].find_one({"Email": user["sub"]}) or {}
+    # Issue a fresh token — frontend stores it for Django Authorization header
+    fresh_token = create_token(user["username"], user["sub"])
+    _set_cookie(response, fresh_token)
     return {
         "success":  True,
         "username": user["username"],
@@ -343,6 +276,7 @@ def me(user: dict = Depends(get_current_user)):
         "ward":     profile.get("ward",   ""),
         "booth":    profile.get("booth",  ""),
         "status":   profile.get("status", "pending"),
+        "token":    fresh_token,
     }
 
 
