@@ -866,10 +866,10 @@ def api_serial_number(request):
                 except (ValueError, TypeError):
                     pass   # fall through to auto-increment
 
-    # Default: next auto-increment from SurveyRecords
+    # Next serial = total count + 1  (gap-proof: max+1 breaks if any record is deleted)
     db     = get_survey_db()
-    latest = db['SurveyRecords'].find_one(sort=[('serialNumber', -1)])
-    serial = (int(latest['serialNumber']) + 1) if latest else 1
+    count  = db['SurveyRecords'].count_documents({})
+    serial = count + 1
     return JsonResponse({'serialNumber': serial, 'source': 'auto'})
 
 
@@ -916,16 +916,14 @@ def api_save_survey(request):
                 {'Serial No': 1, 'Sl No': 1, 'Name': 1, 'House No': 1, 'Booth No': 1}
             )
 
-    # ── 2. Use 2025 Serial No if found, else keep the submitted serial ────────
-    serial_from_2025 = None
-    if voter_2025:
-        raw_serial = voter_2025.get('Serial No') or voter_2025.get('Sl No')
-        try:
-            serial_from_2025 = int(raw_serial)
-        except (ValueError, TypeError):
-            pass
-
-    final_serial = serial_from_2025 if serial_from_2025 is not None else int(body.get('serialNumber') or 1)
+    # ── 2. Assign sequential serial = current count + 1 (gap-proof) ──────────
+    # We no longer use the 2025-roll serial as the survey serial number —
+    # that caused gaps whenever a save was cancelled or a record deleted.
+    # The 2025 lookup above is still used only to decide inVoterRoll routing.
+    survey_db_for_serial = get_survey_db()
+    survey_count   = survey_db_for_serial['SurveyRecords'].count_documents({})
+    final_serial   = survey_count + 1
+    serial_from_2025 = None   # kept for serialSource flag below
 
     data = {
         # ── Personal ──────────────────────────────────────────────
