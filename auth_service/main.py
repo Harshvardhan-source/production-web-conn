@@ -232,12 +232,13 @@ def register(body: RegisterBody, response: Response):
 @app.post("/auth/login")
 def login(body: LoginBody, response: Response):
     db   = get_db()
-    user = db["UserReg"].find_one({"Email": body.email}, {"Username": 1, "Password": 1})
+    # Fetch full document — need Password, role, status, ward, booth
+    user = db["UserReg"].find_one({"Email": body.email})
 
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-    stored = user["Password"]
+    stored = user.get("Password", "")
     if stored.startswith("pbkdf2_") or stored.startswith("bcrypt_django"):
         from django.contrib.auth.hashers import check_password as django_check
         pwd_ok = django_check(body.password, stored)
@@ -250,9 +251,25 @@ def login(body: LoginBody, response: Response):
     if not pwd_ok:
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
+    # ── Check account approval status ────────────────────────────────────────
+    acct_status = user.get("status", "approved")  # legacy accounts have no status → treat as approved
+    if acct_status == "pending":
+        raise HTTPException(status_code=403, detail="Your account is pending admin approval.")
+    if acct_status == "rejected":
+        raise HTTPException(status_code=403, detail="Your registration was rejected. Contact the admin.")
+
     token = create_token(user["Username"], body.email)
     _set_cookie(response, token)
-    return {"success": True, "username": user["Username"], "email": body.email, "token": token}
+    return {
+        "success":  True,
+        "username": user["Username"],
+        "email":    body.email,
+        "role":     user.get("role",   ""),
+        "ward":     user.get("ward",   ""),
+        "booth":    user.get("booth",  ""),
+        "status":   acct_status,
+        "token":    token,
+    }
 
 
 @app.post("/auth/logout")
