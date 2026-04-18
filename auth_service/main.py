@@ -173,6 +173,9 @@ class RegisterBody(BaseModel):
     username: str
     email:    EmailStr
     password: str
+    role:     str = ""
+    ward:     str = ""
+    booth:    str = ""
 
     @field_validator("username")
     @classmethod
@@ -218,15 +221,28 @@ def register(body: RegisterBody, response: Response):
     hashed = _bcrypt.hashpw(body.password.encode(), _bcrypt.gensalt(rounds=10)).decode()
 
     db["UserReg"].insert_one({
-        "Time_stamp": datetime.utcnow(),
+        "Time_stamp": datetime.now(timezone.utc),   # utcnow() is deprecated
         "Username":   body.username,
         "Email":      body.email,
         "Password":   hashed,
+        "status":     "pending",                    # always pending until admin approves
+        "role":       body.role,                    # from signup form
+        "ward":       body.ward,                    # from signup form
+        "booth":      body.booth,                   # from signup form
     })
 
     token = create_token(body.username, body.email)
     _set_cookie(response, token)
-    return {"success": True, "username": body.username, "email": body.email, "token": token}
+    return {
+        "success":  True,
+        "username": body.username,
+        "email":    body.email,
+        "role":     body.role,
+        "ward":     body.ward,
+        "booth":    body.booth,
+        "status":   "pending",
+        "token":    token,
+    }
 
 
 @app.post("/auth/login")
