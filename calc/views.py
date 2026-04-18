@@ -604,6 +604,120 @@ def api_ward_dashboard(request):
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
 
 
+# ─── BOOTH DASHBOARD ──────────────────────────────────────────────────────────
+# GET /api/booth-dashboard/?ward=21&booth=31
+# Reads WardBoothWise_2026 (ward-booth-details) on survey cluster for 2026 stats.
+# Also queries SurveyRecords for survey coverage at booth level.
+
+_booth_dash_cache = {}   # { 'ward_booth': {'data': {...}, 'ts': float} }
+_BOOTH_CACHE_TTL  = 300  # 5 minutes
+
+@require_http_methods(['GET'])
+def api_booth_dashboard(request):
+    import time as _t, re as _re
+    ward  = request.GET.get('ward',  '').strip()
+    booth = request.GET.get('booth', '').strip()
+    if not ward or not booth:
+        return JsonResponse({'success': False, 'message': 'ward and booth parameters required'}, status=400)
+
+    cache_key = f'{ward}_{booth}'
+    cached = _booth_dash_cache.get(cache_key)
+    if cached and (_t.time() - cached['ts']) < _BOOTH_CACHE_TTL:
+        return JsonResponse({'success': True, **cached['data']})
+
+    try:
+        survey_db = get_survey_db()
+        ward_int  = int(ward)  if ward.isdigit()  else None
+        booth_int = int(booth) if booth.isdigit() else None
+
+        # ── 1. WardBoothWise_2026 — booth-level 2026 electors data ───────────
+        filt = {}
+        if ward_int is not None and booth_int is not None:
+            filt = {'$or': [
+                {'wardNumber': ward_int,  'boothNumber': booth_int},
+                {'wardNumber': str(ward), 'boothNumber': booth},
+            ]}
+        booth_doc = survey_db['WardBoothWise_2026'].find_one(filt) or {}
+
+        # Fallback: full scan if type mismatch
+        if not booth_doc and ward_int is not None and booth_int is not None:
+            for _d in survey_db['WardBoothWise_2026'].find():
+                if (str(_d.get('wardNumber','')).strip() == str(ward_int) and
+                    str(_d.get('boothNumber','')).strip() == str(booth_int)):
+                    booth_doc = _d
+                    break
+
+        def _num(v):
+            if v is None: return 0
+            try: return int(str(v).replace(',','').strip())
+            except: return 0
+
+        def _flt(v):
+            if v is None: return 0.0
+            try: return round(float(str(v).replace('%','').replace(',','').strip()), 2)
+            except: return 0.0
+
+        ward_name   = (booth_doc.get('wardName') or '').strip() or WARD_NUM_TO_NAME.get(ward, f'Ward {ward}')
+        booth_electors = _num(booth_doc.get('totalElectors'))
+
+        # ── 2. SurveyRecords — how many surveyed for this booth ───────────────
+        booth_filters = [{'boothNo': booth}]
+        if booth_int is not None:
+            booth_filters.append({'boothNo': booth_int})
+
+        pipeline = [
+            {'$match': {'$or': booth_filters}},
+            {'$facet': {
+                'total':   [{'$count': 'n'}],
+                'genders': [{'$group': {'_id': '$gender', 'n': {'$sum': 1}}}],
+                'houses':  [
+                    {'$match': {'houseNumber': {'$exists': True, '$ne': None, '$ne': ''}}},
+                    {'$group': {'_id': '$houseNumber'}},
+                    {'$count': 'n'},
+                ],
+            }}
+        ]
+        s_res       = list(survey_db['SurveyRecords'].aggregate(pipeline))[0]
+        total_reg   = s_res['total'][0]['n']  if s_res['total']  else 0
+        house_count = s_res['houses'][0]['n'] if s_res['houses'] else 0
+        gmap        = {g['_id']: g['n'] for g in s_res['genders']}
+        reg_male    = gmap.get('Male',   0)
+        reg_female  = gmap.get('Female', 0)
+
+        # ── 3. Coverage ───────────────────────────────────────────────────────
+        denom        = booth_electors or 1
+        coverage_pct = round(total_reg / denom * 100, 1)
+
+        result = {
+            'wardNumber':       ward,
+            'wardName':         ward_name,
+            'boothNumber':      booth_int or booth,
+            # 2026 electors data
+            'totalElectors':    booth_electors,
+            'cutoffElec':       _num(booth_doc.get('cutoffElec')),
+            'bloMapped':        _num(booth_doc.get('bloMapped')),
+            'totalMapped':      _num(booth_doc.get('totalMapped')),
+            'pctBloMapped':     _flt(booth_doc.get('pctBloMapped')),
+            'ageCutoff':        _num(booth_doc.get('ageCutoff')),
+            'progeny18':        _num(booth_doc.get('progeny18')),
+            'pctProgeny':       _flt(booth_doc.get('pctProgeny')),
+            'electorsMapped':   _num(booth_doc.get('electorsMapped')),
+            'pctElectorsMapped':_flt(booth_doc.get('pctElectorsMapped')),
+            'pctTotalCompleted':_flt(booth_doc.get('pctTotalCompleted')),
+            # Survey coverage
+            'totalReg':         total_reg,
+            'regMale':          reg_male,
+            'regFemale':        reg_female,
+            'houseCount':       house_count,
+            'coveragePct':      coverage_pct,
+        }
+
+        _booth_dash_cache[cache_key] = {'data': result, 'ts': _t.time()}
+        return JsonResponse({'success': True, **result})
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
 
 
 _large_families_cache = {}   # { 'data': [...], 'ts': float }
@@ -2996,5 +3110,3 @@ def api_me(request):
     if user:
         return JsonResponse({'loggedIn': True, 'username': user['username'], 'email': user['email']})
     return JsonResponse({'loggedIn': False}, status=401)
-
-
