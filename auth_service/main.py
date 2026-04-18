@@ -283,12 +283,15 @@ def me(response: Response, user: dict = Depends(get_current_user)):
 # ─── Cookie helper ────────────────────────────────────────────────────────────
 
 def _set_cookie(response: Response, token: str):
+    # secure=True + samesite="none" required for cross-origin cookie on HTTPS
+    # frontend (frontend-production-web.onrender.com) and auth service
+    # (production-web-conn-1.onrender.com) are different origins
     response.set_cookie(
         key="cc_token",
         value=token,
         httponly=True,
-        secure=False,       # set True in production (HTTPS only)
-        samesite="lax",
+        secure=True,        # required for samesite=none on HTTPS
+        samesite="none",    # allows cross-origin requests with withCredentials
         max_age=TOKEN_EXP_H * 3600,
         path="/",
     )
