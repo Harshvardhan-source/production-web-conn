@@ -626,7 +626,7 @@ def api_booth_dashboard(request):
         return JsonResponse({'success': True, **cached['data']})
 
     try:
-        survey_db = get_survey_db()
+        survey_db = get_db1()
         ward_int  = int(ward)  if ward.isdigit()  else None
         booth_int = int(booth) if booth.isdigit() else None
 
