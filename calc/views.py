@@ -626,22 +626,26 @@ def api_booth_dashboard(request):
         return JsonResponse({'success': True, **cached['data']})
 
     try:
-        survey_db = get_db1()
+        # WardBoothWise_2026 → main1 cluster (MainB)
+        # SurveyRecords       → survey cluster
+        main1_db  = get_db1()
+        survey_db = get_survey_db()
         ward_int  = int(ward)  if ward.isdigit()  else None
         booth_int = int(booth) if booth.isdigit() else None
 
         # ── 1. WardBoothWise_2026 — booth-level 2026 electors data ───────────
+        #    Lives on main1 cluster (MainB database, _get_main1_client)
         filt = {}
         if ward_int is not None and booth_int is not None:
             filt = {'$or': [
                 {'wardNumber': ward_int,  'boothNumber': booth_int},
                 {'wardNumber': str(ward), 'boothNumber': booth},
             ]}
-        booth_doc = survey_db['WardBoothWise_2026'].find_one(filt) or {}
+        booth_doc = main1_db['WardBoothWise_2026'].find_one(filt) or {}
 
         # Fallback: full scan if type mismatch
         if not booth_doc and ward_int is not None and booth_int is not None:
-            for _d in survey_db['WardBoothWise_2026'].find():
+            for _d in main1_db['WardBoothWise_2026'].find():
                 if (str(_d.get('wardNumber','')).strip() == str(ward_int) and
                     str(_d.get('boothNumber','')).strip() == str(booth_int)):
                     booth_doc = _d
