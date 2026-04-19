@@ -792,14 +792,15 @@ def api_ward_dashboard(request):
         ward_name_upper  = ward_name.upper().strip()
         ward_booths_list = WARD_NAME_TO_BOOTHS.get(ward_name_upper, [])
 
-        # Convert booth ints to strings for matching (2025 list may store as string)
+        # Include BOTH string and integer forms of each booth number.
+        # Part No in the 2025 collection may be stored as int or str — $in is type-strict.
         booth_strs = [str(b) for b in ward_booths_list]
-        booth_ints = ward_booths_list
+        booth_ints = list(ward_booths_list)   # already ints from WARD_FULL_DATA
 
         large_family_count = 0
         ward_hmc = {'H': 0, 'M': 0, 'C': 0, 'total': 0}
         if ward_booths_list:
-            booth_match = {'Part No': {'$in': booth_strs + [str(b) for b in booth_ints]}}
+            booth_match = {'Part No': {'$in': booth_strs + booth_ints}}  # str + int forms
             lf_pipeline = [
                 {'$match': booth_match},
                 {'$facet': {
@@ -951,10 +952,14 @@ def api_booth_dashboard(request):
         gmap        = {g['_id']: g['n'] for g in s_res['genders']}
 
         # ── 3. HMC from 2025 voter list for this booth ────────────────────────
-        booth_strs = [booth, str(booth_int)] if booth_int is not None else [booth]
-        booth_strs = list(set(booth_strs))
+        # IMPORTANT: Part No may be stored as int OR string in MongoDB.
+        # $in does strict type matching, so we include BOTH forms to guarantee a hit.
+        booth_vals = list({booth, str(booth_int)} if booth_int is not None else {booth})
+        if booth_int is not None:
+            booth_vals.append(booth_int)   # ← integer form — critical for collections
+                                           #   where Part No is stored as int (e.g. 31, not "31")
         hmc_pipeline = [
-            {'$match': {'Part No': {'$in': booth_strs}}},
+            {'$match': {'Part No': {'$in': booth_vals}}},
             {'$match': {'Predicted_Religion_Label': {'$in': ['H', 'M', 'C']}}},
             {'$group': {'_id': '$Predicted_Religion_Label', 'n': {'$sum': 1}}},
         ]
