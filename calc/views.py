@@ -797,25 +797,26 @@ def api_ward_dashboard(request):
         coverage_pct = round(total_reg / denom * 100, 1)
 
         # ── 5. Predicted religion counts from 2025 voter roll for this ward ───
-        # Uses booth numbers (Part No) that belong to this ward
+        # Uses booth numbers (Part No) that belong to this ward.
+        # Part No is stored as INTEGER in MongoDB — include both int and str.
         ward_pred_religion = {'H': 0, 'M': 0, 'C': 0, 'other': 0}
         if ward_booths_list:
             booth_vals_for_rel = ward_booths_list + [str(b) for b in ward_booths_list]
             ward_rel_pipeline = [
                 {'$match': {'Part No': {'$in': booth_vals_for_rel}}},
-                {'$group': {'_id': '$Predicted_Religion', 'n': {'$sum': 1}}},
+                {'$group': {
+                    '_id': {
+                        'label': '$Predicted_Religion_Label',
+                        'code':  '$Predicted_Religion',
+                    },
+                    'n': {'$sum': 1}
+                }},
             ]
             ward_rel_raw = list(db['2025'].aggregate(ward_rel_pipeline))
-            _prm = {1: 'H', 2: 'M', 3: 'C', '1': 'H', '2': 'M', '3': 'C'}
             for rdoc in ward_rel_raw:
-                val   = rdoc['_id']
-                label = _prm.get(val)
-                if not label:
-                    try:
-                        label = _prm.get(int(float(val)))
-                    except (ValueError, TypeError):
-                        label = None
-                ward_pred_religion[label if label else 'other'] += rdoc.get('n', 0)
+                grp   = rdoc['_id']
+                label = _decode_religion_label(grp.get('label'), grp.get('code'))
+                ward_pred_religion[label] += rdoc.get('n', 0)
         ward_pred_religion['total'] = sum(v for k, v in ward_pred_religion.items() if k != 'total')
 
         result = {
@@ -939,23 +940,24 @@ def api_booth_dashboard(request):
         gmap        = {g['_id']: g['n'] for g in s_res['genders']}
 
         # ── Predicted religion counts from 2025 voter roll for this booth ─────
-        booth_values_2025 = [booth] + ([str(booth_int)] if booth_int is not None else []) + ([booth_int] if booth_int is not None else [])
+        # Part No stored as integer — match both int and str
+        booth_values_2025 = ([booth_int] if booth_int is not None else []) + [booth] + ([str(booth_int)] if booth_int is not None else [])
         rel_pipeline = [
             {'$match': {'Part No': {'$in': booth_values_2025}}},
-            {'$group': {'_id': '$Predicted_Religion', 'n': {'$sum': 1}}},
+            {'$group': {
+                '_id': {
+                    'label': '$Predicted_Religion_Label',
+                    'code':  '$Predicted_Religion',
+                },
+                'n': {'$sum': 1},
+            }},
         ]
         rel_raw = list(main_db['2025'].aggregate(rel_pipeline))
-        _pred_rel_map_local = {1: 'H', 2: 'M', 3: 'C', '1': 'H', '2': 'M', '3': 'C'}
         predicted_religion = {'H': 0, 'M': 0, 'C': 0, 'other': 0}
         for rdoc in rel_raw:
-            val   = rdoc['_id']
-            label = _pred_rel_map_local.get(val)
-            if not label:
-                try:
-                    label = _pred_rel_map_local.get(int(float(val)))
-                except (ValueError, TypeError):
-                    label = None
-            predicted_religion[label if label else 'other'] += rdoc.get('n', 0)
+            grp   = rdoc['_id']
+            label = _decode_religion_label(grp.get('label'), grp.get('code'))
+            predicted_religion[label] += rdoc.get('n', 0)
         predicted_religion['total'] = sum(v for k, v in predicted_religion.items() if k != 'total')
 
         total_electors = _num(booth_doc.get('totalElectors'))
@@ -1024,30 +1026,37 @@ def api_booth_dashboard(request):
 _religion_stats_cache = {}       # key → { 'data': {...}, 'ts': float }
 _RELIGION_CACHE_TTL   = 300      # 5 minutes
 
-# Mapping from Predicted_Religion integer codes stored in MongoDB → label
-_PRED_REL_MAP = {
-    1: 'H',   # Hindu
-    2: 'M',   # Muslim
-    3: 'C',   # Christian
-    '1': 'H',
-    '2': 'M',
-    '3': 'C',
+# ── Religion label normaliser ─────────────────────────────────────────────────
+# The 2025 collection stores BOTH a numeric code AND a string label:
+#   Predicted_Religion       : 2         ← integer, unreliable mapping
+#   Predicted_Religion_Label : "C"       ← string "H" / "M" / "C" — USE THIS
+# We always prefer the Label field; fall back to numeric only if Label is absent.
+_PRED_REL_NUM_MAP = {
+    1: 'H', 2: 'C', 3: 'M',        # derived empirically from Label field
+    '1': 'H', '2': 'C', '3': 'M',
 }
+_VALID_LABELS = {'H', 'M', 'C'}
 
-def _decode_religion(val) -> str:
-    """Map raw DB value to H / M / C / other."""
-    if val is None:
-        return 'other'
-    mapped = _PRED_REL_MAP.get(val)
-    if mapped:
-        return mapped
-    # Handle float stored as 1.0, 2.0, 3.0
-    try:
-        mapped = _PRED_REL_MAP.get(int(float(val)))
+def _decode_religion_label(label_val, num_val=None) -> str:
+    """
+    Return 'H', 'M', 'C', or 'other'.
+    Prefer Predicted_Religion_Label (string); fall back to Predicted_Religion (int).
+    """
+    if label_val is not None:
+        s = str(label_val).strip().upper()
+        if s in _VALID_LABELS:
+            return s
+    # Fallback to numeric
+    if num_val is not None:
+        mapped = _PRED_REL_NUM_MAP.get(num_val) or _PRED_REL_NUM_MAP.get(str(num_val))
         if mapped:
             return mapped
-    except (ValueError, TypeError):
-        pass
+        try:
+            mapped = _PRED_REL_NUM_MAP.get(int(float(num_val)))
+            if mapped:
+                return mapped
+        except (ValueError, TypeError):
+            pass
     return 'other'
 
 
@@ -1055,15 +1064,25 @@ def _empty_hmc():
     return {'H': 0, 'M': 0, 'C': 0, 'other': 0}
 
 
+# ── All-booths in the constituency (for match-filter on constituency view) ────
+_ALL_CONSTITUENCY_BOOTHS = []
+for _wdata in WARD_FULL_DATA.values():
+    _ALL_CONSTITUENCY_BOOTHS.extend(_wdata['booths'])          # int list
+# Keep both int and string forms so $in works regardless of stored type
+_ALL_BOOTHS_BOTH = _ALL_CONSTITUENCY_BOOTHS + [str(b) for b in _ALL_CONSTITUENCY_BOOTHS]
+
+
 @require_http_methods(['GET'])
 def api_religion_stats(request):
     """
     GET /api/religion-stats/              → constituency-wide + all wards + all booths
-    GET /api/religion-stats/?ward=27      → same + booth breakdown for that ward
-    GET /api/religion-stats/?ward=27&booth=82 → single booth only
+    GET /api/religion-stats/?ward=27      → ward-scoped + booth breakdown
+    GET /api/religion-stats/?ward=27&booth=82 → single booth
 
-    Data source: SurveyDataBase.2025, field Predicted_Religion (1=H, 2=M, 3=C)
-    Ward assignment: BOOTH_TO_WARD[doc['Part No']]
+    Source: SurveyDataBase.2025
+    Primary field  : Predicted_Religion_Label  ("H" / "M" / "C")
+    Fallback field : Predicted_Religion         (1 / 2 / 3)
+    Booth field    : Part No  (stored as integer in MongoDB)
     """
     import time as _t
 
@@ -1079,69 +1098,78 @@ def api_religion_stats(request):
         db   = get_db()
         coll = db['2025']
 
-        # ── Build match filter ────────────────────────────────────────────────
-        match_filter = {}
-
+        # ── Build Part No match filter ────────────────────────────────────────
+        # Part No is stored as INTEGER in the 2025 collection.
+        # Always include both int and str forms to handle any type variance.
         if booth_param:
-            # Single booth filter — match on Part No
-            booth_ints = []
             try:
-                booth_ints = [int(booth_param)]
+                booth_int_val = int(booth_param)
+                part_no_filter = {'$in': [booth_int_val, booth_param]}
             except ValueError:
-                pass
-            match_filter['Part No'] = {
-                '$in': [booth_param] + [str(b) for b in booth_ints] + booth_ints
-            }
+                part_no_filter = {'$in': [booth_param]}
+            match_filter = {'Part No': part_no_filter}
+
         elif ward_param:
-            # All booths belonging to this ward
             try:
                 ward_int = int(ward_param)
             except ValueError:
                 ward_int = None
-
             ward_booths = (
                 WARD_FULL_DATA.get(ward_int, {}).get('booths', []) or
                 WARD_FULL_DATA.get(ward_param, {}).get('booths', [])
             )
             if not ward_booths:
                 return JsonResponse(
-                    {'success': False, 'message': f'Ward {ward_param} not found in WARD_FULL_DATA.'},
+                    {'success': False, 'message': f'Ward {ward_param} not found.'},
                     status=400
                 )
+            # Both int and string forms
             booth_values = ward_booths + [str(b) for b in ward_booths]
-            match_filter['Part No'] = {'$in': booth_values}
+            match_filter = {'Part No': {'$in': booth_values}}
 
-        # ── Aggregation: group by (Part No, Predicted_Religion) ──────────────
+        else:
+            # Constituency view — restrict to known constituency booths
+            # so we skip any stray data outside our wards
+            match_filter = {'Part No': {'$in': _ALL_BOOTHS_BOTH}}
+
+        # ── Single aggregation: group by (Part No, Label, numeric code) ───────
+        # Collect both Label and numeric so Python can resolve the right key
         pipeline = [
-            *([ {'$match': match_filter} ] if match_filter else []),
+            {'$match': match_filter},
             {'$group': {
                 '_id': {
-                    'booth':    '$Part No',
-                    'religion': '$Predicted_Religion',
+                    'booth': '$Part No',
+                    'label': '$Predicted_Religion_Label',
+                    'code':  '$Predicted_Religion',
                 },
                 'n': {'$sum': 1},
             }},
         ]
 
-        raw = list(coll.aggregate(pipeline))
+        raw = list(coll.aggregate(pipeline, allowDiskUse=True))
 
-        # ── Tally into booth_map[booth_str] → { H/M/C/other: count } ─────────
-        booth_map = {}   # booth_str → hmc dict
+        # ── Tally into booth_map ──────────────────────────────────────────────
+        booth_map = {}   # booth_str → { H, M, C, other }
         for doc in raw:
-            booth_raw = doc['_id'].get('booth')
-            booth_str = str(booth_raw) if booth_raw is not None else 'unknown'
-            rel_label = _decode_religion(doc['_id'].get('religion'))
+            grp       = doc['_id']
+            booth_raw = grp.get('booth')
+            # Normalise booth to string key
+            booth_str = str(int(booth_raw)) if booth_raw is not None else 'unknown'
+            rel_label = _decode_religion_label(grp.get('label'), grp.get('code'))
             n         = doc.get('n', 0)
 
             if booth_str not in booth_map:
                 booth_map[booth_str] = _empty_hmc()
-            booth_map[booth_str][rel_label] = booth_map[booth_str].get(rel_label, 0) + n
+            booth_map[booth_str][rel_label] += n
 
-        # ── Aggregate booth_map → ward_map ────────────────────────────────────
-        ward_map = {}   # ward_str → { wardName, hmc, booths: { booth_str → hmc } }
+        # ── Aggregate into ward_map ───────────────────────────────────────────
+        ward_map = {}
         for booth_str, hmc in booth_map.items():
-            ward_str = BOOTH_TO_WARD.get(booth_str) or BOOTH_TO_WARD.get(
-                int(booth_str) if booth_str.isdigit() else booth_str, 'unknown'
+            # Look up ward — BOOTH_TO_WARD has both int and str keys
+            ward_str = (
+                BOOTH_TO_WARD.get(booth_str)
+                or BOOTH_TO_WARD.get(int(booth_str) if booth_str.isdigit() else booth_str)
+                or 'unknown'
             )
             ward_name = WARD_NUM_TO_NAME.get(ward_str, f'Ward {ward_str}')
 
@@ -1168,30 +1196,32 @@ def api_religion_stats(request):
                 constituency[label] += wdata.get(label, 0)
         constituency['total'] = sum(constituency.values())
 
-        # ── Build sorted byWard list ──────────────────────────────────────────
-        by_ward = []
-        for wdata in sorted(ward_map.values(), key=lambda x: (
-            int(x['wardNumber']) if str(x['wardNumber']).isdigit() else 9999
-        )):
-            entry = {
-                'wardNumber': wdata['wardNumber'],
-                'wardName':   wdata['wardName'],
-                'H':          wdata['H'],
-                'M':          wdata['M'],
-                'C':          wdata['C'],
-                'other':      wdata['other'],
-                'total':      wdata['H'] + wdata['M'] + wdata['C'] + wdata['other'],
-            }
-            by_ward.append(entry)
+        def _sort_ward(x):
+            try: return int(x['wardNumber'])
+            except (ValueError, TypeError): return 9999
 
-        # ── Build byBooth list (always included so frontend can drill down) ───
+        def _sort_booth(b):
+            try: return int(b['boothNumber'])
+            except (ValueError, TypeError): return 9999
+
+        # ── byWard list ───────────────────────────────────────────────────────
+        by_ward = [
+            {
+                'wardNumber': w['wardNumber'],
+                'wardName':   w['wardName'],
+                'H':          w['H'],
+                'M':          w['M'],
+                'C':          w['C'],
+                'other':      w['other'],
+                'total':      w['H'] + w['M'] + w['C'] + w['other'],
+            }
+            for w in sorted(ward_map.values(), key=_sort_ward)
+        ]
+
+        # ── byBooth list ──────────────────────────────────────────────────────
         by_booth = []
-        for wdata in sorted(ward_map.values(), key=lambda x: (
-            int(x['wardNumber']) if str(x['wardNumber']).isdigit() else 9999
-        )):
-            for bdata in sorted(wdata['booths'].values(), key=lambda b: (
-                int(b['boothNumber']) if str(b['boothNumber']).isdigit() else 9999
-            )):
+        for wdata in sorted(ward_map.values(), key=_sort_ward):
+            for bdata in sorted(wdata['booths'].values(), key=_sort_booth):
                 by_booth.append({
                     'wardNumber':  wdata['wardNumber'],
                     'wardName':    wdata['wardName'],
