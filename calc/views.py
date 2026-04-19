@@ -796,32 +796,56 @@ def api_ward_dashboard(request):
         denom        = total_voters or 1
         coverage_pct = round(total_reg / denom * 100, 1)
 
+        # ── 5. Predicted religion counts from 2025 voter roll for this ward ───
+        # Uses booth numbers (Part No) that belong to this ward
+        ward_pred_religion = {'H': 0, 'M': 0, 'C': 0, 'other': 0}
+        if ward_booths_list:
+            booth_vals_for_rel = ward_booths_list + [str(b) for b in ward_booths_list]
+            ward_rel_pipeline = [
+                {'$match': {'Part No': {'$in': booth_vals_for_rel}}},
+                {'$group': {'_id': '$Predicted_Religion', 'n': {'$sum': 1}}},
+            ]
+            ward_rel_raw = list(db['2025'].aggregate(ward_rel_pipeline))
+            _prm = {1: 'H', 2: 'M', 3: 'C', '1': 'H', '2': 'M', '3': 'C'}
+            for rdoc in ward_rel_raw:
+                val   = rdoc['_id']
+                label = _prm.get(val)
+                if not label:
+                    try:
+                        label = _prm.get(int(float(val)))
+                    except (ValueError, TypeError):
+                        label = None
+                ward_pred_religion[label if label else 'other'] += rdoc.get('n', 0)
+        ward_pred_religion['total'] = sum(v for k, v in ward_pred_religion.items() if k != 'total')
+
         result = {
-            'wardName':         ward_name,
-            'wardNumber':       ward,
-            'districtId':       district_id,
-            'constituencyId':   const_id,
-            'totalVoters':      total_voters,
-            'totalMale':        total_male,
-            'totalFemale':      total_female,
-            'totalTrans':       total_trans,
-            'totalHindu':       total_hindu,
-            'totalMuslim':      total_muslim,
-            'totalChristian':   total_chr,
+            'wardName':           ward_name,
+            'wardNumber':         ward,
+            'districtId':         district_id,
+            'constituencyId':     const_id,
+            'totalVoters':        total_voters,
+            'totalMale':          total_male,
+            'totalFemale':        total_female,
+            'totalTrans':         total_trans,
+            'totalHindu':         total_hindu,
+            'totalMuslim':        total_muslim,
+            'totalChristian':     total_chr,
             'voterReligion': {
                 'Hindu':     total_hindu,
                 'Muslim':    total_muslim,
                 'Christian': total_chr,
             },
-            'totalReg':         total_reg,
-            'regMale':          reg_male,
-            'regFemale':        reg_female,
-            'regReligion':      reg_religion,
-            'houseCount':       house_count,
-            'largeFamilyCount': large_family_count,
-            'wardCoverage':     {ward_name: coverage_pct},
-            'coveragePct':      coverage_pct,
-            'ward2026':         ward_ref_2026,
+            # Predicted religion from 2025 roll (H/M/C)
+            'predictedReligion':  ward_pred_religion,
+            'totalReg':           total_reg,
+            'regMale':            reg_male,
+            'regFemale':          reg_female,
+            'regReligion':        reg_religion,
+            'houseCount':         house_count,
+            'largeFamilyCount':   large_family_count,
+            'wardCoverage':       {ward_name: coverage_pct},
+            'coveragePct':        coverage_pct,
+            'ward2026':           ward_ref_2026,
         }
 
         _ward_dash_cache[ward] = {'data': result, 'ts': _t.time()}
@@ -914,6 +938,26 @@ def api_booth_dashboard(request):
         house_count = s_res['houses'][0]['n'] if s_res['houses'] else 0
         gmap        = {g['_id']: g['n'] for g in s_res['genders']}
 
+        # ── Predicted religion counts from 2025 voter roll for this booth ─────
+        booth_values_2025 = [booth] + ([str(booth_int)] if booth_int is not None else []) + ([booth_int] if booth_int is not None else [])
+        rel_pipeline = [
+            {'$match': {'Part No': {'$in': booth_values_2025}}},
+            {'$group': {'_id': '$Predicted_Religion', 'n': {'$sum': 1}}},
+        ]
+        rel_raw = list(main_db['2025'].aggregate(rel_pipeline))
+        _pred_rel_map_local = {1: 'H', 2: 'M', 3: 'C', '1': 'H', '2': 'M', '3': 'C'}
+        predicted_religion = {'H': 0, 'M': 0, 'C': 0, 'other': 0}
+        for rdoc in rel_raw:
+            val   = rdoc['_id']
+            label = _pred_rel_map_local.get(val)
+            if not label:
+                try:
+                    label = _pred_rel_map_local.get(int(float(val)))
+                except (ValueError, TypeError):
+                    label = None
+            predicted_religion[label if label else 'other'] += rdoc.get('n', 0)
+        predicted_religion['total'] = sum(v for k, v in predicted_religion.items() if k != 'total')
+
         total_electors = _num(booth_doc.get('totalElectors'))
         coverage_pct   = round(total_reg / (total_electors or 1) * 100, 1)
 
@@ -939,6 +983,8 @@ def api_booth_dashboard(request):
             'regFemale':         gmap.get('Female', 0),
             'houseCount':        house_count,
             'coveragePct':       coverage_pct,
+            # Predicted religion breakdown for this booth (from 2025 voter roll)
+            'predictedReligion': predicted_religion,
         }
 
         _booth_dash_cache[cache_key] = {'data': result, 'ts': _t.time()}
@@ -948,6 +994,233 @@ def api_booth_dashboard(request):
         traceback.print_exc()
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
 
+
+# ─── PREDICTED RELIGION STATS ────────────────────────────────────────────────
+# GET /api/religion-stats/
+# GET /api/religion-stats/?ward=27
+# GET /api/religion-stats/?ward=27&booth=82
+#
+# Source: SurveyDataBase.2025 collection, field "Predicted_Religion"
+# Values in DB:  1 → Hindu (H)  |  2 → Muslim (M)  |  3 → Christian (C)
+# Ward mapping:  uses BOOTH_TO_WARD (booth "Part No" → ward number)
+#
+# Response shape:
+# {
+#   "success": true,
+#   "constituency": { "H": 12000, "M": 3500, "C": 2100, "other": 50 },
+#   "byWard": [
+#     { "wardNumber": "27", "wardName": "BOLOOR",
+#       "H": 900, "M": 320, "C": 210, "other": 5, "total": 1435 },
+#     ...
+#   ],
+#   "byBooth": [                          ← included when ?ward= is given
+#     { "wardNumber": "27", "wardName": "BOLOOR", "boothNumber": "82",
+#       "H": 110, "M": 40, "C": 28, "other": 0, "total": 178 },
+#     ...
+#   ]
+# }
+# ─────────────────────────────────────────────────────────────────────────────
+
+_religion_stats_cache = {}       # key → { 'data': {...}, 'ts': float }
+_RELIGION_CACHE_TTL   = 300      # 5 minutes
+
+# Mapping from Predicted_Religion integer codes stored in MongoDB → label
+_PRED_REL_MAP = {
+    1: 'H',   # Hindu
+    2: 'M',   # Muslim
+    3: 'C',   # Christian
+    '1': 'H',
+    '2': 'M',
+    '3': 'C',
+}
+
+def _decode_religion(val) -> str:
+    """Map raw DB value to H / M / C / other."""
+    if val is None:
+        return 'other'
+    mapped = _PRED_REL_MAP.get(val)
+    if mapped:
+        return mapped
+    # Handle float stored as 1.0, 2.0, 3.0
+    try:
+        mapped = _PRED_REL_MAP.get(int(float(val)))
+        if mapped:
+            return mapped
+    except (ValueError, TypeError):
+        pass
+    return 'other'
+
+
+def _empty_hmc():
+    return {'H': 0, 'M': 0, 'C': 0, 'other': 0}
+
+
+@require_http_methods(['GET'])
+def api_religion_stats(request):
+    """
+    GET /api/religion-stats/              → constituency-wide + all wards + all booths
+    GET /api/religion-stats/?ward=27      → same + booth breakdown for that ward
+    GET /api/religion-stats/?ward=27&booth=82 → single booth only
+
+    Data source: SurveyDataBase.2025, field Predicted_Religion (1=H, 2=M, 3=C)
+    Ward assignment: BOOTH_TO_WARD[doc['Part No']]
+    """
+    import time as _t
+
+    ward_param  = request.GET.get('ward',  '').strip()
+    booth_param = request.GET.get('booth', '').strip()
+
+    cache_key = f'rel_{ward_param}_{booth_param}'
+    cached = _religion_stats_cache.get(cache_key)
+    if cached and (_t.time() - cached['ts']) < _RELIGION_CACHE_TTL:
+        return JsonResponse({'success': True, **cached['data']})
+
+    try:
+        db   = get_db()
+        coll = db['2025']
+
+        # ── Build match filter ────────────────────────────────────────────────
+        match_filter = {}
+
+        if booth_param:
+            # Single booth filter — match on Part No
+            booth_ints = []
+            try:
+                booth_ints = [int(booth_param)]
+            except ValueError:
+                pass
+            match_filter['Part No'] = {
+                '$in': [booth_param] + [str(b) for b in booth_ints] + booth_ints
+            }
+        elif ward_param:
+            # All booths belonging to this ward
+            try:
+                ward_int = int(ward_param)
+            except ValueError:
+                ward_int = None
+
+            ward_booths = (
+                WARD_FULL_DATA.get(ward_int, {}).get('booths', []) or
+                WARD_FULL_DATA.get(ward_param, {}).get('booths', [])
+            )
+            if not ward_booths:
+                return JsonResponse(
+                    {'success': False, 'message': f'Ward {ward_param} not found in WARD_FULL_DATA.'},
+                    status=400
+                )
+            booth_values = ward_booths + [str(b) for b in ward_booths]
+            match_filter['Part No'] = {'$in': booth_values}
+
+        # ── Aggregation: group by (Part No, Predicted_Religion) ──────────────
+        pipeline = [
+            *([ {'$match': match_filter} ] if match_filter else []),
+            {'$group': {
+                '_id': {
+                    'booth':    '$Part No',
+                    'religion': '$Predicted_Religion',
+                },
+                'n': {'$sum': 1},
+            }},
+        ]
+
+        raw = list(coll.aggregate(pipeline))
+
+        # ── Tally into booth_map[booth_str] → { H/M/C/other: count } ─────────
+        booth_map = {}   # booth_str → hmc dict
+        for doc in raw:
+            booth_raw = doc['_id'].get('booth')
+            booth_str = str(booth_raw) if booth_raw is not None else 'unknown'
+            rel_label = _decode_religion(doc['_id'].get('religion'))
+            n         = doc.get('n', 0)
+
+            if booth_str not in booth_map:
+                booth_map[booth_str] = _empty_hmc()
+            booth_map[booth_str][rel_label] = booth_map[booth_str].get(rel_label, 0) + n
+
+        # ── Aggregate booth_map → ward_map ────────────────────────────────────
+        ward_map = {}   # ward_str → { wardName, hmc, booths: { booth_str → hmc } }
+        for booth_str, hmc in booth_map.items():
+            ward_str = BOOTH_TO_WARD.get(booth_str) or BOOTH_TO_WARD.get(
+                int(booth_str) if booth_str.isdigit() else booth_str, 'unknown'
+            )
+            ward_name = WARD_NUM_TO_NAME.get(ward_str, f'Ward {ward_str}')
+
+            if ward_str not in ward_map:
+                ward_map[ward_str] = {
+                    'wardNumber': ward_str,
+                    'wardName':   ward_name,
+                    **_empty_hmc(),
+                    'booths': {},
+                }
+            for label in ('H', 'M', 'C', 'other'):
+                ward_map[ward_str][label] += hmc.get(label, 0)
+
+            ward_map[ward_str]['booths'][booth_str] = {
+                'boothNumber': booth_str,
+                **hmc,
+                'total': sum(hmc.values()),
+            }
+
+        # ── Constituency totals ───────────────────────────────────────────────
+        constituency = _empty_hmc()
+        for wdata in ward_map.values():
+            for label in ('H', 'M', 'C', 'other'):
+                constituency[label] += wdata.get(label, 0)
+        constituency['total'] = sum(constituency.values())
+
+        # ── Build sorted byWard list ──────────────────────────────────────────
+        by_ward = []
+        for wdata in sorted(ward_map.values(), key=lambda x: (
+            int(x['wardNumber']) if str(x['wardNumber']).isdigit() else 9999
+        )):
+            entry = {
+                'wardNumber': wdata['wardNumber'],
+                'wardName':   wdata['wardName'],
+                'H':          wdata['H'],
+                'M':          wdata['M'],
+                'C':          wdata['C'],
+                'other':      wdata['other'],
+                'total':      wdata['H'] + wdata['M'] + wdata['C'] + wdata['other'],
+            }
+            by_ward.append(entry)
+
+        # ── Build byBooth list (always included so frontend can drill down) ───
+        by_booth = []
+        for wdata in sorted(ward_map.values(), key=lambda x: (
+            int(x['wardNumber']) if str(x['wardNumber']).isdigit() else 9999
+        )):
+            for bdata in sorted(wdata['booths'].values(), key=lambda b: (
+                int(b['boothNumber']) if str(b['boothNumber']).isdigit() else 9999
+            )):
+                by_booth.append({
+                    'wardNumber':  wdata['wardNumber'],
+                    'wardName':    wdata['wardName'],
+                    'boothNumber': bdata['boothNumber'],
+                    'H':           bdata.get('H', 0),
+                    'M':           bdata.get('M', 0),
+                    'C':           bdata.get('C', 0),
+                    'other':       bdata.get('other', 0),
+                    'total':       bdata.get('total', 0),
+                })
+
+        result = {
+            'constituency': constituency,
+            'byWard':       by_ward,
+            'byBooth':      by_booth,
+            # Convenience meta
+            'labels':       {'H': 'Hindu', 'M': 'Muslim', 'C': 'Christian'},
+            'filter':       {'ward': ward_param or None, 'booth': booth_param or None},
+        }
+
+        _religion_stats_cache[cache_key] = {'data': result, 'ts': _t.time()}
+        return JsonResponse({'success': True, **result})
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 _large_families_cache = {}   # { 'data': [...], 'ts': float }
 _LF_CACHE_TTL = 300           # 5 minutes
