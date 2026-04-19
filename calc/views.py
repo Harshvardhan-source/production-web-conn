@@ -2249,10 +2249,12 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
     Relation Name) and new field names (Voter Name / House / Flat No /
     Voter ID / EPIC No / Relative Name).  Docs from either upload will be found.
 
-    Tier 1 — EPIC exact      (tries both old and new EPIC field names)
-    Tier 2 — Exact regex     (name + house, tries all field name combinations)
-    Tier 3 — Fuzzy/house     (fetch all docs at same house via $or, score each)
-    Tier 4 — Fuzzy prefix    (prefix filter across both name fields, top 50)
+    Tier 1 — EPIC exact          (tries both old and new EPIC field names)
+    Tier 2 — Exact regex         (name + house, all field name combos)
+    Tier 3 — Fuzzy house         (all docs at same house, fuzzy scored)
+    Tier 4 — Relation+house      (when name missing, match by relation at same house)
+    Tier 5 — Fuzzy prefix        (name prefix scan, top 60, lower threshold)
+    Tier 6 — House-only fallback (name-only match within same house, very lenient)
     """
     # Common house $or query (works regardless of which schema doc was stored in)
     def _house_query(h):
@@ -2264,6 +2266,9 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
             {'$or': [{'Voter Name': name_rx}, {'Name': name_rx}]},
             _house_query(h),
         ]}
+
+    _PROJ_02 = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
+                'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,'Gender':1,'Age':1}
 
     # Tier 1: EPIC exact — try both field names
     if voterid:
@@ -2280,26 +2285,48 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
         if doc:
             return bson_clean(doc)
 
-    _PROJ_02 = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
-                'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,'Gender':1,'Age':1}
-
-    # Tier 3: all voters at same house via $or, fuzzy score with early-exit
+    # Tier 3: all voters at same house via $or, fuzzy score — use lower threshold
+    # (2002 data often has transliteration differences: Vishwanath/Vishwanatha etc.)
     if house and (name or relation):
         candidates = list(col.find(_house_query(house), _PROJ_02))
         if candidates:
             best_doc, best_score = _score_candidates(candidates, _flat_2002, name, relation)
-            if best_doc and best_score >= _FUZZY_THRESHOLD:
+            # Lower threshold to 65 for house-confirmed matches (house itself narrows it enough)
+            if best_doc and best_score >= 65:
                 return bson_clean(best_doc)
 
-    # Tier 4: prefix → fuzzy, capped at 30 with projection
+    # Tier 4: relation + house match (when name is missing or very different)
+    if relation and house:
+        rel_rx = {'$regex': re.escape(relation[:4]), '$options': 'i'}
+        candidates = list(col.find({'$and': [
+            _house_query(house),
+            {'$or': [{'Relative Name': rel_rx}, {'Relation Name': rel_rx}]},
+        ]}, _PROJ_02).limit(20))
+        if candidates:
+            best_doc, best_score = _score_candidates(candidates, _flat_2002, name, relation)
+            if best_doc and best_score >= 60:
+                return bson_clean(best_doc)
+
+    # Tier 5: prefix → fuzzy, wider scan (top 60), slightly lower threshold
     if name:
         px = {'$regex': f'^{re.escape(name[:3])}', '$options': 'i'}
         candidates = list(col.find(
             {'$or': [{'Voter Name': px}, {'Name': px}]}, _PROJ_02
-        ).limit(30))
+        ).limit(60))
         if candidates:
             best_doc, best_score = _score_candidates(candidates, _flat_2002, name, relation)
-            if best_doc and best_score >= _FUZZY_THRESHOLD:
+            # When house also provided use lower threshold (house+name+score triple confirmation)
+            threshold = 70 if house else _FUZZY_THRESHOLD
+            if best_doc and best_score >= threshold:
+                return bson_clean(best_doc)
+
+    # Tier 6: house-only fallback — return best-scoring doc even without name prefix
+    # (catches cases where name spelling is completely different)
+    if house and name:
+        candidates = list(col.find(_house_query(house), _PROJ_02).limit(30))
+        if candidates:
+            best_doc, best_score = _score_candidates(candidates, _flat_2002, name, relation)
+            if best_doc and best_score >= 55:
                 return bson_clean(best_doc)
 
     return None
@@ -2417,9 +2444,17 @@ def _run_sir_analysis(db, voterid, name, house, ward, booth, serial, relation=''
                             'detail': 'Record consistent in both 2002 and 2025 rolls.'})
             any_stored = True
     else:
+        # NOT_FOUND — voter absent from BOTH rolls (data gap / unregistered / OCR error)
+        not_found_doc = {**base, 'category': 'NOT_FOUND',
+                         'name': name, 'voterid': voterid, 'house': house,
+                         'note': 'Not traced in either 2002 or 2025 roll — possible data gap, OCR error, or unregistered voter'}
+        db['SIR_NotFound'].update_one(
+            {'survey_voterid': vid_key},
+            {'$setOnInsert': not_found_doc}, upsert=True)
         results.append({'category': 'NOT_FOUND', 'label': 'Unregistered / Not Traced',
                         'color': '#6b7fa0', 'icon': '?',
                         'detail': 'Voter not found in either roll. May be unregistered, recently relocated, or name/ID mismatch.'})
+        any_stored = True
 
     suspicious = []
 
@@ -2599,10 +2634,106 @@ def api_check_sir(request):
             })
 
     # ── Return full voter data so frontend comparison panel can display it ────
-    # When 2002 record is missing, also run Excel fuzzy suggest automatically
+    # Suggestions from BOTH MongoDB 2002 collection AND Excel file (best-effort)
     suggestions_2002 = []
-    if not in_2002 and (name or house):
-        # Use cached DataFrame + pre-built house index — no disk I/O after first load
+    if not in_2002 and (name or house or relation):
+        # ── Source A: MongoDB 2002 fuzzy search (primary — actual DB) ───────────
+        try:
+            _PROJ_02s = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
+                         'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,'Gender':1,'Age':1}
+            col_2002s = db['2002']
+
+            # Build candidate pool based on which fields are provided
+            cand_set = []
+
+            # Field-aware candidate collection:
+            # If house given → fetch all at that house (very precise)
+            if house:
+                house_docs = list(col_2002s.find(
+                    {'$or': [{'House / Flat No': house}, {'House No': house}]}, _PROJ_02s
+                ).limit(30))
+                cand_set.extend(house_docs)
+
+            # If name given → fetch by name prefix
+            if name and len(name) >= 3:
+                px = {'$regex': f'^{re.escape(name[:3])}', '$options': 'i'}
+                name_docs = list(col_2002s.find(
+                    {'$or': [{'Voter Name': px}, {'Name': px}]}, _PROJ_02s
+                ).limit(60))
+                # Deduplicate
+                seen_ids = {str(d.get('_id','')) for d in cand_set}
+                for d in name_docs:
+                    if str(d.get('_id','')) not in seen_ids:
+                        cand_set.append(d)
+                        seen_ids.add(str(d.get('_id','')))
+
+            # If relation given → fetch by relation prefix
+            if relation and len(relation) >= 3:
+                rpx = {'$regex': f'^{re.escape(relation[:3])}', '$options': 'i'}
+                rel_docs = list(col_2002s.find(
+                    {'$or': [{'Relative Name': rpx}, {'Relation Name': rpx}]}, _PROJ_02s
+                ).limit(40))
+                seen_ids = {str(d.get('_id','')) for d in cand_set}
+                for d in rel_docs:
+                    if str(d.get('_id','')) not in seen_ids:
+                        cand_set.append(d)
+                        seen_ids.add(str(d.get('_id','')))
+
+            # Score all candidates — weight by available fields
+            # More fields provided = tighter scoring
+            scored = []
+            for doc in cand_set:
+                flat = _flat_2002(doc)
+                n_score = _name_score(name, flat['name'])     if name     else 50.0
+                r_score = _name_score(relation, flat['relation']) if relation else 50.0
+                h_match = (flat['house'].upper() == house.upper()) if house else True
+
+                # Composite score weighted by fields provided
+                field_count = sum([bool(name), bool(relation), bool(house)])
+                if field_count == 1:
+                    if name:     comp = n_score
+                    elif relation: comp = r_score
+                    else:        comp = 80.0 if h_match else 0.0
+                elif field_count == 2:
+                    if name and house:
+                        comp = (0.7 * n_score + 0.3 * (100.0 if h_match else 0.0))
+                    elif name and relation:
+                        comp = (0.6 * n_score + 0.4 * r_score)
+                    else:  # house + relation
+                        comp = (0.5 * r_score + 0.5 * (100.0 if h_match else 0.0))
+                else:  # all 3
+                    comp = (0.55 * n_score + 0.25 * r_score + 0.20 * (100.0 if h_match else 0.0))
+
+                # Minimum bar: name score ≥ 35 OR relation score ≥ 50 OR exact house
+                if n_score < 35 and r_score < 50 and not h_match:
+                    continue
+                scored.append((comp, flat, doc))
+
+            scored.sort(key=lambda x: -x[0])
+            seen_suggestions = set()
+            for comp, flat, doc in scored[:10]:
+                key_sig = (flat['name'], flat['house'])
+                if key_sig in seen_suggestions: continue
+                seen_suggestions.add(key_sig)
+                suggestions_2002.append({
+                    'name':     flat['name'],
+                    'relation': flat['relation'],
+                    'house':    flat['house'],
+                    'gender':   flat['gender'],
+                    'age':      flat['age'],
+                    'voterid':  flat['voterid'],
+                    'score':    round(comp),
+                    'source':   'mongodb',
+                    'field_scores': {
+                        'name':     round(_name_score(name, flat['name'])) if name else 0,
+                        'relation': round(_name_score(relation, flat['relation'])) if relation else 0,
+                        'house':    100 if (house and flat['house'].upper() == house.upper()) else 0,
+                    },
+                })
+        except Exception:
+            pass
+
+        # ── Source B: Excel file fuzzy search (secondary — catches data not in MongoDB) ─
         try:
             df_x, cx, hidx = _get_xlsx()
             if df_x is not None:
@@ -2611,20 +2742,13 @@ def api_check_sir(request):
                 CG, CA = cx.get('gender'), cx.get('age')
                 W = {CN: 3.0, CR: 2.0, CH: 1.5}
 
-                # ── Build candidate pool from THREE sources ────────────────────────────
-                # 1. Exact house index   — O(1), most precise
-                # 2. Name prefix rows   — catches name matches in different houses
-                # 3. Relation prefix rows — catches relatives in different houses
-                # Deduplicate by row index before scoring.
-
                 candidate_indices = set()
 
-                # Source 1: house index (O(1))
+                # Field-aware candidate selection
                 if house and hidx:
                     for idx in hidx.get(house.strip().upper(), []):
                         candidate_indices.add(idx)
 
-                # Source 2: name prefix rows (up to 200 candidates)
                 if name and CN:
                     pfx = name[:3].upper()
                     col_upper = df_x[CN].str.upper()
@@ -2632,7 +2756,6 @@ def api_check_sir(request):
                     for idx in name_matches[:200]:
                         candidate_indices.add(idx)
 
-                # Source 3: relation prefix rows (up to 100 candidates)
                 if relation and CR:
                     rpfx = relation[:3].upper()
                     rel_upper = df_x[CR].str.upper()
@@ -2640,7 +2763,6 @@ def api_check_sir(request):
                     for idx in rel_matches[:100]:
                         candidate_indices.add(idx)
 
-                # Fallback: if still empty, score entire DataFrame
                 if not candidate_indices:
                     subset = df_x
                 else:
@@ -2654,30 +2776,34 @@ def api_check_sir(request):
                 rows_s = []
                 for _, row in subset.iterrows():
                     fs, tw, ws = {}, 0.0, 0.0
-                    for col, qv in query_cols.items():
-                        cell = str(row.get(col, '')).strip().upper()
-                        w    = W.get(col, 1.0)
+                    for col_key, qv in query_cols.items():
+                        cell = str(row.get(col_key, '')).strip().upper()
+                        w    = W.get(col_key, 1.0)
                         s    = _name_score(qv.upper(), cell)
-                        fs[col] = round(s); tw += w; ws += s * w
+                        fs[col_key] = round(s); tw += w; ws += s * w
                     comp = ws / tw if tw else 0
-                    # Require name score ≥ 40 OR relation score ≥ 60 to avoid noise
                     name_s = fs.get(CN, 0) if CN else 0
                     rel_s  = fs.get(CR, 0) if CR else 0
-                    if name_s < 40 and rel_s < 60: continue
+                    if name_s < 35 and rel_s < 50: continue
                     rows_s.append({'_r': row, 'c': comp, 'fs': fs})
-                    if comp >= 97: break   # early-exit on near-perfect match
+                    if comp >= 97: break
 
                 rows_s.sort(key=lambda x: x['c'], reverse=True)
-                for item in rows_s[:5]:
+                existing_names = {s['name'] for s in suggestions_2002}
+                for item in rows_s[:10]:
                     r = item['_r']
+                    nm = str(r.get(CN, ''))
+                    if nm in existing_names: continue   # skip duplicate from MongoDB
+                    existing_names.add(nm)
                     suggestions_2002.append({
-                        'name':     str(r.get(CN,'')),
-                        'relation': str(r.get(CR,'')),
-                        'house':    str(r.get(CH,'')),
-                        'gender':   str(r.get(CG,'')) if CG else '',
-                        'age':      str(r.get(CA,'')) if CA else '',
-                        'voterid':  str(r.get(CE,'')) if CE else '',
+                        'name':     nm,
+                        'relation': str(r.get(CR, '')),
+                        'house':    str(r.get(CH, '')),
+                        'gender':   str(r.get(CG, '')) if CG else '',
+                        'age':      str(r.get(CA, '')) if CA else '',
+                        'voterid':  str(r.get(CE, '')) if CE else '',
                         'score':    round(item['c']),
+                        'source':   'excel',
                         'field_scores': {
                             'name':     item['fs'].get(CN, 0),
                             'relation': item['fs'].get(CR, 0),
@@ -2687,13 +2813,18 @@ def api_check_sir(request):
         except Exception:
             pass   # suggestions are best-effort
 
-    # ── Similar 2025 records (same house or same name prefix, up to 8) ─────────
+        # Final sort by score, cap at 10
+        suggestions_2002.sort(key=lambda x: -x['score'])
+        suggestions_2002 = suggestions_2002[:10]
+
+    # ── Similar 2025 records (same house AND/OR same name prefix, up to 12) ─────
     similar_2025 = []
-    _PROJ_SLIM = {'Name':1,'Relation Name':1,'Epic NO':1,'House No':1,'Gender':1,'Age':1}
+    _PROJ_SLIM = {'Name':1,'Relation Name':1,'Epic NO':1,'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1}
     _seen_epics = {r25.get('voterid','')} if in_2025 else set()
 
+    # Priority 1: same house (most precise grouping)
     if house:
-        for doc in col_2025.find({'House No': house}, _PROJ_SLIM).limit(12):
+        for doc in col_2025.find({'House No': house}, _PROJ_SLIM).limit(15):
             d = bson_clean(doc)
             epic = str(d.get('Epic NO','')).strip()
             if epic in _seen_epics: continue
@@ -2705,10 +2836,13 @@ def api_check_sir(request):
                 'voterid':  epic,
                 'gender':   str(d.get('Gender','')).strip(),
                 'age':      str(d.get('Age','')).strip(),
+                'booth':    str(d.get('Booth No','')).strip(),
             })
-    elif name and len(name) >= 3:
+
+    # Priority 2: name prefix (when no house or to supplement)
+    if name and len(name) >= 3:
         px = {'$regex': f'^{re.escape(name[:3])}', '$options': 'i'}
-        for doc in col_2025.find({'Name': px}, _PROJ_SLIM).limit(12):
+        for doc in col_2025.find({'Name': px}, _PROJ_SLIM).limit(15):
             d = bson_clean(doc)
             epic = str(d.get('Epic NO','')).strip()
             if epic in _seen_epics: continue
@@ -2720,8 +2854,27 @@ def api_check_sir(request):
                 'voterid':  epic,
                 'gender':   str(d.get('Gender','')).strip(),
                 'age':      str(d.get('Age','')).strip(),
+                'booth':    str(d.get('Booth No','')).strip(),
             })
-    similar_2025 = similar_2025[:8]
+
+    # Priority 3: relation prefix (additional cross-reference)
+    if relation and len(relation) >= 3 and len(similar_2025) < 12:
+        rpx = {'$regex': f'^{re.escape(relation[:3])}', '$options': 'i'}
+        for doc in col_2025.find({'Relation Name': rpx}, _PROJ_SLIM).limit(10):
+            d = bson_clean(doc)
+            epic = str(d.get('Epic NO','')).strip()
+            if epic in _seen_epics: continue
+            _seen_epics.add(epic)
+            similar_2025.append({
+                'name':     str(d.get('Name','')).strip(),
+                'relation': str(d.get('Relation Name','')).strip(),
+                'house':    str(d.get('House No','')).strip(),
+                'voterid':  epic,
+                'gender':   str(d.get('Gender','')).strip(),
+                'age':      str(d.get('Age','')).strip(),
+                'booth':    str(d.get('Booth No','')).strip(),
+            })
+    similar_2025 = similar_2025[:12]
 
     return JsonResponse({
         'success':    True,
@@ -2873,6 +3026,7 @@ def api_sir_stats(request):
         'modifications':  db['SIR_Modifications'].count_documents({}),
         'suspicious':     db['SIR_Suspicious'].count_documents({}),
         'retained':       db['SIR_Retained'].count_documents({}),
+        'not_found':      db['SIR_NotFound'].count_documents({}),
         'voters_2002':    voters_2002,
         'voters_2025':    voters_2025,
         'db_2002_status': 'ok' if voters_2002 > 0 else 'empty — place 2002.xlsx in project root and call /api/sync-2002/',
@@ -2894,6 +3048,7 @@ def api_sir_data(request):
         'MODIFIED':   'SIR_Modifications',
         'SUSPICIOUS': 'SIR_Suspicious',
         'RETAINED':   'SIR_Retained',
+        'NOT_FOUND':  'SIR_NotFound',
     }
 
     summary = {
@@ -2902,6 +3057,7 @@ def api_sir_data(request):
         'MODIFIED':   db['SIR_Modifications'].count_documents({}),
         'SUSPICIOUS': db['SIR_Suspicious'].count_documents({}),
         'RETAINED':   db['SIR_Retained'].count_documents({}),
+        'NOT_FOUND':  db['SIR_NotFound'].count_documents({}),
     }
     summary['TOTAL'] = sum(summary.values())
 
