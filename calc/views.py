@@ -2377,7 +2377,7 @@ def _run_sir_analysis(db, voterid, name, house, ward, booth, serial, relation=''
                'house': r02['house'], 'age_2002': r02['age'],
                'gender': r02['gender'], 'relation': r02['relation'],
                'note': 'Was in 2002 roll — removed from 2025 roll'}
-        db['SIR_Deletions'].update_one(
+        db['SIR_Deleted'].update_one(
             {'survey_voterid': vid_key},
             {'$setOnInsert': doc}, upsert=True)
         results.append({'category': 'DELETION', 'label': 'Deletion',
@@ -2413,7 +2413,7 @@ def _run_sir_analysis(db, voterid, name, house, ward, booth, serial, relation=''
                    'age_2002': r02['age'],    'age_2025': r25['age'],
                    'changes': changes,
                    'note': f'{len(changes)} field(s) changed between rolls'}
-            db['SIR_Modifications'].update_one(
+            db['SIR_Modified'].update_one(
                 {'survey_voterid': vid_key},
                 {'$setOnInsert': doc}, upsert=True)
             results.append({'category': 'MODIFICATION', 'label': 'Modification',
@@ -2904,15 +2904,19 @@ def api_sir_records(request):
 
     col_map = {
         'NEW_ADDITION': 'SIR_NewAdditions',
-        'DELETION':     'SIR_Deletions',
-        'MODIFICATION': 'SIR_Modifications',
+        'NEW':          'SIR_NewAdditions',
+        'DELETION':     'SIR_Deleted',
+        'DELETED':      'SIR_Deleted',
+        'MODIFICATION': 'SIR_Modified',
+        'MODIFIED':     'SIR_Modified',
         'SUSPICIOUS':   'SIR_Suspicious',
         'RETAINED':     'SIR_Retained',
+        'NOT_FOUND':    'SIR_NotFound',
     }
 
     if category in col_map:
         col   = db[col_map[category]]
-        total = col.count_documents({})
+        total = col.count_documents(base_filter)
         docs  = [bson_clean(d) for d in col.find().skip(skip).limit(limit).sort('surveyed_at', -1)]
         return JsonResponse({'success': True, 'category': category,
                              'records': docs, 'total': total, 'page': page})
@@ -3008,8 +3012,8 @@ def api_sir_stats(request):
     voters_2025 = db['2025'].count_documents({})
     return JsonResponse({'success': True,
         'new_additions':  db['SIR_NewAdditions'].count_documents({}),
-        'deletions':      db['SIR_Deletions'].count_documents({}),
-        'modifications':  db['SIR_Modifications'].count_documents({}),
+        'deletions':      db['SIR_Deleted'].count_documents({}),
+        'modifications':  db['SIR_Modified'].count_documents({}),
         'suspicious':     db['SIR_Suspicious'].count_documents({}),
         'retained':       db['SIR_Retained'].count_documents({}),
         'not_found':      db['SIR_NotFound'].count_documents({}),
@@ -3027,37 +3031,48 @@ def api_sir_data(request):
     page     = max(1, int(request.GET.get('page', 1)))
     limit    = 50
     skip     = (page - 1) * limit
+    # Optional filters
+    ward_filter  = request.GET.get('ward',  '').strip()
+    booth_filter = request.GET.get('booth', '').strip()
 
     col_map = {
         'NEW':        'SIR_NewAdditions',
-        'DELETED':    'SIR_Deletions',
-        'MODIFIED':   'SIR_Modifications',
+        'DELETED':    'SIR_Deleted',
+        'MODIFIED':   'SIR_Modified',
         'SUSPICIOUS': 'SIR_Suspicious',
         'RETAINED':   'SIR_Retained',
         'NOT_FOUND':  'SIR_NotFound',
     }
 
+    # Build optional mongo filter for ward/booth
+    base_filter = {}
+    if ward_filter:
+        base_filter['$or'] = [{'ward': ward_filter}, {'ward_number': ward_filter}]
+    if booth_filter:
+        bf = {'$or': [{'booth': booth_filter}, {'booth_no': booth_filter}]}
+        base_filter = {'$and': [base_filter, bf]} if base_filter else bf
+
     summary = {
-        'NEW':        db['SIR_NewAdditions'].count_documents({}),
-        'DELETED':    db['SIR_Deletions'].count_documents({}),
-        'MODIFIED':   db['SIR_Modifications'].count_documents({}),
-        'SUSPICIOUS': db['SIR_Suspicious'].count_documents({}),
-        'RETAINED':   db['SIR_Retained'].count_documents({}),
-        'NOT_FOUND':  db['SIR_NotFound'].count_documents({}),
+        'NEW':        db['SIR_NewAdditions'].count_documents(base_filter),
+        'DELETED':    db['SIR_Deleted'].count_documents(base_filter),
+        'MODIFIED':   db['SIR_Modified'].count_documents(base_filter),
+        'SUSPICIOUS': db['SIR_Suspicious'].count_documents(base_filter),
+        'RETAINED':   db['SIR_Retained'].count_documents(base_filter),
+        'NOT_FOUND':  db['SIR_NotFound'].count_documents(base_filter),
     }
     summary['TOTAL'] = sum(summary.values())
 
     if category in col_map:
         col   = db[col_map[category]]
         total = col.count_documents({})
-        raw   = col.find({}).sort('surveyed_at', -1).skip(skip).limit(limit)
+        raw   = col.find(base_filter).sort('surveyed_at', -1).skip(skip).limit(limit)
         records = [_sir_to_frontend(bson_clean(d), category) for d in raw]
         return JsonResponse({'success': True, 'summary': summary,
                              'records': records, 'total': total})
 
     all_records = []
     for cat, cname in col_map.items():
-        for d in db[cname].find({}).sort('surveyed_at', -1).limit(20):
+        for d in db[cname].find(base_filter).sort('surveyed_at', -1).limit(20):
             all_records.append(_sir_to_frontend(bson_clean(d), cat))
     all_records.sort(key=lambda r: r.get('Time_stamp', ''), reverse=True)
     total = sum(summary[k] for k in col_map)
