@@ -587,6 +587,12 @@ def _registration_analytics(db=None):
                 'religions': [
                     {'$group': {'_id': '$Religion', 'n': {'$sum': 1}}}
                 ],
+
+                # HMC counts from Predicted_Religion_Label field
+                'hmc': [
+                    {'$match': {'Predicted_Religion_Label': {'$in': ['H', 'M', 'C']}}},
+                    {'$group': {'_id': '$Predicted_Religion_Label', 'n': {'$sum': 1}}}
+                ],
  
                 # Unique house count — cheaper than distinct() on large collections
                 'house_count': [
@@ -635,6 +641,15 @@ def _registration_analytics(db=None):
     religion_map   = {'H': 'Hindu', 'M': 'Muslim', 'C': 'Christian', 'J': 'Jain', 'B': 'Buddhist', 'S': 'Sikh'}
     rel_map_v      = {g['_id']: g['n'] for g in v_result['religions']}
     voter_religion = {name: rel_map_v.get(code, 0) for code, name in religion_map.items()}
+
+    # HMC from Predicted_Religion_Label
+    hmc_map = {g['_id']: g['n'] for g in v_result.get('hmc', [])}
+    voter_hmc = {
+        'H': hmc_map.get('H', 0),
+        'M': hmc_map.get('M', 0),
+        'C': hmc_map.get('C', 0),
+        'total': sum(hmc_map.get(k, 0) for k in ('H', 'M', 'C')),
+    }
  
     # ── Ward coverage (uses WardReference + ward_counts from survey) ──────────
     ward_ref   = list(coll_ward.find({}, {'number': 1, 'totalCount': 1}))
@@ -657,6 +672,7 @@ def _registration_analytics(db=None):
         'voterFemale':     voter_female,
         'regReligion':     reg_religion,
         'voterReligion':   voter_religion,
+        'voterHMC':        voter_hmc,
         'wardCoverage':    percentages,
     }
  
@@ -771,7 +787,7 @@ def api_ward_dashboard(request):
         rmap        = {r['_id']: r['n'] for r in s_res['religions']}
         reg_religion= {r: rmap.get(r, 0) for r in religions}
 
-        # ── 3. Large families in this ward from 2025 voter list ──────────────
+        # ── 3. Large families + HMC from 2025 voter list ────────────────────
         # Use module-level WARD_NAME_TO_BOOTHS — no local copy needed
         ward_name_upper  = ward_name.upper().strip()
         ward_booths_list = WARD_NAME_TO_BOOTHS.get(ward_name_upper, [])
@@ -781,16 +797,35 @@ def api_ward_dashboard(request):
         booth_ints = ward_booths_list
 
         large_family_count = 0
+        ward_hmc = {'H': 0, 'M': 0, 'C': 0, 'total': 0}
         if ward_booths_list:
+            booth_match = {'Part No': {'$in': booth_strs + [str(b) for b in booth_ints]}}
             lf_pipeline = [
-                {'$match': {'Part No': {'$in': booth_strs + [str(b) for b in booth_ints]}}},
-                {'$match': {'House No': {'$exists': True, '$ne': None}}},
-                {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
-                {'$match': {'count': {'$gt': 15}}},
-                {'$count': 'n'},
+                {'$match': booth_match},
+                {'$facet': {
+                    'large_families': [
+                        {'$match': {'House No': {'$exists': True, '$ne': None}}},
+                        {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
+                        {'$match': {'count': {'$gt': 15}}},
+                        {'$count': 'n'},
+                    ],
+                    'hmc': [
+                        {'$match': {'Predicted_Religion_Label': {'$in': ['H', 'M', 'C']}}},
+                        {'$group': {'_id': '$Predicted_Religion_Label', 'n': {'$sum': 1}}},
+                    ],
+                }}
             ]
             lf_result = list(db['2025'].aggregate(lf_pipeline))
-            large_family_count = lf_result[0]['n'] if lf_result else 0
+            if lf_result:
+                r = lf_result[0]
+                large_family_count = r['large_families'][0]['n'] if r.get('large_families') else 0
+                hmc_map = {g['_id']: g['n'] for g in r.get('hmc', [])}
+                ward_hmc = {
+                    'H': hmc_map.get('H', 0),
+                    'M': hmc_map.get('M', 0),
+                    'C': hmc_map.get('C', 0),
+                    'total': sum(hmc_map.get(k, 0) for k in ('H', 'M', 'C')),
+                }
 
         # ── 4. Coverage ───────────────────────────────────────────────────────
         denom        = total_voters or 1
@@ -813,6 +848,7 @@ def api_ward_dashboard(request):
                 'Muslim':    total_muslim,
                 'Christian': total_chr,
             },
+            'voterHMC':         ward_hmc,
             'totalReg':         total_reg,
             'regMale':          reg_male,
             'regFemale':        reg_female,
@@ -914,6 +950,23 @@ def api_booth_dashboard(request):
         house_count = s_res['houses'][0]['n'] if s_res['houses'] else 0
         gmap        = {g['_id']: g['n'] for g in s_res['genders']}
 
+        # ── 3. HMC from 2025 voter list for this booth ────────────────────────
+        booth_strs = [booth, str(booth_int)] if booth_int is not None else [booth]
+        booth_strs = list(set(booth_strs))
+        hmc_pipeline = [
+            {'$match': {'Part No': {'$in': booth_strs}}},
+            {'$match': {'Predicted_Religion_Label': {'$in': ['H', 'M', 'C']}}},
+            {'$group': {'_id': '$Predicted_Religion_Label', 'n': {'$sum': 1}}},
+        ]
+        hmc_result = list(main_db['2025'].aggregate(hmc_pipeline))
+        hmc_map    = {g['_id']: g['n'] for g in hmc_result}
+        booth_hmc  = {
+            'H': hmc_map.get('H', 0),
+            'M': hmc_map.get('M', 0),
+            'C': hmc_map.get('C', 0),
+            'total': sum(hmc_map.get(k, 0) for k in ('H', 'M', 'C')),
+        }
+
         total_electors = _num(booth_doc.get('totalElectors'))
         coverage_pct   = round(total_reg / (total_electors or 1) * 100, 1)
 
@@ -939,6 +992,8 @@ def api_booth_dashboard(request):
             'regFemale':         gmap.get('Female', 0),
             'houseCount':        house_count,
             'coveragePct':       coverage_pct,
+            # HMC religion counts from 2025 voter list
+            'boothHMC':          booth_hmc,
         }
 
         _booth_dash_cache[cache_key] = {'data': result, 'ts': _t.time()}
