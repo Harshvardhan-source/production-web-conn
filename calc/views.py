@@ -1277,7 +1277,51 @@ def api_save_survey(request):
                 status=409
             )
 
-    # ── 4. Save to correct collection ────────────────────────────────────────
+    # ── 4. SIR analysis — run synchronously so we can label the record ──────────
+    # Reads voter rolls from the main cluster (get_db()).
+    # Writes SIR_* collections to the survey cluster (get_survey_db()).
+    sir_result   = None
+    sir_category = 'UNKNOWN'   # will be stored on the survey record
+    try:
+        voterid_sir = (data.get('voterid') or '').strip().upper()
+        name_sir    = _norm((data.get('firstName', '') + ' ' + data.get('lastName', '')).strip())
+        house_sir   = _norm(data.get('houseNumber', ''))
+        ward_sir    = data.get('wardNumber', '')
+        booth_sir   = str(data.get('boothNo', ''))
+        serial_sir  = data.get('serialNumber', '')
+
+        sir_result = _run_sir_analysis(
+            read_db  = get_db(),        # voter rolls (2002 / 2025) live here
+            write_db = survey_db,       # SIR_* collections live alongside SurveyRecords
+            voterid  = voterid_sir,
+            name     = name_sir,
+            house    = house_sir,
+            ward     = ward_sir,
+            booth    = booth_sir,
+            serial   = serial_sir,
+        )
+
+        # Derive the primary category label for the SurveyRecord
+        if sir_result and sir_result.get('results'):
+            sir_category = sir_result['results'][0]['category']
+        elif sir_result and sir_result.get('suspicious'):
+            sir_category = 'SUSPICIOUS'
+
+        # If additional suspicious flags were found, append that info
+        if sir_result and sir_result.get('suspicious') and sir_category != 'SUSPICIOUS':
+            sir_category = sir_category + '+SUSPICIOUS'
+
+        print(f'[SIR] category={sir_category} for {voterid_sir or name_sir}')
+
+    except Exception as _sir_err:
+        print(f'[SIR] Inline analysis error: {_sir_err}')
+        sir_category = 'SIR_ERROR'
+
+    # Stamp the SIR category on the record before persisting
+    data['sir_category']   = sir_category
+    data['sir_suspicious'] = bool(sir_result and sir_result.get('suspicious')) if sir_result else False
+
+    # ── 5. Save to correct collection ────────────────────────────────────────
     # voter_2025 is None  →  not in 2025 voter roll → NotFoundRecordSurvey
     # voter_2025 found    →  normal path             → SurveyRecords
     if voter_2025 is None:
@@ -1291,26 +1335,8 @@ def api_save_survey(request):
         collection_used = 'NotFoundRecordSurvey'
     else:
         survey_db['SurveyRecords'].insert_one(data)
-        print(f"[api_save_survey] Saved to SurveyRecords — serial {final_serial} (from 2025 roll)")
+        print(f"[api_save_survey] Saved to SurveyRecords — serial {final_serial}, SIR={sir_category}")
         collection_used = 'SurveyRecords'
-
-    # ── 5. Background SIR analysis ────────────────────────────────────────────
-    def _sir_bg():
-        try:
-            voterid_sir = data.get('voterid', '').strip().upper() if data.get('voterid') else ''
-            name_sir    = _norm((data.get('firstName', '') + ' ' + data.get('lastName', '')).strip())
-            house_sir   = _norm(data.get('houseNumber', ''))
-            ward_sir    = data.get('wardNumber', '')
-            booth_sir   = str(data.get('boothNo', ''))
-            serial_sir  = data.get('serialNumber', '')
-            _run_sir_analysis(
-                get_db(), voterid_sir, name_sir, house_sir,
-                ward_sir, booth_sir, serial_sir
-            )
-        except Exception as e:
-            print(f'[SIR] Background check error: {e}')
-
-    threading.Thread(target=_sir_bg, daemon=True).start()
 
     return JsonResponse({
         'success':        True,
@@ -1319,6 +1345,8 @@ def api_save_survey(request):
         'serialSource':   data['serialSource'],
         'collection':     collection_used,
         'inVoterRoll':    voter_2025 is not None,
+        'sir':            sir_result,   # ← frontend SIR modal reads this
+        'sir_category':   sir_category,
     })
 
 
@@ -2328,9 +2356,25 @@ def _epic_prefix(vid):
     return m.group(1) if m else ''
 
 
-def _run_sir_analysis(db, voterid, name, house, ward, booth, serial, relation=''):
-    col_2025 = db['2025']
-    col_2002 = db['2002']   # ← MongoDB, uploaded from Google Sheet
+def _run_sir_analysis(voterid, name, house, ward, booth, serial, relation='',
+                      read_db=None, write_db=None, db=None):
+    """
+    read_db  — cluster holding 2002/2025 voter rolls (main cluster, get_db()).
+    write_db — cluster holding SIR_* collections   (survey cluster, get_survey_db()).
+
+    Legacy callers that pass a positional `db` argument still work:
+    both reads and writes go to that same db.
+    """
+    if db is not None:
+        read_db  = db
+        write_db = db
+    if read_db is None:
+        read_db  = get_db()
+    if write_db is None:
+        write_db = read_db
+
+    col_2025 = read_db['2025']
+    col_2002 = read_db['2002']   # ← MongoDB, uploaded from Google Sheet
 
     # ── Look up in both rolls — parallel threads ─────────────────────────────────
     _rr = [None, None]
@@ -2363,7 +2407,7 @@ def _run_sir_analysis(db, voterid, name, house, ward, booth, serial, relation=''
                'house': r25['house'], 'age_2025': r25['age'],
                'gender': r25['gender'], 'relation': r25['relation'],
                'note': 'In 2025 roll — absent from 2002 roll'}
-        db['SIR_NewAdditions'].update_one(
+        write_db['SIR_NewAdditions'].update_one(
             {'survey_voterid': vid_key},
             {'$setOnInsert': doc}, upsert=True)
         results.append({'category': 'NEW_ADDITION', 'label': 'New Addition',
@@ -2377,7 +2421,7 @@ def _run_sir_analysis(db, voterid, name, house, ward, booth, serial, relation=''
                'house': r02['house'], 'age_2002': r02['age'],
                'gender': r02['gender'], 'relation': r02['relation'],
                'note': 'Was in 2002 roll — removed from 2025 roll'}
-        db['SIR_Deleted'].update_one(
+        write_db['SIR_Deleted'].update_one(
             {'survey_voterid': vid_key},
             {'$setOnInsert': doc}, upsert=True)
         results.append({'category': 'DELETION', 'label': 'Deletion',
@@ -2413,7 +2457,7 @@ def _run_sir_analysis(db, voterid, name, house, ward, booth, serial, relation=''
                    'age_2002': r02['age'],    'age_2025': r25['age'],
                    'changes': changes,
                    'note': f'{len(changes)} field(s) changed between rolls'}
-            db['SIR_Modified'].update_one(
+            write_db['SIR_Modified'].update_one(
                 {'survey_voterid': vid_key},
                 {'$setOnInsert': doc}, upsert=True)
             results.append({'category': 'MODIFICATION', 'label': 'Modification',
@@ -2427,7 +2471,7 @@ def _run_sir_analysis(db, voterid, name, house, ward, booth, serial, relation=''
                        'house': r25['house'], 'age_2002': r02['age'],
                        'age_2025': r25['age'], 'gender': r25['gender'],
                        'note': 'Record consistent in both 2002 and 2025 rolls'}
-            db['SIR_Retained'].update_one(
+            write_db['SIR_Retained'].update_one(
                 {'survey_voterid': vid_key},
                 {'$setOnInsert': ret_doc}, upsert=True)
             results.append({'category': 'RETAINED', 'label': 'Retained',
@@ -2439,7 +2483,7 @@ def _run_sir_analysis(db, voterid, name, house, ward, booth, serial, relation=''
         not_found_doc = {**base, 'category': 'NOT_FOUND',
                          'name': name, 'voterid': voterid, 'house': house,
                          'note': 'Not traced in 2002 or 2025 roll — data gap, OCR error, or unregistered'}
-        db['SIR_NotFound'].update_one(
+        write_db['SIR_NotFound'].update_one(
             {'survey_voterid': vid_key},
             {'$setOnInsert': not_found_doc}, upsert=True)
         results.append({'category': 'NOT_FOUND', 'label': 'Unregistered / Not Traced',
@@ -2475,7 +2519,7 @@ def _run_sir_analysis(db, voterid, name, house, ward, booth, serial, relation=''
                'flag_type': s['flag'], 'flag_label': s['label'],
                'flag_detail': s['detail'], 'flag_value': s.get('value', ''),
                'name': name, 'voterid': voterid, 'house': house}
-        db['SIR_Suspicious'].update_one(
+        write_db['SIR_Suspicious'].update_one(
             {'survey_voterid': vid_key, 'flag_type': s['flag']},
             {'$setOnInsert': doc}, upsert=True)
         any_stored = True
@@ -2530,7 +2574,7 @@ def api_check_sir(request):
     db = get_db()
 
     if do_store:
-        sir = _run_sir_analysis(db, voterid, name, house, ward, booth, serial, relation)
+        sir = _run_sir_analysis(voterid, name, house, ward, booth, serial, relation, db=db)
         return JsonResponse({'success': True, **sir})
 
     # ── Read-only preview (no DB writes) ──────────────────────────────────────
@@ -3007,16 +3051,17 @@ def api_sir_suggest(request):
 
 @require_http_methods(['GET'])
 def api_sir_stats(request):
-    db = get_db()
+    db        = get_db()
+    survey_db = get_survey_db()
     voters_2002 = db['2002'].count_documents({})
     voters_2025 = db['2025'].count_documents({})
     return JsonResponse({'success': True,
-        'new_additions':  db['SIR_NewAdditions'].count_documents({}),
-        'deletions':      db['SIR_Deleted'].count_documents({}),
-        'modifications':  db['SIR_Modified'].count_documents({}),
-        'suspicious':     db['SIR_Suspicious'].count_documents({}),
-        'retained':       db['SIR_Retained'].count_documents({}),
-        'not_found':      db['SIR_NotFound'].count_documents({}),
+        'new_additions':  survey_db['SIR_NewAdditions'].count_documents({}),
+        'deletions':      survey_db['SIR_Deleted'].count_documents({}),
+        'modifications':  survey_db['SIR_Modified'].count_documents({}),
+        'suspicious':     survey_db['SIR_Suspicious'].count_documents({}),
+        'retained':       survey_db['SIR_Retained'].count_documents({}),
+        'not_found':      survey_db['SIR_NotFound'].count_documents({}),
         'voters_2002':    voters_2002,
         'voters_2025':    voters_2025,
         'db_2002_status': 'ok' if voters_2002 > 0 else 'empty — place 2002.xlsx in project root and call /api/sync-2002/',
@@ -3026,7 +3071,8 @@ def api_sir_stats(request):
 
 @require_http_methods(['GET'])
 def api_sir_data(request):
-    db       = get_db()
+    db        = get_db()
+    survey_db = get_survey_db()   # SIR_* collections live here
     category = request.GET.get('category', 'ALL').upper()
     page     = max(1, int(request.GET.get('page', 1)))
     limit    = 50
@@ -3053,17 +3099,17 @@ def api_sir_data(request):
         base_filter = {'$and': [base_filter, bf]} if base_filter else bf
 
     summary = {
-        'NEW':        db['SIR_NewAdditions'].count_documents(base_filter),
-        'DELETED':    db['SIR_Deleted'].count_documents(base_filter),
-        'MODIFIED':   db['SIR_Modified'].count_documents(base_filter),
-        'SUSPICIOUS': db['SIR_Suspicious'].count_documents(base_filter),
-        'RETAINED':   db['SIR_Retained'].count_documents(base_filter),
-        'NOT_FOUND':  db['SIR_NotFound'].count_documents(base_filter),
+        'NEW':        survey_db['SIR_NewAdditions'].count_documents(base_filter),
+        'DELETED':    survey_db['SIR_Deleted'].count_documents(base_filter),
+        'MODIFIED':   survey_db['SIR_Modified'].count_documents(base_filter),
+        'SUSPICIOUS': survey_db['SIR_Suspicious'].count_documents(base_filter),
+        'RETAINED':   survey_db['SIR_Retained'].count_documents(base_filter),
+        'NOT_FOUND':  survey_db['SIR_NotFound'].count_documents(base_filter),
     }
     summary['TOTAL'] = sum(summary.values())
 
     if category in col_map:
-        col   = db[col_map[category]]
+        col   = survey_db[col_map[category]]
         total = col.count_documents({})
         raw   = col.find(base_filter).sort('surveyed_at', -1).skip(skip).limit(limit)
         records = [_sir_to_frontend(bson_clean(d), category) for d in raw]
@@ -3072,7 +3118,7 @@ def api_sir_data(request):
 
     all_records = []
     for cat, cname in col_map.items():
-        for d in db[cname].find(base_filter).sort('surveyed_at', -1).limit(20):
+        for d in survey_db[cname].find(base_filter).sort('surveyed_at', -1).limit(20):
             all_records.append(_sir_to_frontend(bson_clean(d), cat))
     all_records.sort(key=lambda r: r.get('Time_stamp', ''), reverse=True)
     total = sum(summary[k] for k in col_map)
@@ -3174,13 +3220,13 @@ def api_sir_bulk(request):
         try:
             d = _flat_2025(doc)
             _run_sir_analysis(
-                db,
                 voterid = d['voterid'],
                 name    = d['name'],
                 house   = d['house'],
                 ward    = d['ward'],
                 booth   = d['booth'],
                 serial  = '',
+                db      = db,
             )
             processed += 1
         except Exception as e:
@@ -3202,7 +3248,6 @@ def api_sir_bulk(request):
             if not d['name'] and not d['voterid']:
                 continue   # skip blank docs
             _run_sir_analysis(
-                db,
                 voterid  = d['voterid'],
                 name     = d['name'],
                 house    = d['house'],
@@ -3210,6 +3255,7 @@ def api_sir_bulk(request):
                 booth    = '',
                 serial   = '',
                 relation = d['relation'],
+                db       = db,
             )
             processed += 1
         except Exception as e:
