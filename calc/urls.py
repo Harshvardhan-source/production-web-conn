@@ -54,4 +54,7 @@ urlpatterns = [
     path('admin/approve/',           views.api_admin_approve,      name='api_admin_approve'),
     path('admin/reject/',            views.api_admin_reject,       name='api_admin_reject'),
     path('admin/update-role/',       views.api_admin_update_role,  name='api_admin_update_role'),
+    path('api/admin/disable/', views.api_admin_disable, name='admin_disable'),
+    path('api/admin/enable/',  views.api_admin_enable,  name='admin_enable'),
 ]
+

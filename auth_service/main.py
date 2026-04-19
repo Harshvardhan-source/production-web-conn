@@ -273,6 +273,8 @@ def login(body: LoginBody, response: Response):
         raise HTTPException(status_code=403, detail="Your account is pending admin approval.")
     if acct_status == "rejected":
         raise HTTPException(status_code=403, detail="Your registration was rejected. Contact the admin.")
+    if acct_status == "disabled":
+        raise HTTPException(status_code=403, detail="Your account has been disabled by an admin. Contact the office.")
 
     token = create_token(user["Username"], body.email)
     _set_cookie(response, token)

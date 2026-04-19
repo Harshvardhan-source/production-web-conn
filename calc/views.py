@@ -317,11 +317,14 @@ def _can_write_booth(user: dict, booth) -> bool:
 
 
 def _require_approved(view_fn):
-    """Decorator: reject unauthenticated or pending/rejected users."""
+    """Decorator: reject unauthenticated or pending/rejected/disabled users."""
     def wrapper(request, *args, **kwargs):
         user = _user_from_request(request)
         if not user:
             return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+        status = user.get('status', 'pending')
+        if status == 'disabled':
+            return JsonResponse({'success': False, 'message': 'Your account has been disabled. Contact the admin.'}, status=403)
         if not _is_approved(user):
             return JsonResponse({'success': False, 'message': 'Your account is pending admin approval.'}, status=403)
         return view_fn(request, *args, **kwargs)
@@ -476,6 +479,8 @@ def api_login(request):
         return JsonResponse({'success': False, 'message': 'Your account is pending admin approval. Please wait.'}, status=403)
     if status == 'rejected':
         return JsonResponse({'success': False, 'message': 'Your registration has been rejected. Contact the admin.'}, status=403)
+    if status == 'disabled':
+        return JsonResponse({'success': False, 'message': 'Your account has been disabled. Contact the admin.'}, status=403)
 
     request.session['username'] = user['Username']
     request.session['email']    = email
@@ -3375,16 +3380,21 @@ def api_admin_users(request):
             'requestedAt': u.get('requestedAt', u.get('Time_stamp', '')).isoformat() if hasattr(u.get('requestedAt', u.get('Time_stamp', '')), 'isoformat') else str(u.get('requestedAt', '')),
             'approvedAt':  u.get('approvedAt', '').isoformat() if hasattr(u.get('approvedAt', ''), 'isoformat') else str(u.get('approvedAt', '') or ''),
             'approvedBy':  u.get('approvedBy', ''),
+            'disabledAt':  u.get('disabledAt', '').isoformat() if hasattr(u.get('disabledAt', ''), 'isoformat') else str(u.get('disabledAt', '') or ''),
+            'disabledBy':  u.get('disabledBy', ''),
+            'disableReason': u.get('disableReason', ''),
         })
 
     pending  = [u for u in result if u['status'] == 'pending']
     approved = [u for u in result if u['status'] == 'approved']
     rejected = [u for u in result if u['status'] == 'rejected']
+    disabled = [u for u in result if u['status'] == 'disabled']
     return JsonResponse({
         'success':  True,
         'pending':  pending,
         'approved': approved,
         'rejected': rejected,
+        'disabled': disabled,
         'total':    len(result),
     })
 
@@ -3485,6 +3495,87 @@ def api_admin_update_role(request):
 
     _invalidate_user_cache(target_email)
     return JsonResponse({'success': True, 'message': f'Role updated for {target_email}.'})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+@_require_superuser
+def api_admin_disable(request):
+    """
+    POST /api/admin/disable/
+    Body: { "email": "user@domain.com", "reason": "..." }
+    Immediately suspends an approved user — they cannot log in or call any
+    protected endpoint until re-enabled.  Their role/ward/booth are preserved
+    so re-enabling is seamless.
+    """
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        body = request.POST.dict()
+
+    target_email = body.get('email', '').strip().lower()
+    if not target_email:
+        return JsonResponse({'success': False, 'message': 'email is required.'}, status=400)
+
+    # Prevent admins from disabling other admins
+    target = get_db()['UserReg'].find_one({'Email': target_email}, {'role': 1, 'status': 1})
+    if not target:
+        return JsonResponse({'success': False, 'message': 'User not found.'}, status=404)
+    if target.get('role') in ('mla', 'pa'):
+        return JsonResponse({'success': False, 'message': 'Cannot disable an admin account.'}, status=403)
+    if target.get('status') == 'disabled':
+        return JsonResponse({'success': False, 'message': 'User is already disabled.'}, status=400)
+
+    admin = _user_from_request(request)
+    result = get_db()['UserReg'].update_one({'Email': target_email}, {'$set': {
+        'status':        'disabled',
+        'disabledAt':    datetime.utcnow(),
+        'disabledBy':    admin['email'],
+        'disableReason': body.get('reason', ''),
+    }})
+
+    _invalidate_user_cache(target_email)
+    return JsonResponse({'success': True, 'message': f'Access disabled for {target_email}.'})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+@_require_superuser
+def api_admin_enable(request):
+    """
+    POST /api/admin/enable/
+    Body: { "email": "user@domain.com" }
+    Restores a previously disabled user back to 'approved' status.
+    Their original role/ward/booth are unchanged.
+    """
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        body = request.POST.dict()
+
+    target_email = body.get('email', '').strip().lower()
+    if not target_email:
+        return JsonResponse({'success': False, 'message': 'email is required.'}, status=400)
+
+    target = get_db()['UserReg'].find_one({'Email': target_email}, {'status': 1})
+    if not target:
+        return JsonResponse({'success': False, 'message': 'User not found.'}, status=404)
+    if target.get('status') != 'disabled':
+        return JsonResponse({'success': False, 'message': 'User is not currently disabled.'}, status=400)
+
+    admin = _user_from_request(request)
+    result = get_db()['UserReg'].update_one({'Email': target_email}, {'$set': {
+        'status':      'approved',
+        'enabledAt':   datetime.utcnow(),
+        'enabledBy':   admin['email'],
+        # Clear the disable fields so history is clean
+        'disabledAt':  None,
+        'disabledBy':  '',
+        'disableReason': '',
+    }})
+
+    _invalidate_user_cache(target_email)
+    return JsonResponse({'success': True, 'message': f'Access restored for {target_email}.'})
 
 
 # ─── SESSION CHECK ────────────────────────────────────────────────────────────
