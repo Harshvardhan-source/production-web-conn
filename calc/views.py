@@ -2404,6 +2404,15 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
             if best_doc and best_score >= _FUZZY_THRESHOLD:
                 return bson_clean(best_doc)
 
+    # Tier 3b: house prefix fuzzy — catches "2-14-1223" when record is "2-14-1223/1"
+    if house and (name or relation):
+        house_pfx_rx = {'$regex': f'^{re.escape(house)}', '$options': 'i'}
+        candidates = list(col.find({'House No': house_pfx_rx}, _PROJ_25).limit(30))
+        if candidates:
+            best_doc, best_score = _score_candidates(candidates, _flat_2025, name, relation)
+            if best_doc and best_score >= _FUZZY_THRESHOLD:
+                return bson_clean(best_doc)
+
     # Tier 4: prefix → fuzzy, capped at 30 with projection
     if name:
         candidates = list(col.find(
@@ -2458,6 +2467,16 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
     # Tier 3: fuzzy within same house — threshold 60 (house confirms locality)
     if house and (name or relation):
         candidates = list(col.find(_house_q(house), _PROJ_02))
+        if candidates:
+            best_doc, best_score = _score_candidates(candidates, _flat_2002, name, relation)
+            if best_doc and best_score >= 60:
+                return bson_clean(best_doc)
+
+    # Tier 3b: house prefix fuzzy — catches "2-14-1223" when record is stored as "2-14-1223/1"
+    if house and (name or relation):
+        house_pfx_rx = {'$regex': f'^{re.escape(house)}', '$options': 'i'}
+        pfx_q = {'$or': [{'House / Flat No': house_pfx_rx}, {'House No': house_pfx_rx}]}
+        candidates = list(col.find(pfx_q, _PROJ_02).limit(30))
         if candidates:
             best_doc, best_score = _score_candidates(candidates, _flat_2002, name, relation)
             if best_doc and best_score >= 60:
@@ -2826,20 +2845,32 @@ def api_check_sir(request):
     suggestions_2002 = []
     if not in_2002 and (name or house or relation):
         _PROJ_02s = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
-                     'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,'Gender':1,'Age':1}
+                     'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,'Gender':1,'Age':1,
+                     'Booth No':1,'Part No':1,'Serial No':1}
         col_2002s = col_2002
 
         def _house_q2(h):
             return {'$or': [{'House / Flat No': h}, {'House No': h}]}
+
+        def _house_q2_prefix(h):
+            """Also match house numbers that start with h (e.g. '2-14-1223' matches '2-14-1223/1')."""
+            pfx_rx = {'$regex': f'^{re.escape(h)}', '$options': 'i'}
+            return {'$or': [{'House / Flat No': pfx_rx}, {'House No': pfx_rx}]}
 
         try:
             raw_candidates = []
             seen_ids = set()
 
             # ── Candidate collection — field-aware ───────────────────────────────
-            # house given → fetch all records at that house first (most precise)
+            # house given → fetch all records at that exact house first (most precise)
+            # ALSO fetch records where house starts with the given value (catches /1, /2 suffixes)
             if house:
                 for d in col_2002s.find(_house_q2(house), _PROJ_02s).limit(40):
+                    _id = str(d.get('_id', ''))
+                    if _id not in seen_ids:
+                        seen_ids.add(_id); raw_candidates.append(d)
+                # Prefix match: "2-14-1223" should also suggest "2-14-1223/1", "2-14-1223/2" etc.
+                for d in col_2002s.find(_house_q2_prefix(house), _PROJ_02s).limit(40):
                     _id = str(d.get('_id', ''))
                     if _id not in seen_ids:
                         seen_ids.add(_id); raw_candidates.append(d)
@@ -2922,6 +2953,8 @@ def api_check_sir(request):
                     'gender':       f['gender'],
                     'age':          f['age'],
                     'voterid':      f['voterid'],
+                    'booth':        str(doc.get('Booth No', doc.get('Part No', ''))).strip(),
+                    'serial':       str(doc.get('Serial No', '')).strip(),
                     'score':        round(item['comp']),
                     'source':       'mongodb',
                     'field_scores': item['field_scores'],
@@ -3016,6 +3049,7 @@ def api_check_sir(request):
     _seen_epics = {r25.get('voterid','')} if in_2025 else set()
 
     if house:
+        # Exact house match
         for doc in col_2025.find({'House No': house}, _PROJ_SLIM).limit(15):
             d = bson_clean(doc)
             epic = str(d.get('Epic NO','')).strip()
@@ -3025,6 +3059,20 @@ def api_check_sir(request):
                 'name': str(d.get('Name','')).strip(), 'relation': str(d.get('Relation Name','')).strip(),
                 'house': str(d.get('House No','')).strip(), 'voterid': epic,
                 'gender': str(d.get('Gender','')).strip(), 'age': str(d.get('Age','')).strip(),
+                'booth': str(d.get('Booth No','')).strip(), 'part': str(d.get('Part No','')).strip(),
+            })
+        # Prefix match: "2-14-1223" also finds "2-14-1223/1", "2-14-1223/2" etc.
+        house_pfx_rx = {'$regex': f'^{re.escape(house)}', '$options': 'i'}
+        for doc in col_2025.find({'House No': house_pfx_rx}, _PROJ_SLIM).limit(20):
+            d = bson_clean(doc)
+            epic = str(d.get('Epic NO','')).strip()
+            if epic in _seen_epics: continue
+            _seen_epics.add(epic)
+            similar_2025.append({
+                'name': str(d.get('Name','')).strip(), 'relation': str(d.get('Relation Name','')).strip(),
+                'house': str(d.get('House No','')).strip(), 'voterid': epic,
+                'gender': str(d.get('Gender','')).strip(), 'age': str(d.get('Age','')).strip(),
+                'booth': str(d.get('Booth No','')).strip(), 'part': str(d.get('Part No','')).strip(),
             })
 
     if name and len(name) >= 3:
@@ -3038,6 +3086,7 @@ def api_check_sir(request):
                 'name': str(d.get('Name','')).strip(), 'relation': str(d.get('Relation Name','')).strip(),
                 'house': str(d.get('House No','')).strip(), 'voterid': epic,
                 'gender': str(d.get('Gender','')).strip(), 'age': str(d.get('Age','')).strip(),
+                'booth': str(d.get('Booth No','')).strip(), 'part': str(d.get('Part No','')).strip(),
             })
 
     if relation and len(relation) >= 3 and len(similar_2025) < 12:
@@ -3051,6 +3100,7 @@ def api_check_sir(request):
                 'name': str(d.get('Name','')).strip(), 'relation': str(d.get('Relation Name','')).strip(),
                 'house': str(d.get('House No','')).strip(), 'voterid': epic,
                 'gender': str(d.get('Gender','')).strip(), 'age': str(d.get('Age','')).strip(),
+                'booth': str(d.get('Booth No','')).strip(), 'part': str(d.get('Part No','')).strip(),
             })
     similar_2025 = similar_2025[:12]
 
