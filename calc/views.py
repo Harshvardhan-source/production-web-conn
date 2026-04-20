@@ -915,9 +915,19 @@ def api_ward_dashboard(request):
                 }
 
         # ── 4. Polled/NotPolled HMC from 2023_polled_notpolled for this ward ───
-        csv_ward = _csv_ward_name(ward_name)
+        # Query by Booth No (from WARD_FULL_DATA) instead of Ward name to avoid
+        # old-name mismatch. The 2023_polled_notpolled collection stores a numeric
+        # "Booth No" field — include both int and str forms to be type-safe.
+        ward_num_key  = ward_int if ward_int is not None else (int(ward) if str(ward).isdigit() else None)
+        ward_booths_for_polled = WARD_FULL_DATA.get(ward_num_key, {}).get('booths', [])
         try:
-            ward_polled_hmc = _get_polled_hmc(db, {'Ward': csv_ward})
+            if ward_booths_for_polled:
+                booth_vals_polled = ward_booths_for_polled + [str(b) for b in ward_booths_for_polled]
+                ward_polled_hmc = _get_polled_hmc(db, {'Booth No': {'$in': booth_vals_polled}})
+            else:
+                # Fallback: try name-based match if no booths found
+                csv_ward = _csv_ward_name(ward_name)
+                ward_polled_hmc = _get_polled_hmc(db, {'Ward': csv_ward})
         except Exception:
             ward_polled_hmc = None
 
