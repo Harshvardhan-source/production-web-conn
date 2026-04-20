@@ -1083,12 +1083,15 @@ def api_booth_dashboard(request):
         coverage_pct   = round(total_reg / (total_electors or 1) * 100, 1)
 
         # ── 4. Polled/NotPolled HMC from 2023_polled_notpolled for this booth ──
+        # FIX: 2023_polled_notpolled is on the SURVEY cluster, not main db.
+        # Include both int + str forms of Booth No — MongoDB $in is type-strict.
+        _survey_db_booth = get_survey_db()
         booth_num_int = booth_int or (int(booth) if booth.isdigit() else None)
         try:
             if booth_num_int is not None:
-                booth_polled_hmc = _get_polled_hmc(db, {'Booth No': booth_num_int})
+                booth_polled_hmc = _get_polled_hmc(_survey_db_booth, {'Booth No': {'$in': [booth_num_int, str(booth_num_int)]}})
             else:
-                booth_polled_hmc = _get_polled_hmc(db, {'Booth No': booth})
+                booth_polled_hmc = _get_polled_hmc(_survey_db_booth, {'Booth No': {'$in': [booth, str(booth)]}})
         except Exception:
             booth_polled_hmc = None
 
