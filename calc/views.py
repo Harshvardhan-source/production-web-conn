@@ -80,6 +80,85 @@ for _wnum, _wdata in WARD_FULL_DATA.items():
 
 # ward_name (upper) → list of booth ints
 WARD_NAME_TO_BOOTHS = {v["name"].upper(): v["booths"] for v in WARD_FULL_DATA.values()}
+
+# ── 2023 polled/notpolled collection uses SurveyOpt-style ward names ───────────
+# Maps WARD_FULL_DATA name (UPPER) → ward name stored in 2023_polled_notpolled
+_WARD_FULL_TO_CSV = {
+    "PADAVU":              "PADAV-WEST",
+    "PADAVU CENTRAL":      "PADAV CENTRAL",
+    "PADAVU POORVA":       "PADAV-EAST",
+    "DEREBAIL SOUTH WEST": "DEREBAIL NAIRUTHYA",
+    "KAMBLA":              "KAMBALA",
+    "SHIVBHAG":            "SHIVABAGH",
+    "BENDUR":              "BENDOOR",
+    "DONGERKERY":          "DONGARAKERY",
+    "NAVAYATH":            "BUNDER",
+    "CANTONMENT":          "CONTONMENT",
+    "MILAGRIS":            "MILAGRESS",
+    "JEPPINAMUGER":        "JAPPIMOGAR",
+    "ATTAVARA":            "ATHAVARA",
+    "ALAPE DAKSHINA":      "ALAPE SOUTH",
+    "ALAPE UTTARA":        "ALAPE NORTH",
+    "MANNAGUDDA":          "MANNAGDDA",
+}
+
+def _csv_ward_name(ward_full_name: str) -> str:
+    """Convert WARD_FULL_DATA name → 2023_polled_notpolled Ward field value."""
+    upper = ward_full_name.upper().strip()
+    return _WARD_FULL_TO_CSV.get(upper, ward_full_name)  # unchanged if no alias
+
+
+def _get_polled_hmc(db, match_filter: dict) -> dict:
+    """
+    Query 2023_polled_notpolled collection and return:
+    {
+      'H': {'polled': n, 'notPolled': n, 'total': n},
+      'M': {...},
+      'C': {...},
+      'total': {'polled': n, 'notPolled': n, 'total': n},
+    }
+    match_filter: MongoDB $match dict (e.g. {'Ward': 'PADAV-WEST'} or {'Booth No': 44})
+    """
+    coll = db['2023_polled_notpolled']
+    pipeline = [
+        {'$match': match_filter},
+        {'$group': {
+            '_id': {
+                'religion':      '$Religion',
+                'polling_status': '$Polling status',
+            },
+            'n': {'$sum': 1}
+        }},
+    ]
+    rows = list(coll.aggregate(pipeline))
+
+    # Religion label → key
+    rel_to_key = {'Hindu': 'H', 'Muslim': 'M', 'Christian': 'C'}
+
+    result = {
+        'H': {'polled': 0, 'notPolled': 0, 'total': 0},
+        'M': {'polled': 0, 'notPolled': 0, 'total': 0},
+        'C': {'polled': 0, 'notPolled': 0, 'total': 0},
+        'total': {'polled': 0, 'notPolled': 0, 'total': 0},
+    }
+    for row in rows:
+        rel  = row['_id'].get('religion', '')
+        stat = row['_id'].get('polling_status', '')
+        n    = row['n']
+        key  = rel_to_key.get(rel)
+        if not key:
+            continue
+        if stat == 'Polled':
+            result[key]['polled'] += n
+            result['total']['polled'] += n
+        else:
+            result[key]['notPolled'] += n
+            result['total']['notPolled'] += n
+
+    for k in ('H', 'M', 'C', 'total'):
+        result[k]['total'] = result[k]['polled'] + result[k]['notPolled']
+
+    return result
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Fuzzy name matching — handles transliteration variants like
@@ -650,6 +729,12 @@ def _registration_analytics(db=None):
         'C': hmc_map.get('C', 0),
         'total': sum(hmc_map.get(k, 0) for k in ('H', 'M', 'C')),
     }
+
+    # ── Polled / NotPolled HMC from 2023_polled_notpolled (constituency = all) ─
+    try:
+        polled_hmc = _get_polled_hmc(db, {})
+    except Exception:
+        polled_hmc = None
  
     # ── Ward coverage (uses WardReference + ward_counts from survey) ──────────
     ward_ref   = list(coll_ward.find({}, {'number': 1, 'totalCount': 1}))
@@ -673,6 +758,7 @@ def _registration_analytics(db=None):
         'regReligion':     reg_religion,
         'voterReligion':   voter_religion,
         'voterHMC':        voter_hmc,
+        'polledHMC':       polled_hmc,
         'wardCoverage':    percentages,
     }
  
@@ -828,7 +914,14 @@ def api_ward_dashboard(request):
                     'total': sum(hmc_map.get(k, 0) for k in ('H', 'M', 'C')),
                 }
 
-        # ── 4. Coverage ───────────────────────────────────────────────────────
+        # ── 4. Polled/NotPolled HMC from 2023_polled_notpolled for this ward ───
+        csv_ward = _csv_ward_name(ward_name)
+        try:
+            ward_polled_hmc = _get_polled_hmc(db, {'Ward': csv_ward})
+        except Exception:
+            ward_polled_hmc = None
+
+        # ── 5. Coverage ───────────────────────────────────────────────────────
         denom        = total_voters or 1
         coverage_pct = round(total_reg / denom * 100, 1)
 
@@ -850,6 +943,7 @@ def api_ward_dashboard(request):
                 'Christian': total_chr,
             },
             'voterHMC':         ward_hmc,
+            'polledHMC':        ward_polled_hmc,
             'totalReg':         total_reg,
             'regMale':          reg_male,
             'regFemale':        reg_female,
@@ -975,6 +1069,16 @@ def api_booth_dashboard(request):
         total_electors = _num(booth_doc.get('totalElectors'))
         coverage_pct   = round(total_reg / (total_electors or 1) * 100, 1)
 
+        # ── 4. Polled/NotPolled HMC from 2023_polled_notpolled for this booth ──
+        booth_num_int = booth_int or (int(booth) if booth.isdigit() else None)
+        try:
+            if booth_num_int is not None:
+                booth_polled_hmc = _get_polled_hmc(db, {'Booth No': booth_num_int})
+            else:
+                booth_polled_hmc = _get_polled_hmc(db, {'Booth No': booth})
+        except Exception:
+            booth_polled_hmc = None
+
         result = {
             'wardNumber':        ward,
             'wardName':          ward_name,
@@ -999,6 +1103,8 @@ def api_booth_dashboard(request):
             'coveragePct':       coverage_pct,
             # HMC religion counts from 2025 voter list
             'boothHMC':          booth_hmc,
+            # Polled/NotPolled HMC from 2023 election data
+            'polledHMC':         booth_polled_hmc,
         }
 
         _booth_dash_cache[cache_key] = {'data': result, 'ts': _t.time()}
