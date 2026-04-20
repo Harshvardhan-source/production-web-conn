@@ -790,9 +790,10 @@ def api_ward_dashboard(request):
     if not ward:
         return JsonResponse({'success': False, 'message': 'ward parameter required'}, status=400)
 
-    # Cache hit
+    # Cache hit (skip if ?nocache=1 passed for debugging)
+    no_cache = request.GET.get('nocache', '0') == '1'
     cached = _ward_dash_cache.get(ward)
-    if cached and (_t.time() - cached['ts']) < _WARD_CACHE_TTL:
+    if not no_cache and cached and (_t.time() - cached['ts']) < _WARD_CACHE_TTL:
         return JsonResponse({'success': True, **cached['data']})
 
     try:
@@ -915,19 +916,21 @@ def api_ward_dashboard(request):
                 }
 
         # ── 4. Polled/NotPolled HMC from 2023_polled_notpolled for this ward ───
-        # Query by Booth No (from WARD_FULL_DATA) instead of Ward name to avoid
-        # old-name mismatch. The 2023_polled_notpolled collection stores a numeric
-        # "Booth No" field — include both int and str forms to be type-safe.
-        ward_num_key  = ward_int if ward_int is not None else (int(ward) if str(ward).isdigit() else None)
-        ward_booths_for_polled = WARD_FULL_DATA.get(ward_num_key, {}).get('booths', [])
+        # FIX 1: 2023_polled_notpolled is on SURVEY cluster (get_survey_db), not main db.
+        #         Constituency-level already uses survey_db correctly — ward level must too.
+        # FIX 2: Query by Booth No (from WARD_FULL_DATA) instead of old ward name string,
+        #         which fails because 2023 collection uses legacy ward names.
+        #         Both int + str forms passed because MongoDB $in is type-strict.
+        _survey_db_ward = get_survey_db()
+        ward_num_key = ward_int if ward_int is not None else (int(ward) if str(ward).isdigit() else None)
+        ward_booths_for_polled = WARD_FULL_DATA.get(ward_num_key, {}).get("booths", [])
         try:
             if ward_booths_for_polled:
-                booth_vals_polled = ward_booths_for_polled + [str(b) for b in ward_booths_for_polled]
-                ward_polled_hmc = _get_polled_hmc(db, {'Booth No': {'$in': booth_vals_polled}})
+                booth_vals_polled = list(ward_booths_for_polled) + [str(b) for b in ward_booths_for_polled]
+                ward_polled_hmc = _get_polled_hmc(_survey_db_ward, {"Booth No": {"$in": booth_vals_polled}})
             else:
-                # Fallback: try name-based match if no booths found
                 csv_ward = _csv_ward_name(ward_name)
-                ward_polled_hmc = _get_polled_hmc(db, {'Ward': csv_ward})
+                ward_polled_hmc = _get_polled_hmc(_survey_db_ward, {"Ward": csv_ward})
         except Exception:
             ward_polled_hmc = None
 
