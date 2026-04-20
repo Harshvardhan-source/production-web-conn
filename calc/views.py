@@ -732,7 +732,7 @@ def _registration_analytics(db=None):
 
     # ── Polled / NotPolled HMC from 2023_polled_notpolled (constituency = all) ─
     try:
-        polled_hmc = _get_polled_hmc(db, {})
+        polled_hmc = _get_polled_hmc(survey_db, {})
     except Exception:
         polled_hmc = None
  
