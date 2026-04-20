@@ -2016,6 +2016,7 @@ def api_house_search(request):
             'house_no':  hn,
             'address':   str(d.get('Address', '')),            # voter's own address from 2025 DB
             'serial_no': d.get('Serial No') or d.get('Sl No', ''),  # voter's serial from 2025 roll
+            'religion':  str(d.get('Predicted_Religion_Label', '')).strip(),  # H / M / C
             'surveyed':  False,
         }
         house_map.setdefault(hn, []).append(member)
