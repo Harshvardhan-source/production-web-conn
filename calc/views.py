@@ -714,8 +714,10 @@ def _registration_analytics(db=None):
     large_family_count = v_result['large_families'][0]['n'] if v_result.get('large_families') else 0
  
     gender_map_v = {g['_id']: g['n'] for g in v_result['genders']}
-    voter_male   = gender_map_v.get('M', 0)
-    voter_female = gender_map_v.get('F', 0)
+    # 2025 collection stores Gender as full strings "Male" / "Female" (not 'M'/'F')
+    voter_male   = gender_map_v.get('Male',   0)
+    voter_female = gender_map_v.get('Female', 0)
+    voter_trans  = gender_map_v.get('Other',  0) + gender_map_v.get('Trans', 0)
  
     religion_map   = {'H': 'Hindu', 'M': 'Muslim', 'C': 'Christian', 'J': 'Jain', 'B': 'Buddhist', 'S': 'Sikh'}
     rel_map_v      = {g['_id']: g['n'] for g in v_result['religions']}
@@ -755,6 +757,7 @@ def _registration_analytics(db=None):
         'regFemale':       reg_female,
         'voterMale':       voter_male,
         'voterFemale':     voter_female,
+        'voterTrans':      voter_trans,
         'regReligion':     reg_religion,
         'voterReligion':   voter_religion,
         'voterHMC':        voter_hmc,
@@ -1065,19 +1068,36 @@ def api_booth_dashboard(request):
         if booth_int is not None:
             booth_vals.append(booth_int)   # ← integer form — critical for collections
                                            #   where Part No is stored as int (e.g. 31, not "31")
-        hmc_pipeline = [
+        booth_voter_pipeline = [
             {'$match': {'Part No': {'$in': booth_vals}}},
-            {'$match': {'Predicted_Religion_Label': {'$in': ['H', 'M', 'C']}}},
-            {'$group': {'_id': '$Predicted_Religion_Label', 'n': {'$sum': 1}}},
+            {'$facet': {
+                'hmc': [
+                    {'$match': {'Predicted_Religion_Label': {'$in': ['H', 'M', 'C']}}},
+                    {'$group': {'_id': '$Predicted_Religion_Label', 'n': {'$sum': 1}}},
+                ],
+                # 2025 stores Gender as full strings: "Male" / "Female"
+                'genders': [
+                    {'$group': {'_id': '$Gender', 'n': {'$sum': 1}}},
+                ],
+                'total': [{'$count': 'n'}],
+            }}
         ]
-        hmc_result = list(main_db['2025'].aggregate(hmc_pipeline))
-        hmc_map    = {g['_id']: g['n'] for g in hmc_result}
-        booth_hmc  = {
+        bv_result   = list(main_db['2025'].aggregate(booth_voter_pipeline))
+        bv_facet    = bv_result[0] if bv_result else {}
+
+        hmc_map     = {g['_id']: g['n'] for g in bv_facet.get('hmc', [])}
+        booth_hmc   = {
             'H': hmc_map.get('H', 0),
             'M': hmc_map.get('M', 0),
             'C': hmc_map.get('C', 0),
             'total': sum(hmc_map.get(k, 0) for k in ('H', 'M', 'C')),
         }
+
+        bgmap              = {g['_id']: g['n'] for g in bv_facet.get('genders', [])}
+        booth_voter_male   = bgmap.get('Male',   0)
+        booth_voter_female = bgmap.get('Female', 0)
+        booth_voter_trans  = bgmap.get('Other',  0) + bgmap.get('Trans', 0)
+        booth_total_voters = bv_facet['total'][0]['n'] if bv_facet.get('total') else 0
 
         total_electors = _num(booth_doc.get('totalElectors'))
         coverage_pct   = round(total_reg / (total_electors or 1) * 100, 1)
@@ -1111,6 +1131,11 @@ def api_booth_dashboard(request):
             'electorsMapped':    _num(booth_doc.get('electorsMapped')),
             'pctElectorsMapped': _flt(booth_doc.get('pctElectorsMapped')),
             'pctTotalCompleted': _flt(booth_doc.get('pctTotalCompleted')),
+            # Voter demographics from 2025 roll (booth level)
+            'totalVoters':       booth_total_voters,
+            'totalMale':         booth_voter_male,
+            'totalFemale':       booth_voter_female,
+            'totalTrans':        booth_voter_trans,
             # Survey coverage — from SurveyRecords
             'totalReg':          total_reg,
             'regMale':           gmap.get('Male',   0),
