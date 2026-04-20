@@ -81,9 +81,8 @@ for _wnum, _wdata in WARD_FULL_DATA.items():
 # ward_name (upper) → list of booth ints
 WARD_NAME_TO_BOOTHS = {v["name"].upper(): v["booths"] for v in WARD_FULL_DATA.values()}
 
-# ── 2023 polled/notpolled collection ward-name aliases (kept for fallback only) ──
-# NOTE: The booth-number approach (_get_polled_hmc_by_booths) is now used for ward-
-# level queries. These name mappings are only used as a fallback.
+# ── 2023 polled/notpolled collection uses SurveyOpt-style ward names ───────────
+# Maps WARD_FULL_DATA name (UPPER) → ward name stored in 2023_polled_notpolled
 _WARD_FULL_TO_CSV = {
     "PADAVU":              "PADAV-WEST",
     "PADAVU CENTRAL":      "PADAV CENTRAL",
@@ -118,17 +117,14 @@ def _get_polled_hmc(db, match_filter: dict) -> dict:
       'C': {...},
       'total': {'polled': n, 'notPolled': n, 'total': n},
     }
-    match_filter: MongoDB $match dict.
-      - For booth-level:  {'Booth No': 44}   or  {'Booth No': {'$in': [31,32,33]}}
-      - For constituency: {}  (all records)
-    NOTE: Ward-name-based filtering is unreliable — always prefer booth-number filters.
+    match_filter: MongoDB $match dict (e.g. {'Ward': 'PADAV-WEST'} or {'Booth No': 44})
     """
     coll = db['2023_polled_notpolled']
     pipeline = [
         {'$match': match_filter},
         {'$group': {
             '_id': {
-                'religion':       '$Religion',
+                'religion':      '$Religion',
                 'polling_status': '$Polling status',
             },
             'n': {'$sum': 1}
@@ -136,6 +132,7 @@ def _get_polled_hmc(db, match_filter: dict) -> dict:
     ]
     rows = list(coll.aggregate(pipeline))
 
+    # Religion label → key
     rel_to_key = {'Hindu': 'H', 'Muslim': 'M', 'Christian': 'C'}
 
     result = {
@@ -162,20 +159,6 @@ def _get_polled_hmc(db, match_filter: dict) -> dict:
         result[k]['total'] = result[k]['polled'] + result[k]['notPolled']
 
     return result
-
-
-def _get_polled_hmc_by_booths(db, booth_list: list) -> dict:
-    """
-    Ward-level polled HMC using booth numbers from WARD_FULL_DATA.
-    Bypasses the stale Ward-name field — booth numbers are stable identifiers.
-    booth_list: list of int booth numbers, e.g. [31, 32, 33, 55, 56, 57, 58]
-    """
-    if not booth_list:
-        return None
-    # Include both int and string variants for robustness
-    booth_vals = list(booth_list) + [str(b) for b in booth_list]
-    match_filter = {'Booth No': {'$in': booth_vals}}
-    return _get_polled_hmc(db, match_filter)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Fuzzy name matching — handles transliteration variants like
@@ -747,9 +730,9 @@ def _registration_analytics(db=None):
         'total': sum(hmc_map.get(k, 0) for k in ('H', 'M', 'C')),
     }
 
-    # ── Polled / NotPolled HMC from 2023_polled_notpolled (all booths = all wards) ─
+    # ── Polled / NotPolled HMC from 2023_polled_notpolled (constituency = all) ─
     try:
-        polled_hmc = _get_polled_hmc(db, {})
+        polled_hmc = _get_polled_hmc(survey_db, {})
     except Exception:
         polled_hmc = None
  
@@ -931,18 +914,10 @@ def api_ward_dashboard(request):
                     'total': sum(hmc_map.get(k, 0) for k in ('H', 'M', 'C')),
                 }
 
-        # ── 4. Polled/NotPolled HMC from 2023_polled_notpolled ─────────────────
-        # Use booth numbers from WARD_FULL_DATA — ward name in the collection is
-        # stale (old ward names) so booth-number matching is the reliable approach.
+        # ── 4. Polled/NotPolled HMC from 2023_polled_notpolled for this ward ───
+        csv_ward = _csv_ward_name(ward_name)
         try:
-            ward_num_key = ward_int if ward_int is not None else (int(ward) if str(ward).isdigit() else None)
-            if ward_num_key and ward_num_key in WARD_FULL_DATA:
-                ward_booth_list = WARD_FULL_DATA[ward_num_key]['booths']
-                ward_polled_hmc = _get_polled_hmc_by_booths(db, ward_booth_list)
-            else:
-                # Fallback: try old name mapping
-                csv_ward = _csv_ward_name(ward_name)
-                ward_polled_hmc = _get_polled_hmc(db, {'Ward': csv_ward})
+            ward_polled_hmc = _get_polled_hmc(db, {'Ward': csv_ward})
         except Exception:
             ward_polled_hmc = None
 
