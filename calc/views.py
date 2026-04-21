@@ -4055,3 +4055,84 @@ def api_me(request):
             'status':   user.get('status', 'pending'),
         })
     return JsonResponse({'loggedIn': False}, status=401)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STATIC SIR DATASETS — loaded from Excel files bundled with the backend
+# Three datasets: Genuine Voters, Presumed Dead, Suspected Bogus
+# Files must be placed in the same directory as views.py (or adjust _BASE_DIR).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import functools
+
+_BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
+
+@functools.lru_cache(maxsize=3)
+def _load_static_sir(filename: str) -> list:
+    """Load an Excel SIR file and return as list of dicts. Cached in memory."""
+    path = _os.path.join(_BASE_DIR, filename)
+    if not _os.path.exists(path):
+        return []
+    df = pd.read_excel(path, dtype=str)
+    df = df.where(pd.notna(df), None)   # replace NaN with None for JSON safety
+    return df.to_dict(orient='records')
+
+
+def _paginate_filter(records: list, search: str, page: int, limit: int = 50):
+    """Filter by search string and paginate."""
+    if search:
+        q = search.lower()
+        records = [
+            r for r in records
+            if any(q in str(v).lower() for v in r.values() if v is not None)
+        ]
+    total  = len(records)
+    start  = (page - 1) * limit
+    return records[start:start + limit], total
+
+
+@require_http_methods(['GET'])
+def api_sir_genuine(request):
+    """GET /api/sir-genuine/?page=1&search="""
+    records = _load_static_sir('genuine_voters_SIR_combined__1_.xlsx')
+    page    = max(1, int(request.GET.get('page',   1)))
+    search  = request.GET.get('search', '').strip()
+    page_records, total = _paginate_filter(records, search, page)
+    return JsonResponse({
+        'success': True,
+        'total':   total,
+        'count':   len(records),
+        'page':    page,
+        'records': page_records,
+    })
+
+
+@require_http_methods(['GET'])
+def api_sir_dead(request):
+    """GET /api/sir-dead/?page=1&search="""
+    records = _load_static_sir('presumed_dead_above55_2002_voters.xlsx')
+    page    = max(1, int(request.GET.get('page',   1)))
+    search  = request.GET.get('search', '').strip()
+    page_records, total = _paginate_filter(records, search, page)
+    return JsonResponse({
+        'success': True,
+        'total':   total,
+        'count':   len(records),
+        'page':    page,
+        'records': page_records,
+    })
+
+
+@require_http_methods(['GET'])
+def api_sir_bogus(request):
+    """GET /api/sir-bogus/?page=1&search="""
+    records = _load_static_sir('suspected_bogus_voters_2025.xlsx')
+    page    = max(1, int(request.GET.get('page',   1)))
+    search  = request.GET.get('search', '').strip()
+    page_records, total = _paginate_filter(records, search, page)
+    return JsonResponse({
+        'success': True,
+        'total':   total,
+        'count':   len(records),
+        'page':    page,
+        'records': page_records,
+    })
