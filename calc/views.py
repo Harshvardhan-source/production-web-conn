@@ -1291,10 +1291,19 @@ def api_save_survey(request):
     if not _is_approved(_user):
         return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
 
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        body = request.POST.dict()
+    # ── Parse body — supports both JSON and multipart (when aadhaar photo sent) ──
+    aadhaar_photo_file = None
+    if request.content_type and 'multipart' in request.content_type:
+        try:
+            body = json.loads(request.POST.get('data', '{}'))
+        except Exception:
+            body = request.POST.dict()
+        aadhaar_photo_file = request.FILES.get('aadhaar_photo')
+    else:
+        try:
+            body = json.loads(request.body)
+        except Exception:
+            body = request.POST.dict()
 
     # Ward / booth write check (after body is parsed so we have ward/booth)
     _ward_body  = body.get('wardNumber', '')
@@ -1365,6 +1374,9 @@ def api_save_survey(request):
         'gender':           body.get('gender'),
         'maritalStatus':    body.get('maritalStatus'),
         'voterid':          voterid or body.get('voterid'),
+
+        # ── Aadhaar photo (GCS URL if uploaded, else None) ─────────
+        'aadhaarPhotoUrl':  None,
 
         # ── Outstation ────────────────────────────────────────────
         'outstationResident': body.get('outstationResident', 'No'),
@@ -1468,7 +1480,23 @@ def api_save_survey(request):
     data['sir_category']   = sir_category
     data['sir_suspicious'] = bool(sir_result and sir_result.get('suspicious')) if sir_result else False
 
-    # ── 5. Save to correct collection ────────────────────────────────────────
+    # ── 5a. Upload Aadhaar photo to GCS if provided ───────────────────────────
+    if aadhaar_photo_file:
+        try:
+            import uuid as _uuid
+            first = (body.get('firstName') or 'unknown').replace(' ', '_').lower()
+            last  = (body.get('lastName')  or '').replace(' ', '_').lower()
+            ext   = os.path.splitext(aadhaar_photo_file.name)[1].lower() or '.jpg'
+            blob_name = f"aadhaar_photos/{first}_{last}_{final_serial}_{_uuid.uuid4().hex[:8]}{ext}"
+            photo_url = _upload_to_gcs(aadhaar_photo_file, blob_name)
+            data['aadhaarPhotoUrl'] = photo_url
+            print(f"[api_save_survey] ✓ Aadhaar photo uploaded to GCS: {photo_url}")
+        except Exception as _photo_err:
+            # Non-fatal — survey still saves, photo URL stays None
+            data['aadhaarPhotoUrl'] = None
+            print(f"[api_save_survey] ✗ Aadhaar photo GCS upload failed: {_photo_err}")
+
+    # ── 5b. Save to correct collection ───────────────────────────────────────
     # voter_2025 is None  →  not in 2025 voter roll → NotFoundRecordSurvey
     # voter_2025 found    →  normal path             → SurveyRecords
     if voter_2025 is None:
