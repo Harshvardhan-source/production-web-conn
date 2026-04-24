@@ -44,9 +44,9 @@ CORS_ALLOW_HEADERS = [
 
 # ── Middleware (order matters — CorsMiddleware must be first) ─────────────────
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware',          # ← MUST be first
-    'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',
+    'corsheaders.middleware.CorsMiddleware',           # 1st — always
+    'django.middleware.security.SecurityMiddleware',   # 2nd — always
+    'whitenoise.middleware.WhiteNoiseMiddleware',      # 3rd — after Security
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
