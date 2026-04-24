@@ -3159,24 +3159,43 @@ def api_check_sir(request):
 
     _scored_25 = []
     for d in _raw_25:
-        rn  = str(d.get('Name','')).strip()
-        rr  = str(d.get('Relation Name','')).strip()
-        rh  = str(d.get('House No','')).strip()
-        re_ = str(d.get('Epic NO','')).strip()
+        # Apply _norm() so case matches user input — 2025 DB stores Relation Name
+        # in mixed case ("Babu Kottari") while user input is uppercased by _norm().
+        # Without this, _name_score("BABU KOTTARI","Babu Kottari") = 25 (case mismatch)
+        # and 'relation' never gets tagged even for a perfect match.
+        rn  = _norm(d.get('Name',''))
+        rr  = _norm(d.get('Relation Name',''))
+        rh  = _norm(d.get('House No',''))
+        re_ = _norm(d.get('Epic NO',''))
         flags = _match_flags_25(rn, rr, rh, re_)
         if not flags: continue
-        _scored_25.append((len(flags), {
+
+        # Compute composite score so best match floats to top within same flag group
+        _n_sc = _name_score(name, rn)     if name     else 0.0
+        _r_sc = _name_score(relation, rr) if relation else 0.0
+        _h_ok = house and (rh == _norm(house) or rh.startswith(_norm(house)))
+        if name and relation:
+            _comp25 = 0.60*_n_sc + 0.40*_r_sc
+        elif name:
+            _comp25 = _n_sc
+        elif relation:
+            _comp25 = _r_sc
+        else:
+            _comp25 = 100.0
+
+        _scored_25.append((len(flags), _comp25, {
             'name': rn, 'relation': rr, 'house': rh, 'voterid': re_,
-            'gender': str(d.get('Gender','')).strip(),
+            'gender': _norm(d.get('Gender','')),
             'age':    str(d.get('Age','')).strip(),
             'booth':  str(d.get('Booth No','')).strip(),
             'part':   str(d.get('Part No','')).strip(),
             'matched_by': flags,
         }))
 
-    _scored_25.sort(key=lambda x: -x[0])
+    # Sort: most fields matched first, then by composite score (best match rises to top)
+    _scored_25.sort(key=lambda x: (-x[0], -x[1]))
     _confirmed_25_voterid = r25.get('voterid','') if in_2025 else ''
-    for _, rec in _scored_25:
+    for _, _score25, rec in _scored_25:
         epic = rec['voterid']
         if epic and epic in _seen_25_epics: continue
         if _confirmed_25_voterid and epic == _confirmed_25_voterid: continue
