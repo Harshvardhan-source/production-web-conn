@@ -2835,180 +2835,163 @@ def api_check_sir(request):
                 'value': net,
             })
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # BROAD 2002 SUGGESTION ENGINE
-    # ──────────────────────────────────────────────────────────────────────────
-    # Candidate sweeps (ALL run independently, deduped by _id):
-    #   A. house exact        → all voters at exact house no
-    #   B. house prefix       → house nos that start with query (catches /1 /2 suffixes)
-    #   C. name prefix-2      → voter name starts with first 2 chars (very broad)
-    #   D. name prefix-3      → voter name starts with first 3 chars
-    #   E. relation prefix-2  → relative name starts with first 2 chars
-    #   F. relation prefix-3  → relative name starts with first 3 chars
-    #   G. contains-name      → voter name contains the query anywhere (partial match)
-    #   H. contains-relation  → relative name contains query anywhere
+    # ── 2002 suggestions — field-aware, MongoDB primary + Excel secondary ────────
+    # CANDIDATE STRATEGY — always uses minimum prefix length needed to be specific:
+    #   • name  → FIRST WORD prefix-4 (not 2/3) to avoid "ASHA" matching "ASHWITH POOJARY"
+    #   • house → exact + prefix (handles /1 /2 variants)
+    #   • relation → prefix-4 of first word only
     #
-    # Per-candidate 4-field scoring (name, house, relation, voterid) →
-    # composite score with dynamic weights based on which fields were provided.
+    # SCORING — 4-field composite with strict name gate:
+    #   Name score is computed as token_sort (whole-name similarity), NOT partial_ratio.
+    #   This stops short names like "ASHA" scoring high against "ASHWITH POOJARY".
+    #   Gate: name_score >= 62 required when name is provided (was 30 — far too low).
     #
-    # Match buckets returned (each is a labelled group in the response):
-    #   • ALL_4   — all 4 fields match (name+house+relation+voterid)
-    #   • NAME_HOUSE_REL — name + house + relation match
-    #   • NAME_HOUSE — name + house match
-    #   • NAME_REL  — name + relation match
-    #   • NAME_ONLY — only voter name matches
-    #   • HOUSE_ONLY — only house number matches
-    #   • REL_ONLY   — only relation name matches
-    # ══════════════════════════════════════════════════════════════════════════
+    # Returns up to 15 candidates sorted by composite score.
     suggestions_2002 = []
-    if not in_2002 and (name or house or relation or voterid):
+    if not in_2002 and (name or house or relation):
         _PROJ_02s = {
             'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
             'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,
             'Gender':1,'Age':1,'Booth No':1,'Part No':1,'Serial No':1,
         }
         col_2002s = col_2002
-        has_name    = bool(name)
-        has_house   = bool(house)
-        has_rel     = bool(relation)
-        has_voterid = bool(voterid)
 
-        def _house_q(h):
+        def _house_q2(h):
             return {'$or': [{'House / Flat No': h}, {'House No': h}]}
 
-        def _house_pfx_q(h):
-            rx = {'$regex': f'^{re.escape(h)}', '$options': 'i'}
-            return {'$or': [{'House / Flat No': rx}, {'House No': rx}]}
+        def _house_q2_prefix(h):
+            pfx_rx = {'$regex': f'^{re.escape(h)}', '$options': 'i'}
+            return {'$or': [{'House / Flat No': pfx_rx}, {'House No': pfx_rx}]}
 
-        def _name_pfx_q(pfx):
-            rx = {'$regex': f'^{re.escape(pfx)}', '$options': 'i'}
-            return {'$or': [{'Voter Name': rx}, {'Name': rx}]}
+        # ── Strict name similarity — uses whole-string ratio only (no partial) ──
+        # partial_ratio("ASHWITH POOJARY", "ASHA") = ~62 because "ASHA" ⊂ "ASHWITH"
+        # token_sort_ratio("ASHWITH POOJARY", "ASHA") = ~38 — correctly low
+        def _strict_name_score(query: str, cell: str) -> float:
+            """Whole-name similarity: no partial_ratio, prevents short names scoring high."""
+            if not query or not cell: return 0.0
+            if query == cell: return 100.0
+            pq, pc = _phonetic_norm(query), _phonetic_norm(cell)
+            if pq == pc: return 100.0
+            if _RAPIDFUZZ_AVAILABLE:
+                return max(
+                    _rfuzz.token_sort_ratio(query, cell),
+                    _rfuzz.token_sort_ratio(pq,    pc),
+                    _rfdist.JaroWinkler.normalized_similarity(query, cell) * 100,
+                    _rfdist.JaroWinkler.normalized_similarity(pq,    pc)   * 100,
+                )
+            # Pure-Python fallback: Levenshtein only (no partial)
+            s1 = _levenshtein_similarity(query, cell)
+            s2 = _levenshtein_similarity(pq,    pc)
+            return max(s1, s2)
 
-        def _name_contains_q(q):
-            rx = {'$regex': re.escape(q), '$options': 'i'}
-            return {'$or': [{'Voter Name': rx}, {'Name': rx}]}
+        has_name  = bool(name)
+        has_house = bool(house)
+        has_rel   = bool(relation)
 
-        def _rel_pfx_q(pfx):
-            rx = {'$regex': f'^{re.escape(pfx)}', '$options': 'i'}
-            return {'$or': [{'Relative Name': rx}, {'Relation Name': rx}]}
-
-        def _rel_contains_q(q):
-            rx = {'$regex': re.escape(q), '$options': 'i'}
-            return {'$or': [{'Relative Name': rx}, {'Relation Name': rx}]}
+        # Prefix to use for candidate sweep: first word, minimum 4 chars
+        # "ASHWITH POOJARY" → first_word="ASHWITH" → prefix="ASHW"
+        # This means we never sweep on just "AS" which floods with Asha/Ashok/Ashwin
+        def _first_word_pfx(s: str, min_len: int = 4) -> str:
+            fw = s.split()[0] if s.split() else s
+            return fw[:max(min_len, min(len(fw), 5))]   # 4–5 chars of first word
 
         try:
             raw_candidates = []
             seen_ids = set()
 
-            def _absorb(cursor, label=''):
+            def _absorb(cursor):
                 for d in cursor:
                     _id = str(d.get('_id', ''))
                     if _id not in seen_ids:
-                        seen_ids.add(_id)
-                        raw_candidates.append(d)
+                        seen_ids.add(_id); raw_candidates.append(d)
 
-            # A+B — house sweeps (most precise, always run when house given)
+            # House sweeps (exact + prefix — very precise, no scoring risk)
             if has_house:
-                _absorb(col_2002s.find(_house_q(house), _PROJ_02s).limit(60),        'house_exact')
-                _absorb(col_2002s.find(_house_pfx_q(house), _PROJ_02s).limit(60),    'house_pfx')
+                _absorb(col_2002s.find(_house_q2(house),        _PROJ_02s).limit(60))
+                _absorb(col_2002s.find(_house_q2_prefix(house), _PROJ_02s).limit(40))
 
-            # C+D — name prefix sweeps (2-char broad, 3-char tighter)
-            if has_name and len(name) >= 2:
-                _absorb(col_2002s.find(_name_pfx_q(name[:2]), _PROJ_02s).limit(120), 'name_pfx2')
+            # Name sweep — first-word prefix 4+ chars (not 2/3 — prevents "ASHA" flooding)
             if has_name and len(name) >= 3:
-                _absorb(col_2002s.find(_name_pfx_q(name[:3]), _PROJ_02s).limit(120), 'name_pfx3')
+                npfx = _first_word_pfx(name)
+                pfx_rx = {'$regex': f'^{re.escape(npfx)}', '$options': 'i'}
+                _absorb(col_2002s.find(
+                    {'$or': [{'Voter Name': pfx_rx}, {'Name': pfx_rx}]},
+                    _PROJ_02s
+                ).limit(100))
 
-            # E+F — relation prefix sweeps
-            if has_rel and len(relation) >= 2:
-                _absorb(col_2002s.find(_rel_pfx_q(relation[:2]), _PROJ_02s).limit(80), 'rel_pfx2')
+            # Relation sweep — first-word prefix 4+ chars
             if has_rel and len(relation) >= 3:
-                _absorb(col_2002s.find(_rel_pfx_q(relation[:3]), _PROJ_02s).limit(80), 'rel_pfx3')
+                rpfx = _first_word_pfx(relation)
+                rpfx_rx = {'$regex': f'^{re.escape(rpfx)}', '$options': 'i'}
+                _absorb(col_2002s.find(
+                    {'$or': [{'Relative Name': rpfx_rx}, {'Relation Name': rpfx_rx}]},
+                    _PROJ_02s
+                ).limit(60))
 
-            # G — name contains (catches names that don't start with query)
-            if has_name and len(name) >= 3:
-                _absorb(col_2002s.find(_name_contains_q(name), _PROJ_02s).limit(60), 'name_contains')
+            # ── Score all candidates ─────────────────────────────────────────────
+            # Use _strict_name_score (no partial_ratio) — prevents "ASHA" ≈ "ASHWITH POOJARY"
+            # Name gate: score >= 62 (was 30 — far too permissive)
+            NAME_GATE = 62   # minimum whole-name similarity to include a record
+            REL_GATE  = 50
 
-            # H — relation contains
-            if has_rel and len(relation) >= 3:
-                _absorb(col_2002s.find(_rel_contains_q(relation), _PROJ_02s).limit(40), 'rel_contains')
-
-            # ── Score every candidate on all 4 fields ─────────────────────────
             scored = []
             for doc in raw_candidates:
                 flat  = _flat_2002(doc)
-                n_sc  = _name_score(name,     flat['name'])     if has_name    else None
-                r_sc  = _name_score(relation, flat['relation']) if has_rel     else None
-                v_sc  = (100.0 if flat['voterid'].upper() == voterid.upper() else 0.0) if has_voterid else None
-                h_sc  = (100.0 if flat['house'].upper()   == house.upper()   else
+                n_sc  = _strict_name_score(name.upper(), flat['name'].upper())     if has_name  else None
+                r_sc  = _strict_name_score(relation.upper(), flat['relation'].upper()) if has_rel else None
+                h_ok  = (flat['house'].upper() == house.upper()) if has_house else True
+                h_sc  = (100.0 if h_ok else
                          (60.0 if flat['house'].upper().startswith(house.upper()) else 0.0)) if has_house else None
 
-                # ── Match bucket — which fields actually scored ≥ threshold ──
-                NAME_T  = 55   # minimum name score to count as "name matched"
-                REL_T   = 50   # minimum relation score
-                HOUSE_T = 60   # house threshold (exact or prefix)
+                # Hard gates — drop irrelevant records early
+                if has_name  and n_sc is not None and n_sc < NAME_GATE: continue
+                if has_rel   and r_sc is not None and r_sc < REL_GATE and not has_name: continue
 
-                nm_hit  = (n_sc  is not None and n_sc  >= NAME_T)
-                rel_hit = (r_sc  is not None and r_sc  >= REL_T)
-                h_hit   = (h_sc  is not None and h_sc  >= HOUSE_T)
-                v_hit   = (v_sc  is not None and v_sc  == 100.0)
-
-                # Build bucket label for grouping in frontend
-                hits = []
-                if nm_hit:  hits.append('name')
-                if h_hit:   hits.append('house')
-                if rel_hit: hits.append('relation')
-                if v_hit:   hits.append('voterid')
-                bucket = '+'.join(hits) if hits else 'no_match'
-
-                # Skip completely irrelevant records
-                if not hits:
-                    continue
-                # If only house was provided and nothing else, show all house records
-                if has_house and not has_name and not has_rel and not h_hit:
-                    continue
-
-                # ── Composite score — dynamic weights based on fields provided ──
-                w_n  = 3.5 if has_name    else 0.0
-                w_r  = 2.0 if has_rel     else 0.0
-                w_h  = 2.0 if has_house   else 0.0
-                w_v  = 4.0 if has_voterid else 0.0
-                total_w = w_n + w_r + w_h + w_v or 1.0
+                # Composite score — dynamic weights
+                w_n = 3.5 if has_name  else 0.0
+                w_r = 2.0 if has_rel   else 0.0
+                w_h = 2.5 if has_house else 0.0
+                tw  = w_n + w_r + w_h or 1.0
 
                 comp = (
                     (n_sc or 0) * w_n +
                     (r_sc or 0) * w_r +
-                    (h_sc or 0) * w_h +
-                    (v_sc or 0) * w_v
-                ) / total_w
+                    (h_sc or 0) * w_h
+                ) / tw
+
+                # Which fields matched?
+                nm_hit  = n_sc is not None and n_sc  >= NAME_GATE
+                rel_hit = r_sc is not None and r_sc  >= REL_GATE
+                h_hit   = h_sc is not None and h_sc  >= 60
+
+                hits   = [f for f, ok in [('name', nm_hit), ('house', h_hit), ('relation', rel_hit)] if ok]
+                bucket = '+'.join(hits) if hits else 'no_match'
+                if bucket == 'no_match': continue
 
                 scored.append({
-                    'comp':   comp,
-                    'flat':   flat,
+                    'comp': comp, 'flat': flat, 'doc': doc,
                     'bucket': bucket,
-                    'doc':    doc,
                     'field_scores': {
                         'name':     round(n_sc)  if n_sc  is not None else 0,
-                        'house':    round(h_sc)  if h_sc  is not None else 0,
                         'relation': round(r_sc)  if r_sc  is not None else 0,
-                        'voterid':  round(v_sc)  if v_sc  is not None else 0,
+                        'house':    round(h_sc)  if h_sc  is not None else 0,
+                        'voterid':  0,
                     },
                     'match_flags': {
                         'name':     nm_hit,
-                        'house':    h_hit,
                         'relation': rel_hit,
-                        'voterid':  v_hit,
+                        'house':    h_hit,
+                        'voterid':  False,
                     },
                 })
 
-            # ── Dedupe by (name, house) signature, sort by score desc ─────────
             scored.sort(key=lambda x: -x['comp'])
             seen_sigs = set()
             for item in scored:
                 f   = item['flat']
                 doc = item['doc']
                 sig = (f['name'], f['house'])
-                if sig in seen_sigs:
-                    continue
+                if sig in seen_sigs: continue
                 seen_sigs.add(sig)
                 suggestions_2002.append({
                     'name':        f['name'],
@@ -3020,18 +3003,18 @@ def api_check_sir(request):
                     'booth':       str(doc.get('Booth No', doc.get('Part No', ''))).strip(),
                     'serial':      str(doc.get('Serial No', '')).strip(),
                     'score':       round(item['comp']),
-                    'bucket':      item['bucket'],          # ← NEW: which fields matched
+                    'bucket':      item['bucket'],
                     'source':      'mongodb',
-                    'field_scores':  item['field_scores'],  # per-field 0-100
-                    'match_flags':   item['match_flags'],   # per-field bool
+                    'field_scores':  item['field_scores'],
+                    'match_flags':   item['match_flags'],
                 })
-                if len(suggestions_2002) >= 20:             # return up to 20 candidates
+                if len(suggestions_2002) >= 15:
                     break
 
         except Exception:
             pass   # suggestions are best-effort
 
-        # ── Excel fallback — only if MongoDB returned fewer than 5 results ────
+        # ── Excel fallback — only if MongoDB gave fewer than 5 suggestions ──────
         if len(suggestions_2002) < 5:
             try:
                 df_x, cx, hidx = _get_xlsx()
@@ -3044,48 +3027,43 @@ def api_check_sir(request):
                     if has_house and hidx:
                         for idx in hidx.get(house.strip().upper(), []):
                             xl_indices.add(idx)
-                    if has_name and CN:
+                        # Also grab prefix variants (catches /1 /2)
+                        for key, idxs in hidx.items():
+                            if key.startswith(house.strip().upper()) and key != house.strip().upper():
+                                for idx in idxs: xl_indices.add(idx)
+                    if has_name and CN and len(name) >= 3:
+                        npfx = _first_word_pfx(name)
                         col_up = df_x[CN].str.upper()
-                        # 2-char prefix (broad)
-                        if len(name) >= 2:
-                            for idx in df_x.index[col_up.str.startswith(name[:2].upper(), na=False)].tolist()[:300]:
-                                xl_indices.add(idx)
-                        # contains
-                        if len(name) >= 3:
-                            for idx in df_x.index[col_up.str.contains(re.escape(name.upper()), na=False)].tolist()[:150]:
-                                xl_indices.add(idx)
-                    if has_rel and CR:
+                        for idx in df_x.index[col_up.str.startswith(npfx, na=False)].tolist()[:200]:
+                            xl_indices.add(idx)
+                    if has_rel and CR and len(relation) >= 3:
+                        rpfx = _first_word_pfx(relation)
                         rel_up = df_x[CR].str.upper()
-                        if len(relation) >= 2:
-                            for idx in df_x.index[rel_up.str.startswith(relation[:2].upper(), na=False)].tolist()[:150]:
-                                xl_indices.add(idx)
-                        if len(relation) >= 3:
-                            for idx in df_x.index[rel_up.str.contains(re.escape(relation.upper()), na=False)].tolist()[:100]:
-                                xl_indices.add(idx)
+                        for idx in df_x.index[rel_up.str.startswith(rpfx, na=False)].tolist()[:100]:
+                            xl_indices.add(idx)
 
                     subset = df_x.iloc[sorted(xl_indices)] if xl_indices else df_x
                     existing_sigs = {(s['name'], s['house']) for s in suggestions_2002}
-                    rows_s = []
 
+                    rows_s = []
                     for _, row in subset.iterrows():
-                        n_sc = _name_score(name.upper(),     str(row.get(CN,'')).strip().upper()) if (has_name and CN) else None
-                        r_sc = _name_score(relation.upper(), str(row.get(CR,'')).strip().upper()) if (has_rel  and CR) else None
+                        n_sc = _strict_name_score(name.upper(),     str(row.get(CN,'')).strip().upper()) if (has_name and CN) else None
+                        r_sc = _strict_name_score(relation.upper(), str(row.get(CR,'')).strip().upper()) if (has_rel  and CR) else None
                         rh   = str(row.get(CH,'')).strip().upper()
                         h_sc = (100.0 if rh == house.upper() else (60.0 if rh.startswith(house.upper()) else 0.0)) if has_house else None
 
-                        nm_hit  = n_sc  is not None and n_sc  >= 55
-                        rel_hit = r_sc  is not None and r_sc  >= 50
-                        h_hit   = h_sc  is not None and h_sc  >= 60
+                        if has_name  and n_sc is not None and n_sc < NAME_GATE: continue
+                        if has_rel   and r_sc is not None and r_sc < REL_GATE and not has_name: continue
 
-                        hits = []
-                        if nm_hit:  hits.append('name')
-                        if h_hit:   hits.append('house')
-                        if rel_hit: hits.append('relation')
+                        nm_hit  = n_sc is not None and n_sc  >= NAME_GATE
+                        rel_hit = r_sc is not None and r_sc  >= REL_GATE
+                        h_hit   = h_sc is not None and h_sc  >= 60
+                        hits    = [f for f, ok in [('name', nm_hit), ('house', h_hit), ('relation', rel_hit)] if ok]
                         if not hits: continue
 
-                        w_n = 3.5 if has_name else 0.0
-                        w_r = 2.0 if has_rel  else 0.0
-                        w_h = 2.0 if has_house else 0.0
+                        w_n = 3.5 if has_name  else 0.0
+                        w_r = 2.0 if has_rel   else 0.0
+                        w_h = 2.5 if has_house else 0.0
                         tw  = w_n + w_r + w_h or 1.0
                         comp = ((n_sc or 0)*w_n + (r_sc or 0)*w_r + (h_sc or 0)*w_h) / tw
 
@@ -3106,7 +3084,7 @@ def api_check_sir(request):
                         })
 
                     rows_s.sort(key=lambda x: -x['c'])
-                    for item in rows_s[:10]:
+                    for item in rows_s[:8]:
                         r = item['_r']
                         nm = str(r.get(CN,'')); hs = str(r.get(CH,''))
                         if (nm, hs) in existing_sigs: continue
@@ -3128,7 +3106,7 @@ def api_check_sir(request):
                 pass
 
         suggestions_2002.sort(key=lambda x: -x['score'])
-        suggestions_2002 = suggestions_2002[:20]
+        suggestions_2002 = suggestions_2002[:15]
 
     # ── Similar 2025 records — field-aware, up to 12 ─────────────────────────
     # house → all at same house
@@ -3265,9 +3243,9 @@ def api_sir_records(request):
 @require_http_methods(['POST'])
 def api_sir_suggest(request):
     """
-    Broad fuzzy voter search across 2002 Excel + MongoDB.
-    Searches all 4 fields independently (name, house, relation, voterid),
-    then scores and groups results into match buckets.
+    Fuzzy voter search — strict whole-name scoring, no partial_ratio.
+    Uses first-word prefix (min 4 chars) for candidate selection to avoid
+    flooding with short-name matches like 'ASHA' when query is 'ASHWITH POOJARY'.
     """
     try:
         body = json.loads(request.body)
@@ -3310,68 +3288,78 @@ def api_sir_suggest(request):
                 'match_flags':   {'name':True,'house':True,'relation':True,'voterid':True},
             }]})
 
-    # ── Broad candidate collection ────────────────────────────────────────────
+    # ── Strict whole-name scorer (no partial_ratio) ───────────────────────────
+    def _strict_name_score(query: str, cell: str) -> float:
+        if not query or not cell: return 0.0
+        if query == cell: return 100.0
+        pq, pc = _phonetic_norm(query), _phonetic_norm(cell)
+        if pq == pc: return 100.0
+        if _RAPIDFUZZ_AVAILABLE:
+            return max(
+                _rfuzz.token_sort_ratio(query, cell),
+                _rfuzz.token_sort_ratio(pq, pc),
+                _rfdist.JaroWinkler.normalized_similarity(query, cell) * 100,
+                _rfdist.JaroWinkler.normalized_similarity(pq,    pc)   * 100,
+            )
+        return max(
+            _levenshtein_similarity(query, cell),
+            _levenshtein_similarity(pq, pc),
+        )
+
+    # First-word prefix min 4 chars — prevents "AS" flooding with Asha/Ashok/Asif
+    def _first_word_pfx(s: str, min_len: int = 4) -> str:
+        fw = s.split()[0] if s.split() else s
+        return fw[:max(min_len, min(len(fw), 5))]
+
+    # ── Candidate collection ──────────────────────────────────────────────────
     xl_indices = set()
 
-    # House: exact via pre-built index (O(1))
     if has_house and hidx:
         for idx in hidx.get(q_house, []):
             xl_indices.add(idx)
-        # Prefix match for house (catches /1 /2 suffixes)
         for key, idxs in hidx.items():
             if key.startswith(q_house) and key != q_house:
-                for idx in idxs:
-                    xl_indices.add(idx)
+                for idx in idxs: xl_indices.add(idx)
 
-    # Name: 2-char prefix (broad) + 3-char prefix + contains
-    if has_name and CN:
+    if has_name and CN and len(q_name) >= 3:
+        npfx   = _first_word_pfx(q_name)
         col_up = df[CN].str.upper()
-        if len(q_name) >= 2:
-            for idx in df.index[col_up.str.startswith(q_name[:2], na=False)].tolist()[:300]:
-                xl_indices.add(idx)
-        if len(q_name) >= 3:
-            for idx in df.index[col_up.str.startswith(q_name[:3], na=False)].tolist()[:200]:
-                xl_indices.add(idx)
-            for idx in df.index[col_up.str.contains(re.escape(q_name), na=False)].tolist()[:150]:
-                xl_indices.add(idx)
+        for idx in df.index[col_up.str.startswith(npfx, na=False)].tolist()[:200]:
+            xl_indices.add(idx)
 
-    # Relation: 2-char prefix + contains
-    if has_rel and CR:
+    if has_rel and CR and len(q_rel) >= 3:
+        rpfx   = _first_word_pfx(q_rel)
         rel_up = df[CR].str.upper()
-        if len(q_rel) >= 2:
-            for idx in df.index[rel_up.str.startswith(q_rel[:2], na=False)].tolist()[:200]:
-                xl_indices.add(idx)
-        if len(q_rel) >= 3:
-            for idx in df.index[rel_up.str.contains(re.escape(q_rel), na=False)].tolist()[:100]:
-                xl_indices.add(idx)
+        for idx in df.index[rel_up.str.startswith(rpfx, na=False)].tolist()[:100]:
+            xl_indices.add(idx)
 
     subset = df.iloc[sorted(xl_indices)] if xl_indices else df
 
-    # ── Score every candidate on all 4 fields ────────────────────────────────
+    # ── Score every candidate ─────────────────────────────────────────────────
+    NAME_GATE, REL_GATE = 62, 50
+
     rows_scored = []
     for _, row in subset.iterrows():
-        n_sc = _name_score(q_name, str(row.get(CN,'')).strip().upper()) if (has_name and CN) else None
-        r_sc = _name_score(q_rel,  str(row.get(CR,'')).strip().upper()) if (has_rel  and CR) else None
+        n_sc = _strict_name_score(q_name, str(row.get(CN,'')).strip().upper()) if (has_name and CN) else None
+        r_sc = _strict_name_score(q_rel,  str(row.get(CR,'')).strip().upper()) if (has_rel  and CR) else None
         rh   = str(row.get(CH,'')).strip().upper() if CH else ''
         h_sc = (100.0 if rh == q_house else (60.0 if rh.startswith(q_house) else 0.0)) if has_house else None
-        v_sc = (100.0 if str(row.get(CE,'')).strip().upper() == q_voterid else 0.0) if (has_voterid and CE) else None
 
-        NAME_T, REL_T, HOUSE_T = 55, 50, 60
-        nm_hit  = n_sc is not None and n_sc  >= NAME_T
-        rel_hit = r_sc is not None and r_sc  >= REL_T
-        h_hit   = h_sc is not None and h_sc  >= HOUSE_T
-        v_hit   = v_sc is not None and v_sc  == 100.0
+        if has_name and n_sc is not None and n_sc < NAME_GATE: continue
+        if has_rel  and r_sc is not None and r_sc < REL_GATE and not has_name: continue
 
-        hits = [f for f, ok in [('name',nm_hit),('house',h_hit),('relation',rel_hit),('voterid',v_hit)] if ok]
-        if not hits:
-            continue
+        nm_hit  = n_sc is not None and n_sc  >= NAME_GATE
+        rel_hit = r_sc is not None and r_sc  >= REL_GATE
+        h_hit   = h_sc is not None and h_sc  >= 60
 
-        w_n = 3.5 if has_name    else 0.0
-        w_r = 2.0 if has_rel     else 0.0
-        w_h = 2.0 if has_house   else 0.0
-        w_v = 4.0 if has_voterid else 0.0
-        tw  = w_n + w_r + w_h + w_v or 1.0
-        comp = ((n_sc or 0)*w_n + (r_sc or 0)*w_r + (h_sc or 0)*w_h + (v_sc or 0)*w_v) / tw
+        hits = [f for f, ok in [('name', nm_hit), ('house', h_hit), ('relation', rel_hit)] if ok]
+        if not hits: continue
+
+        w_n = 3.5 if has_name  else 0.0
+        w_r = 2.0 if has_rel   else 0.0
+        w_h = 2.5 if has_house else 0.0
+        tw  = w_n + w_r + w_h or 1.0
+        comp = ((n_sc or 0)*w_n + (r_sc or 0)*w_r + (h_sc or 0)*w_h) / tw
 
         rows_scored.append({
             '_r':    row, 'c': comp,
@@ -3380,21 +3368,20 @@ def api_sir_suggest(request):
                 'name':     round(n_sc) if n_sc is not None else 0,
                 'house':    round(h_sc) if h_sc is not None else 0,
                 'relation': round(r_sc) if r_sc is not None else 0,
-                'voterid':  round(v_sc) if v_sc is not None else 0,
+                'voterid':  0,
             },
-            'mf': {'name': nm_hit, 'house': h_hit, 'relation': rel_hit, 'voterid': v_hit},
+            'mf': {'name': nm_hit, 'house': h_hit, 'relation': rel_hit, 'voterid': False},
         })
 
     rows_scored.sort(key=lambda x: -x['c'])
     suggestions = []
     seen_sigs   = set()
-    for item in rows_scored[:20]:
+    for item in rows_scored:
         r  = item['_r']
         nm = str(r.get(CN,'')) if CN else ''
         hs = str(r.get(CH,'')) if CH else ''
         sig = (nm, hs)
-        if sig in seen_sigs:
-            continue
+        if sig in seen_sigs: continue
         seen_sigs.add(sig)
         suggestions.append({
             'name':         nm,
@@ -3409,6 +3396,7 @@ def api_sir_suggest(request):
             'field_scores': item['fs'],
             'match_flags':  item['mf'],
         })
+        if len(suggestions) >= 15: break
 
     return JsonResponse({'success': True, 'suggestions': suggestions})
 
