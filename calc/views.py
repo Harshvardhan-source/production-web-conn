@@ -2080,10 +2080,11 @@ def api_house_search(request):
         if not hn:
             continue
         vid = str(d.get('Epic NO', '')).strip()
+        _relation = str(d.get('Relation Name', '')).strip()
         member = {
             'name':               str(d.get('Name', '')).strip(),
-            'relation':           str(d.get('Relation Name', '')).strip(),
-            'relationName':       str(d.get('Relation Name', '')).strip(),
+            'relation':           _relation,
+            'relationName':       _relation,
             'voterid':            vid,
             'gender':             str(d.get('Gender', '')),
             'age':                d.get('Age', ''),
@@ -2092,13 +2093,13 @@ def api_house_search(request):
             'house_no':           hn,
             'address':            str(d.get('Address', '')),
             'serial_no':          d.get('Serial No') or d.get('Sl No', ''),
-            # ── 2025 roll extra fields ──────────────────────────────────────
+            # ── 2025 voter roll enrichment fields ──────────────────────────
             'partNo':             str(d.get('Part No', '')).strip(),
-            'sectionName':        str(d.get('Section Name', '')).strip(),
-            'pollingStation':     str(d.get('Polling Station Name', '') or d.get('polling Station Name', '')).strip(),
-            'pollingStationAddr': str(d.get('Polling Station Address', '') or d.get('Polling Statuin Address', '')).strip(),
-            'sourcePdfName':      str(d.get('Source PDF Name', '') or d.get('Source_PDF_Name', '')).strip(),
-            'pageNoOfCard':       str(d.get('Page No of Card', '') or d.get('Page_No_of_Card', '') or d.get('pageNoOfCard', '')).strip(),
+            'sectionName':        str(d.get('Section name', '')).strip(),
+            'pollingStation':     str(d.get('polling Station Name', '')).strip(),
+            'pollingStationAddr': str(d.get('Polling Statuin Address', '')).strip(),
+            'sourcePdfName':      str(d.get('Source PDF Name', '')).strip(),
+            'pageNoOfCard':       str(d.get('Page No of card', '')).strip(),
             'predictedReligion':  str(d.get('Predicted_Religion_Label', '')).strip(),
             'religion':           str(d.get('Predicted_Religion_Label', '')).strip(),
             'surveyed':           False,
