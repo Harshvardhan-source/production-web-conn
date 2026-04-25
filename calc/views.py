@@ -1297,26 +1297,33 @@ def api_save_survey(request):
 
     if 'multipart' in ct:
         # Aadhaar photo path: form data is JSON-stringified under key 'data'
+        raw_data = request.POST.get('data', '')
+        print(f"[api_save_survey] MULTIPART path — data_len={len(raw_data)} FILES={list(request.FILES.keys())}")
         try:
-            body = json.loads(request.POST.get('data', '{}'))
-        except Exception:
+            body = json.loads(raw_data) if raw_data else {}
+        except Exception as _me:
+            print(f"[api_save_survey] multipart JSON parse error: {_me}")
             body = {k: v for k, v in request.POST.items()}
         aadhaar_photo_file = request.FILES.get('aadhaar_photo')
 
     else:
         # Always try to parse raw body as JSON first — regardless of Content-Type header.
-        # This handles cases where the client sends JSON but omits or mis-sets the header.
+        raw_body = request.body
+        print(f"[api_save_survey] JSON path — ct={ct!r} body_len={len(raw_body)} raw[:100]={raw_body[:100]!r}")
         try:
-            body = json.loads(request.body)
+            body = json.loads(raw_body)
         except Exception as _e:
-            # Last resort: url-encoded POST fallback
+            print(f"[api_save_survey] JSON parse failed: {_e}")
             body = {k: v for k, v in request.POST.items()}
             if not body:
-                print(f"[api_save_survey] WARN: body is empty after all parse attempts. "
-                      f"content_type={ct!r}, raw body[:300]={request.body[:300]!r}")
+                print(f"[api_save_survey] WARN: body EMPTY after all parse attempts.")
 
-    # ── DEBUG: log what arrived so null-field issues are traceable ───────────
-    print(f"[api_save_survey] content_type={ct!r} | body keys={list(body.keys())} | firstName={body.get('firstName')!r} | wardNumber={body.get('wardNumber')!r}")
+    # ── DEBUG: log all key fields ─────────────────────────────────────────────
+    print(f"[api_save_survey] PARSED keys={list(body.keys())} firstName={body.get('firstName')!r} "
+          f"lastName={body.get('lastName')!r} wardNumber={body.get('wardNumber')!r} "
+          f"boothNo={body.get('boothNo')!r} voterid={body.get('voterid')!r} "
+          f"dob={body.get('dob')!r} gender={body.get('gender')!r} "
+          f"schemes_count={len(body.get('schemes', []))}")
 
     # Ward / booth write check (after body is parsed so we have ward/booth)
     _ward_body  = body.get('wardNumber', '')
@@ -1329,7 +1336,7 @@ def api_save_survey(request):
             if not _can_write_booth(_user, _booth_body):
                 return JsonResponse({'success': False, 'message': f'You can only submit surveys for your assigned booth ({_user["booth"]}).'}, status=403)
 
-    dob_str = body.get('dob')
+    dob_str = body.get('dob') or None   # treat empty string as None
     age = None
     if dob_str:
         try:
@@ -1337,7 +1344,13 @@ def api_save_survey(request):
             today = datetime.today()
             age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
         except ValueError:
-            return JsonResponse({'success': False, 'message': 'Invalid DOB format.'}, status=400)
+            dob_str = None   # bad format — store None, do not abort
+    # If DOB was blank, fall back to the age the user typed directly
+    if age is None:
+        try:
+            age = int(body.get('age')) if body.get('age') else None
+        except (TypeError, ValueError):
+            age = None
 
     is_outstation = body.get('outstationResident') == 'Yes'
 
@@ -1349,70 +1362,89 @@ def api_save_survey(request):
     survey_count   = survey_db_for_serial['SurveyRecords'].count_documents({})
     final_serial   = survey_count + 1
 
+    # Helper: return None for empty strings so DB does not store ''
+    def _val(k, default=None):
+        v = body.get(k, default)
+        if v == '' or v is None:
+            return default
+        return v
+
     data = {
         # ── Personal ──────────────────────────────────────────────
-        'firstName':        body.get('firstName'),
-        'middleName':       body.get('middleName'),
-        'lastName':         body.get('lastName'),
-        'addharNumber':     body.get('addharNumber'),
-        'contactNumber':    body.get('contactNumber'),
+        'firstName':        _val('firstName'),
+        'middleName':       _val('middleName'),
+        'lastName':         _val('lastName'),
+        'addharNumber':     _val('addharNumber'),
+        'contactNumber':    _val('contactNumber'),
         'serialNumber':     final_serial,
         'serialSource':     'manual',
         'dob':              dob_str,
         'age':              age,
-        'gender':           body.get('gender'),
-        'maritalStatus':    body.get('maritalStatus'),
-        'voterid':          voterid or body.get('voterid'),
+        'gender':           _val('gender'),
+        'maritalStatus':    _val('maritalStatus'),
+        'voterid':          voterid or _val('voterid'),
+        'isHeadOfHouse':    _val('isHeadOfHouse', 'No'),
 
         # ── Aadhaar photo (GCS URL if uploaded, else None) ─────────
         'aadhaarPhotoUrl':  None,
 
         # ── Government schemes used ────────────────────────────────
-        'schemesUsed':      body.get('schemes', []),
+        'schemesUsed':      body.get('schemes') or [],
 
         # ── Outstation ────────────────────────────────────────────
-        'outstationResident': body.get('outstationResident', 'No'),
-        'outstationCity':     body.get('outstationCity')    if is_outstation else None,
-        'outstationState':    body.get('outstationState')   if is_outstation else None,
-        'outstationAddress':  body.get('outstationAddress') if is_outstation else None,
+        'outstationResident': _val('outstationResident', 'No'),
+        'outstationCity':     _val('outstationCity')    if is_outstation else None,
+        'outstationState':    _val('outstationState')   if is_outstation else None,
+        'outstationAddress':  _val('outstationAddress') if is_outstation else None,
 
         # ── Current location (only saved when outstation = Yes) ───
-        'currentHouseNumber': body.get('currentHouseNumber') if is_outstation else None,
-        'currentAreaType':    body.get('currentAreaType')    if is_outstation else None,
-        'currentHomeType':    body.get('currentHomeType')    if is_outstation else None,
-        'currentAddress':     body.get('currentAddress')     if is_outstation else None,
+        'currentHouseNumber': _val('currentHouseNumber') if is_outstation else None,
+        'currentAreaType':    _val('currentAreaType')    if is_outstation else None,
+        'currentHomeType':    _val('currentHomeType')    if is_outstation else None,
+        'currentAddress':     _val('currentAddress')     if is_outstation else None,
 
         # ── Registered address ────────────────────────────────────
-        'wardNumber':       body.get('wardNumber'),
-        'boothNo':          body.get('boothNo'),
-        'houseNumber':      body.get('houseNumber'),
-        'address':          body.get('address'),
-        'areaType':         body.get('areaType'),
-        'homeType':         body.get('homeType'),
+        'wardNumber':       _val('wardNumber'),
+        'boothNo':          _val('boothNo'),
+        'houseNumber':      _val('houseNumber'),
+        'address':          _val('address'),
+        'areaType':         _val('areaType'),
+        'homeType':         _val('homeType'),
 
         # ── Financial ─────────────────────────────────────────────
-        'annualIncome':     body.get('annualIncome'),
-        'familyIncome':     body.get('familyIncome'),
-        'economicStatus':   body.get('economicStatus'),
+        'annualIncome':     _val('annualIncome'),
+        'familyIncome':     _val('familyIncome'),
+        'economicStatus':   _val('economicStatus'),
 
         # ── Demographics ──────────────────────────────────────────
-        'religion':         body.get('religion'),
-        'community':        body.get('community'),
-        'subcategory':      body.get('subcategory'),
-        'education':        body.get('education'),
-        'educationtype':    body.get('educationtype'),
-        'minority':         body.get('minority'),
-        'student':          body.get('student'),
+        'religion':         _val('religion'),
+        'community':        _val('community'),
+        'subcategory':      _val('subcategory'),
+        'education':        _val('education'),
+        'educationtype':    _val('educationtype'),
+        'minority':         _val('minority', 'No'),
+        'student':          _val('student', 'No'),
 
         # ── Employment ────────────────────────────────────────────
-        'employmentStatus': body.get('employmentStatus'),
-        'employmentType':   body.get('employmentType') if body.get('employmentStatus') == 'Employed' else None,
+        'employmentStatus': _val('employmentStatus'),
+        'employmentType':   _val('employmentType') if body.get('employmentStatus') == 'Employed' else None,
 
         # ── Health ────────────────────────────────────────────────
-        'healthStatus':     body.get('healthStatus'),
-        'diseaseType':      body.get('diseaseType')  if body.get('healthStatus') == 'Diseased' else None,
-        'diseaseName':      body.get('diseaseName')  if body.get('healthStatus') == 'Diseased' else None,
-        'differentlyAbled': body.get('differentlyAbled'),
+        'healthStatus':     _val('healthStatus', 'Healthy'),
+        'diseaseType':      _val('diseaseType')  if body.get('healthStatus') == 'Diseased' else None,
+        'diseaseName':      _val('diseaseName')  if body.get('healthStatus') == 'Diseased' else None,
+        'differentlyAbled': _val('differentlyAbled', 'No'),
+
+        # ── 2025 voter roll prefill fields (stored as-is from frontend) ───
+        'relation':             _val('relation'),
+        'relationName':         _val('relationName'),
+        'partNo':               _val('partNo'),
+        'sectionName':          _val('sectionName'),
+        'pollingStation':       _val('pollingStation'),
+        'pollingStationAddr':   _val('pollingStationAddr'),
+        'sourcePdfName':        _val('sourcePdfName'),
+        'pageNoOfCard':         _val('pageNoOfCard'),
+        'predictedReligion':    _val('predictedReligion'),
 
         'Time_stamp':       datetime.utcnow(),
     }
