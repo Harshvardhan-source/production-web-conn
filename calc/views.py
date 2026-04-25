@@ -1309,21 +1309,28 @@ def api_save_survey(request):
     else:
         # JSON / url-encoded path
         raw_body = request.body
-        print(f"[api_save_survey] JSON path: ct={ct!r} len={len(raw_body)} preview={raw_body[:120]!r}")
+        print(f"[api_save_survey] JSON path: ct={ct!r} len={len(raw_body)}")
+        print(f"[api_save_survey] RAW BODY (first 500): {raw_body[:500]!r}")
         try:
             body = json.loads(raw_body)
         except Exception as _e:
             print(f"[api_save_survey] JSON parse failed: {_e}")
             body = {k: v for k, v in request.POST.items()}
             if not body:
-                print("[api_save_survey] WARN: body empty after all parse attempts")
+                print("[api_save_survey] WARN: body EMPTY after all parse attempts")
 
-    # ── Verbose debug — every key field logged so nulls are immediately visible ──
-    print(f"[api_save_survey] PARSED: keys={list(body.keys())} | "
-          f"firstName={body.get('firstName')!r} lastName={body.get('lastName')!r} | "
-          f"ward={body.get('wardNumber')!r} booth={body.get('boothNo')!r} | "
-          f"voterid={body.get('voterid')!r} dob={body.get('dob')!r} | "
-          f"gender={body.get('gender')!r} schemes={len(body.get('schemes') or [])}")
+    # ── Verbose debug — print ALL received values ─────────────────────────────
+    print(f"[api_save_survey] PARSED {len(body)} keys: {list(body.keys())}")
+    print(f"[api_save_survey] firstName={body.get('firstName')!r} "
+          f"lastName={body.get('lastName')!r} "
+          f"dob={body.get('dob')!r} "
+          f"gender={body.get('gender')!r} "
+          f"voterid={body.get('voterid')!r} "
+          f"ward={body.get('wardNumber')!r} "
+          f"booth={body.get('boothNo')!r} "
+          f"house={body.get('houseNumber')!r} "
+          f"religion={body.get('religion')!r} "
+          f"schemes={len(body.get('schemes') or [])}")
 
     # Ward / booth write check (after body is parsed so we have ward/booth)
     _ward_body  = body.get('wardNumber', '')
@@ -1336,10 +1343,15 @@ def api_save_survey(request):
             if not _can_write_booth(_user, _booth_body):
                 return JsonResponse({'success': False, 'message': f'You can only submit surveys for your assigned booth ({_user["booth"]}).'}, status=403)
 
-    # ── Helper: treat empty string same as missing ────────────────────────────
+    # ── Helper: return value as-is; use default only when key is truly absent ──
+    # Empty strings are stored as None so MongoDB shows null rather than ""
     def _val(k, default=None):
-        v = body.get(k, default)
-        return default if (v == '' or v is None) else v
+        v = body.get(k)
+        if v is None:
+            return default
+        if isinstance(v, str) and v.strip() == '':
+            return default
+        return v
 
     # ── DOB → computed age; fall back to manually typed age ──────────────────
     dob_str = _val('dob')
