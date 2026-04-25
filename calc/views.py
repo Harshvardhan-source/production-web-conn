@@ -1378,6 +1378,9 @@ def api_save_survey(request):
         # ── Aadhaar photo (GCS URL if uploaded, else None) ─────────
         'aadhaarPhotoUrl':  None,
 
+        # ── Government schemes used ────────────────────────────────
+        'schemesUsed':      body.get('schemes', []),
+
         # ── Outstation ────────────────────────────────────────────
         'outstationResident': body.get('outstationResident', 'No'),
         'outstationCity':     body.get('outstationCity')    if is_outstation else None,
