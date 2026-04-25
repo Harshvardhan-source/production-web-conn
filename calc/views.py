@@ -2232,15 +2232,66 @@ def _flat(doc):
 # ALL THREE layers run independently; the MAX of all scores is used.
 # This means either rapidfuzz OR the phonetic norm can salvage a match on its own.
 
-_FUZZY_THRESHOLD     = 78
+_FUZZY_THRESHOLD     = 72   # lowered from 78: catches 1-char transliteration variants
 _FUZZY_THRESHOLD_REL = 72
 
 _PHONETIC_RULES = [
+    # ── Aspirate consonants (most common transliteration mismatch) ────────────
+    # VEDHAVYAS↔VEDAVYAS, RADHIKA↔RADIKA, MADHAV↔MADAV
+    # Order matters: longer patterns first to avoid partial replacement
     ('VISHW','VISHV'),('ASHW','ASHV'),('SHWAR','SHVAR'),
-    ('THA','TA'),('DHA','DA'),('BHA','BA'),('SHA','SA'),
-    ('EE','I'),('AA','A'),('OO','U'),('II','I'),
-    ('KSH','X'),('GNE','NE'),('GNA','NA'),
+    ('DHDH','DD'),('DHW','DW'),
+    ('THA','TA'),('DHA','DA'),('BHA','BA'),('SHA','SA'),('GHA','GA'),
+    ('JHA','JA'),('PHA','FA'),('KHA','KA'),
+    # ── Vowel equivalence ─────────────────────────────────────────────────────
+    ('EE','I'),('AA','A'),('OO','U'),('II','I'),('AY','A'),('AI','A'),
+    # ── Consonant cluster equivalence ────────────────────────────────────────
+    ('KSH','X'),('GNE','NE'),('GNA','NA'),('SHR','SR'),
+    # ── Common Kannada/Tulu/Konkani transliteration variants ─────────────────
+    ('LY','L'),('VY','V'),('WA','VA'),('WI','VI'),('WE','VE'),
 ]
+
+# ── Multi-variant prefix generator ───────────────────────────────────────────
+# Generates all search-worthy prefix variants from a name token.
+# VEDHAVYAS → ['VEDHAVYAS', 'VEDAVYAS', 'VEDHAV', 'VEDAV', 'VED']
+# This ensures the MongoDB prefix scan hits even when user adds/removes H, A, etc.
+
+@_lru_cache(maxsize=2048)
+def _name_variants(token: str) -> tuple:
+    """Return a deduplicated tuple of search variants for a single name token."""
+    t = token.upper().strip()
+    if not t: return ()
+    variants = [t]
+
+    # Apply each aspirate drop individually to catch partial corrections
+    _ASPIRATE_DROPS = [
+        ('DH','D'),('TH','T'),('BH','B'),('GH','G'),('KH','K'),
+        ('SH','S'),('JH','J'),('PH','P'),('VH','V'),
+    ]
+    for old, new in _ASPIRATE_DROPS:
+        v = t.replace(old, new)
+        if v != t and v not in variants:
+            variants.append(v)
+        # Also try the reverse (user dropped the aspirate, DB has it)
+        v2 = t.replace(new, old, 1)  # only first occurrence
+        if v2 != t and len(v2) <= len(t) + 2 and v2 not in variants:
+            variants.append(v2)
+
+    # Phonetic norm variant
+    pn = _phonetic_norm(t)
+    if pn not in variants:
+        variants.append(pn)
+
+    # 3-char prefix of each variant (for broad fallback)
+    base_prefixes = list({v[:3] for v in variants if len(v) >= 3})
+
+    seen = set()
+    result = []
+    for v in variants + base_prefixes:
+        if v and v not in seen:
+            seen.add(v)
+            result.append(v)
+    return tuple(result)
 
 # ── Cache phonetic_norm: same name is normalised thousands of times per bulk run
 from functools import lru_cache as _lru_cache
@@ -2474,40 +2525,64 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
             if best_doc and best_score >= _FUZZY_THRESHOLD:
                 return bson_clean(best_doc)
 
-    # Tier 3c: compound name scan — "^VEDAVYAS.*KAMATH" → guarantees exact target fetch
-    # before the broad 3-char fallback, which may be swamped by other "VED*" records.
-    if name and len(name.split()) >= 2:
-        _tks = name.split()
-        _ft, _lt = _tks[0], _tks[-1]
-        if len(_ft) >= 3 and len(_lt) >= 3:
-            _cpx = {'$regex': f'^{re.escape(_ft)}.*{re.escape(_lt[:4])}', '$options':'i'}
-            candidates = list(col.find({'Name': _cpx}, _PROJ_25).limit(20))
-            if candidates:
-                best_doc, best_score = _score_candidates(candidates, _flat_2025, name, relation)
-                if best_doc and best_score >= _FUZZY_THRESHOLD:
-                    return bson_clean(best_doc)
+    # Tier 3c-4: Multi-variant prefix scan — THE KEY FIX FOR TRANSLITERATION
+    #
+    # Problem: "VEDHAVYAS" → compound scan '^VEDHAVYAS.*KAMA' = 0 results (DB has VEDAVYAS)
+    #          full-token  '^VEDHAVYAS'                       = 0 results
+    #          3-char      '^VED' limit 40                    = may cut off before VEDAVYAS
+    #
+    # Solution: _name_variants("VEDHAVYAS") generates:
+    #   ['VEDHAVYAS', 'VEDAVYAS', 'VEDHAV', 'VEDAV', 'VED']
+    #   → Run compound + full-token scan for EACH variant
+    #   → VEDAVYAS variant's compound scan '^VEDAVYAS.*KAMA' hits immediately
+    #
+    # This makes the entire lookup transliteration-agnostic:
+    # VEDHAVYAS / VEDAVYAS / VEDA VYAS / WEDAWYAS → all find the same record.
 
-    # Tier 3d: full first-token prefix scan (uncapped) — "^VEDAVYAS" → limit 60
-    # Old code: '^VED' limit 30 — missed "VEDAVYAS" if 30+ "VEDA/VEDAN/VEDANT" came first.
-    if name and len(name.split()[0]) >= 4:
-        _ft4 = name.split()[0]
-        candidates = list(col.find(
-            {'Name': {'$regex': f'^{re.escape(_ft4)}', '$options': 'i'}}, _PROJ_25
-        ).limit(60))
-        if candidates:
-            best_doc, best_score = _score_candidates(candidates, _flat_2025, name, relation)
-            if best_doc and best_score >= _FUZZY_THRESHOLD:
-                return bson_clean(best_doc)
-
-    # Tier 4: broad 3-char prefix fallback — catches transliteration variants
     if name:
-        candidates = list(col.find(
-            {'Name': {'$regex': f'^{re.escape(name[:3])}', '$options': 'i'}}, _PROJ_25
-        ).limit(80))
-        if candidates:
-            best_doc, best_score = _score_candidates(candidates, _flat_2025, name, relation)
-            if best_doc and best_score >= _FUZZY_THRESHOLD:
-                return bson_clean(best_doc)
+        _ntks   = name.split()
+        _ft_raw = _ntks[0]
+        _lt_raw = _ntks[-1] if len(_ntks) > 1 else ''
+        _all_seen_ids_t = set()
+        _best_t_doc, _best_t_score = None, 0.0
+
+        # Generate variants for first token (VEDHAVYAS → VEDAVYAS, VEDHAV, VED...)
+        _ft_variants = _name_variants(_ft_raw) if len(_ft_raw) >= 2 else (_ft_raw,)
+        _lt_variants = _name_variants(_lt_raw) if _lt_raw and len(_lt_raw) >= 2 else (_lt_raw,) if _lt_raw else ()
+
+        _tier_cands = []
+
+        for _fv in _ft_variants:
+            for _lv in _lt_variants:
+                # Compound scan: '^VEDAVYAS.*KAMA' — tiny result set, guaranteed hit
+                if len(_fv) >= 3 and len(_lv) >= 3:
+                    _cpx = {'$regex': f'^{re.escape(_fv)}.*{re.escape(_lv[:4])}', '$options':'i'}
+                    for doc in col.find({'Name': _cpx}, _PROJ_25).limit(20):
+                        oid = str(doc.get('_id',''))
+                        if oid not in _all_seen_ids_t:
+                            _all_seen_ids_t.add(oid); _tier_cands.append(doc)
+
+            # Full first-token scan: '^VEDAVYAS' limit 100
+            if len(_fv) >= 3:
+                _pfx = {'$regex': f'^{re.escape(_fv)}', '$options':'i'}
+                for doc in col.find({'Name': _pfx}, _PROJ_25).limit(100):
+                    oid = str(doc.get('_id',''))
+                    if oid not in _all_seen_ids_t:
+                        _all_seen_ids_t.add(oid); _tier_cands.append(doc)
+
+        # Surname-first scan for each last-token variant
+        for _lv in _lt_variants:
+            if len(_lv) >= 3:
+                _spfx = {'$regex': f'^{re.escape(_lv[:5])}', '$options':'i'}
+                for doc in col.find({'Name': _spfx}, _PROJ_25).limit(30):
+                    oid = str(doc.get('_id',''))
+                    if oid not in _all_seen_ids_t:
+                        _all_seen_ids_t.add(oid); _tier_cands.append(doc)
+
+        if _tier_cands:
+            _best_t_doc, _best_t_score = _score_candidates(_tier_cands, _flat_2025, name, relation)
+            if _best_t_doc and _best_t_score >= _FUZZY_THRESHOLD:
+                return bson_clean(_best_t_doc)
 
     return None
 
@@ -2580,7 +2655,7 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
             if best_doc and best_score >= 55:
                 return bson_clean(best_doc)
 
-    # Tier 5: name prefix scan — wider (60 docs), adaptive threshold
+    # Tier 5: name prefix scan — variant-aware, wider (80 docs), adaptive threshold
     if name and len(name) >= 3:
         px = {'$regex': f'^{re.escape(name[:3])}', '$options': 'i'}
         candidates = list(col.find(
@@ -2965,46 +3040,44 @@ def api_check_sir(request):
                     _id = str(d.get('_id',''))
                     if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
 
-            # 3) Name — compound-first multi-prefix strategy (same fix as 2025)
+            # 3) Name — transliteration-aware multi-variant scan (suggestions_2002)
             if name and len(name) >= 2:
-                _ntoks = name.split()
-                _ft    = _ntoks[0]
-                _lt    = _ntoks[-1] if len(_ntoks) > 1 else ''
+                _ntoks  = name.split()
+                _ft_raw = _ntoks[0]
+                _lt_raw = _ntoks[-1] if len(_ntoks) > 1 else ''
 
-                # 0) COMPOUND scan: '^ASHWITH.*KOTT' → guarantees exact compound-name match
-                if len(_ntoks) >= 2 and len(_ft) >= 3 and len(_lt) >= 3:
-                    _pfx_cmp = {'$regex': f'^{re.escape(_ft)}.*{re.escape(_lt[:4])}', '$options':'i'}
-                    for d in col_2002s.find(
-                        {'$or':[{'Voter Name':_pfx_cmp},{'Name':_pfx_cmp}]}, _PROJ_02s
-                    ).limit(20):
-                        _id = str(d.get('_id',''))
-                        if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
+                _02_ft_vars = _name_variants(_ft_raw) if len(_ft_raw) >= 2 else (_ft_raw,)
+                _02_lt_vars = _name_variants(_lt_raw) if _lt_raw and len(_lt_raw) >= 2 else (_lt_raw,) if _lt_raw else ()
 
-                # a) Full first-token prefix — no truncation cap
-                if len(_ft) >= 3:
-                    _pfx_tgt = {'$regex': f'^{re.escape(_ft)}', '$options':'i'}
-                    for d in col_2002s.find(
-                        {'$or':[{'Voter Name':_pfx_tgt},{'Name':_pfx_tgt}]}, _PROJ_02s
-                    ).limit(60):
-                        _id = str(d.get('_id',''))
-                        if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
+                for _fv in _02_ft_vars:
+                    # Compound scan with each last-token variant
+                    for _lv in _02_lt_vars:
+                        if len(_fv) >= 3 and len(_lv) >= 3:
+                            _cpx02 = {'$regex': f'^{re.escape(_fv)}.*{re.escape(_lv[:4])}', '$options':'i'}
+                            for d in col_2002s.find(
+                                {'$or':[{'Voter Name':_cpx02},{'Name':_cpx02}]}, _PROJ_02s
+                            ).limit(20):
+                                _id = str(d.get('_id',''))
+                                if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
 
-                # b) Surname scan: DB might store family name first
-                if _lt and len(_lt) >= 3:
-                    _pfx_sur = {'$regex': f'^{re.escape(_lt[:4])}', '$options':'i'}
-                    for d in col_2002s.find(
-                        {'$or':[{'Voter Name':_pfx_sur},{'Name':_pfx_sur}]}, _PROJ_02s
-                    ).limit(30):
-                        _id = str(d.get('_id',''))
-                        if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
+                    # Full first-token scan for each variant
+                    if len(_fv) >= 3:
+                        _pfx02 = {'$regex': f'^{re.escape(_fv)}', '$options':'i'}
+                        for d in col_2002s.find(
+                            {'$or':[{'Voter Name':_pfx02},{'Name':_pfx02}]}, _PROJ_02s
+                        ).limit(80):
+                            _id = str(d.get('_id',''))
+                            if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
 
-                # c) Broad 3-char fallback (transliteration variants: ASHW→ASHV)
-                _pfx3 = {'$regex': f'^{re.escape(name[:3])}', '$options':'i'}
-                for d in col_2002s.find(
-                    {'$or':[{'Voter Name':_pfx3},{'Name':_pfx3}]}, _PROJ_02s
-                ).limit(40):
-                    _id = str(d.get('_id',''))
-                    if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
+                # Surname-first scan for each last-token variant
+                for _lv in _02_lt_vars:
+                    if len(_lv) >= 3:
+                        _02_spfx = {'$regex': f'^{re.escape(_lv[:5])}', '$options':'i'}
+                        for d in col_2002s.find(
+                            {'$or':[{'Voter Name':_02_spfx},{'Name':_02_spfx}]}, _PROJ_02s
+                        ).limit(30):
+                            _id = str(d.get('_id',''))
+                            if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
 
             # 4) Relation — use full first token, not just 3 chars
             # "BABU KOTTARI" → "BABU" (4 chars) is far more targeted than "BAB"
@@ -3225,44 +3298,42 @@ def api_check_sir(request):
             oid = str(doc.get('_id',''))
             if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
 
-    # 3) Name — compound-first multi-prefix strategy
+    # 3) Name — transliteration-aware multi-variant scan (similar_2025)
     #
-    # Scans ordered fastest→broadest to guarantee the target is in _raw_25:
-    #  0) COMPOUND  '^VEDAVYAS.*KAMA'  → ≤20 results, guaranteed exact target
-    #  a) FULL first-token '^VEDAVYAS' → limit 80 (covers all "VEDAVYAS*" names)
-    #  b) Surname-first   '^KAMA'      → limit 20 (catches "KAMATH VEDAVYAS" ordering)
-    #  c) Broad 3-char    '^VED'       → limit 40 (transliteration variants)
+    # _name_variants("VEDHAVYAS") → ['VEDHAVYAS','VEDAVYAS','VEDHAV','VEDAV','VED']
+    # Each variant gets a compound scan + full-token scan, so even with a typo
+    # like VEDHAVYAS the DB record VEDAVYAS is guaranteed to be fetched and scored.
     if name and len(name) >= 3:
-        _25_ntoks = name.split()
-        _25_ft    = _25_ntoks[0]
-        _25_lt    = _25_ntoks[-1] if len(_25_ntoks) > 1 else ''
+        _25_ntoks  = name.split()
+        _25_ft_raw = _25_ntoks[0]
+        _25_lt_raw = _25_ntoks[-1] if len(_25_ntoks) > 1 else ''
 
-        # 0) Compound scan — guarantees exact compound-name is fetched
-        if len(_25_ntoks) >= 2 and len(_25_ft) >= 3 and len(_25_lt) >= 3:
-            _25_cpx = {'$regex': f'^{re.escape(_25_ft)}.*{re.escape(_25_lt[:4])}', '$options':'i'}
-            for doc in col_2025.find({'Name': _25_cpx}, _PROJ_SLIM).limit(20):
-                oid = str(doc.get('_id',''))
-                if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
+        _25_ft_vars = _name_variants(_25_ft_raw) if len(_25_ft_raw) >= 2 else (_25_ft_raw,)
+        _25_lt_vars = _name_variants(_25_lt_raw) if _25_lt_raw and len(_25_lt_raw) >= 2 else (_25_lt_raw,) if _25_lt_raw else ()
 
-        # a) Full first-token — limit 80 (was 60) to handle common first names
-        if len(_25_ft) >= 3:
-            _25_pfx_tgt = {'$regex': f'^{re.escape(_25_ft)}', '$options':'i'}
-            for doc in col_2025.find({'Name': _25_pfx_tgt}, _PROJ_SLIM).limit(80):
-                oid = str(doc.get('_id',''))
-                if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
+        for _fv in _25_ft_vars:
+            # Compound scan with each last-token variant
+            for _lv in _25_lt_vars:
+                if len(_fv) >= 3 and len(_lv) >= 3:
+                    _cpx25 = {'$regex': f'^{re.escape(_fv)}.*{re.escape(_lv[:4])}', '$options':'i'}
+                    for doc in col_2025.find({'Name': _cpx25}, _PROJ_SLIM).limit(20):
+                        oid = str(doc.get('_id',''))
+                        if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
 
-        # b) Surname-first scan — catches "KAMATH VEDAVYAS" ordering in DB
-        if _25_lt and len(_25_lt) >= 3:
-            _25_pfx_sur = {'$regex': f'^{re.escape(_25_lt[:4])}', '$options':'i'}
-            for doc in col_2025.find({'Name': _25_pfx_sur}, _PROJ_SLIM).limit(30):
-                oid = str(doc.get('_id',''))
-                if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
+            # Full first-token scan for each variant — limit 100 (was 80)
+            if len(_fv) >= 3:
+                _pfx25 = {'$regex': f'^{re.escape(_fv)}', '$options':'i'}
+                for doc in col_2025.find({'Name': _pfx25}, _PROJ_SLIM).limit(100):
+                    oid = str(doc.get('_id',''))
+                    if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
 
-        # c) Broad 3-char fallback (transliteration: VEDAVYAS/WEDAWYAS)
-        _25_pfx3 = {'$regex': f'^{re.escape(name[:3])}', '$options':'i'}
-        for doc in col_2025.find({'Name': _25_pfx3}, _PROJ_SLIM).limit(40):
-            oid = str(doc.get('_id',''))
-            if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
+        # Surname-first scan for each last-token variant
+        for _lv in _25_lt_vars:
+            if len(_lv) >= 3:
+                _25_spfx = {'$regex': f'^{re.escape(_lv[:5])}', '$options':'i'}
+                for doc in col_2025.find({'Name': _25_spfx}, _PROJ_SLIM).limit(30):
+                    oid = str(doc.get('_id',''))
+                    if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
 
     # 4) Relation — first-token prefix
     if relation and len(relation) >= 3:
