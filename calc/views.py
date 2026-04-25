@@ -2291,57 +2291,33 @@ def _name_score(a: str, b: str) -> float:
     pa, pb = _phonetic_norm(a), _phonetic_norm(b)
     if pa == pb: return 100.0   # phonetic exact — fastest possible exit
 
-    # ── Length-ratio penalty ──────────────────────────────────────────────────
-    # Prevents short names like "VEDA" from scoring 100 against "VEDAVYAS KAMATH"
-    # via partial_ratio or JaroWinkler (both reward substring containment).
-    # Penalty formula: if one name is less than 60% the length of the other,
-    # cap the raw score so that the shorter name can never beat a full-name match.
-    # Example:
-    #   "VEDA"(4) vs "VEDAVYAS KAMATH"(15): ratio=0.267 → penalty=0.40 → cap at 40
-    #   "VEDAVYAS KAMATH"(15) vs "VEDAVYAS KAMATH"(15): ratio=1.0 → no penalty
-    la, lb = len(a), len(b)
-    _len_ratio = min(la, lb) / max(la, lb)   # always ≤ 1.0
-    # Only penalise when ratio < 0.6 (avoids punishing normal abbreviation variants)
-    _len_penalty_cap = 100.0 if _len_ratio >= 0.60 else (_len_ratio * 100.0 + 10.0)
-
     if _RAPIDFUZZ_AVAILABLE:
-        raw = max(
+        # rapidfuzz is 50-100× faster than pure-Python; skip Levenshtein entirely
+        return max(
             _rfuzz.token_sort_ratio(a, b),
             _rfuzz.token_sort_ratio(pa, pb),
             _rfuzz.partial_ratio(a, b),
             _rfdist.JaroWinkler.normalized_similarity(a, b) * 100,
             _rfdist.JaroWinkler.normalized_similarity(pa, pb) * 100,
         )
-        return min(raw, _len_penalty_cap)
 
     # Fallback: pure-Python (no rapidfuzz installed)
     s1 = _levenshtein_similarity(a, b)
-    if s1 >= 95 and _len_ratio >= 0.60: return s1
+    if s1 >= 95: return s1           # early-exit: already excellent
     s2 = _levenshtein_similarity(pa, pb)
-    if s2 >= 95 and _len_ratio >= 0.60: return s2
-    raw = max(s1, s2,
-              _partial_levenshtein(a, b),
-              _partial_levenshtein(pa, pb))
-    return min(raw, _len_penalty_cap)
+    if s2 >= 95: return s2
+    return max(s1, s2,
+               _partial_levenshtein(a, b),
+               _partial_levenshtein(pa, pb))
 
 
 def _score_candidates(candidates, flat_fn, name, relation):
     """
     Score a list of MongoDB docs against (name, relation).
-    Returns (best_doc, best_score).
-
-    CRITICAL: We never early-exit based on composite score alone.
-    Reason: rapidfuzz partial_ratio("VEDA", "VEDAVYAS KAMATH") ≈ 100 because
-    "VEDA" is a substring of "VEDAVYAS KAMATH".  If "VEDA" appears before
-    "VEDAVYAS KAMATH" in the candidate list, an early exit at ≥97 would lock
-    in "VEDA" and never score the real match.
-
-    We early-exit ONLY when token_sort_ratio ≥ 97 AND the candidate name
-    length is within 20% of the target — ruling out short-name false positives.
+    Returns (best_doc, best_score). Stops early at score ≥ 97.
+    flat_fn is either _flat_2025 or _flat_2002.
     """
     best_doc, best_score = None, 0.0
-    name_len = len(name) if name else 0
-
     for doc in candidates:
         flat    = flat_fn(doc)
         n_score = _name_score(name, flat['name'])
@@ -2349,13 +2325,7 @@ def _score_candidates(candidates, flat_fn, name, relation):
         comp    = (0.65 * n_score + 0.35 * r_score) if (relation and flat['relation']) else n_score
         if comp > best_score:
             best_score, best_doc = comp, doc
-        # Early-exit ONLY if:
-        # 1) score is near-perfect (≥ 99) AND
-        # 2) candidate name length is within 20% of target (avoids "VEDA" locking out "VEDAVYAS KAMATH")
-        cand_len = len(flat.get('name',''))
-        if best_score >= 99 and name_len > 0 and abs(cand_len - name_len) / max(name_len,1) < 0.20:
-            break
-
+        if best_score >= 97: break   # near-perfect — stop looking
     return best_doc, best_score
 
 
@@ -2474,36 +2444,11 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
             if best_doc and best_score >= _FUZZY_THRESHOLD:
                 return bson_clean(best_doc)
 
-    # Tier 3c: compound name scan — "^VEDAVYAS.*KAMATH" → guarantees exact target fetch
-    # before the broad 3-char fallback, which may be swamped by other "VED*" records.
-    if name and len(name.split()) >= 2:
-        _tks = name.split()
-        _ft, _lt = _tks[0], _tks[-1]
-        if len(_ft) >= 3 and len(_lt) >= 3:
-            _cpx = {'$regex': f'^{re.escape(_ft)}.*{re.escape(_lt[:4])}', '$options':'i'}
-            candidates = list(col.find({'Name': _cpx}, _PROJ_25).limit(20))
-            if candidates:
-                best_doc, best_score = _score_candidates(candidates, _flat_2025, name, relation)
-                if best_doc and best_score >= _FUZZY_THRESHOLD:
-                    return bson_clean(best_doc)
-
-    # Tier 3d: full first-token prefix scan (uncapped) — "^VEDAVYAS" → limit 60
-    # Old code: '^VED' limit 30 — missed "VEDAVYAS" if 30+ "VEDA/VEDAN/VEDANT" came first.
-    if name and len(name.split()[0]) >= 4:
-        _ft4 = name.split()[0]
-        candidates = list(col.find(
-            {'Name': {'$regex': f'^{re.escape(_ft4)}', '$options': 'i'}}, _PROJ_25
-        ).limit(60))
-        if candidates:
-            best_doc, best_score = _score_candidates(candidates, _flat_2025, name, relation)
-            if best_doc and best_score >= _FUZZY_THRESHOLD:
-                return bson_clean(best_doc)
-
-    # Tier 4: broad 3-char prefix fallback — catches transliteration variants
+    # Tier 4: prefix → fuzzy, capped at 30 with projection
     if name:
         candidates = list(col.find(
             {'Name': {'$regex': f'^{re.escape(name[:3])}', '$options': 'i'}}, _PROJ_25
-        ).limit(80))
+        ).limit(30))
         if candidates:
             best_doc, best_score = _score_candidates(candidates, _flat_2025, name, relation)
             if best_doc and best_score >= _FUZZY_THRESHOLD:
@@ -3199,12 +3144,10 @@ def api_check_sir(request):
     def _match_flags_25(rn, rr, rh, re_):
         flags = []
         if voterid and re_ and voterid.upper() == re_.upper(): flags.append('voterid')
-        # Threshold 60 (was 70): ensures near-matches like "VEDAVYAS KAMATH" (score ~95)
-        # still appear in suggestions even when another record was confirmed as primary.
-        if name and len(name) >= 2 and _name_score(name, rn) >= 60: flags.append('name')
+        if name and len(name) >= 2 and _name_score(name, rn) >= 70: flags.append('name')
         if house and rh and (rh.upper() == house.upper() or rh.upper().startswith(house.upper())):
             flags.append('house')
-        if relation and len(relation) >= 2 and _name_score(relation, rr) >= 60: flags.append('relation')
+        if relation and len(relation) >= 2 and _name_score(relation, rr) >= 70: flags.append('relation')
         return flags
 
     _raw_25 = []
@@ -3227,40 +3170,46 @@ def api_check_sir(request):
 
     # 3) Name — compound-first multi-prefix strategy
     #
-    # Scans ordered fastest→broadest to guarantee the target is in _raw_25:
-    #  0) COMPOUND  '^VEDAVYAS.*KAMA'  → ≤20 results, guaranteed exact target
-    #  a) FULL first-token '^VEDAVYAS' → limit 80 (covers all "VEDAVYAS*" names)
-    #  b) Surname-first   '^KAMA'      → limit 20 (catches "KAMATH VEDAVYAS" ordering)
-    #  c) Broad 3-char    '^VED'       → limit 40 (transliteration variants)
+    # THE KEY FIX:
+    # Old code used '^ASHWIT' (6 chars) with limit 80.  Mangalore has 80+ voters
+    # starting with ASHWIT/ASHWITHA, so "ASHWITH KOTTARI" sits at position 81+ in
+    # MongoDB insertion order and is NEVER fetched — can't score what you don't retrieve.
+    #
+    # New order of scans (fastest → broadest):
+    #  0) COMPOUND — '^ASHWITH.*KOTT' → ≤20 results, guaranteed to include the target
+    #  a) FULL first-token  — '^ASHWITH' (not capped at 6)  → limit 60
+    #  b) Surname-first scan — '^KOTT'                      → limit 20
+    #  c) Broad 3-char fallback — '^ASH'                    → limit 30
     if name and len(name) >= 3:
         _25_ntoks = name.split()
         _25_ft    = _25_ntoks[0]
         _25_lt    = _25_ntoks[-1] if len(_25_ntoks) > 1 else ''
 
-        # 0) Compound scan — guarantees exact compound-name is fetched
+        # 0) Compound scan — full first token + last token prefix (e.g. ^ASHWITH.*KOTT)
+        #    Returns tiny set; always contains "ASHWITH KOTTARI" for "ASHWITH KOTTARY"
         if len(_25_ntoks) >= 2 and len(_25_ft) >= 3 and len(_25_lt) >= 3:
             _25_cpx = {'$regex': f'^{re.escape(_25_ft)}.*{re.escape(_25_lt[:4])}', '$options':'i'}
             for doc in col_2025.find({'Name': _25_cpx}, _PROJ_SLIM).limit(20):
                 oid = str(doc.get('_id',''))
                 if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
 
-        # a) Full first-token — limit 80 (was 60) to handle common first names
+        # a) Full first-token prefix — uses complete token "ASHWITH" not truncated "ASHWIT"
         if len(_25_ft) >= 3:
             _25_pfx_tgt = {'$regex': f'^{re.escape(_25_ft)}', '$options':'i'}
-            for doc in col_2025.find({'Name': _25_pfx_tgt}, _PROJ_SLIM).limit(80):
+            for doc in col_2025.find({'Name': _25_pfx_tgt}, _PROJ_SLIM).limit(60):
                 oid = str(doc.get('_id',''))
                 if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
 
-        # b) Surname-first scan — catches "KAMATH VEDAVYAS" ordering in DB
+        # b) Surname-first scan — catches "KOTTARI ASHWITH" style entries
         if _25_lt and len(_25_lt) >= 3:
             _25_pfx_sur = {'$regex': f'^{re.escape(_25_lt[:4])}', '$options':'i'}
-            for doc in col_2025.find({'Name': _25_pfx_sur}, _PROJ_SLIM).limit(30):
+            for doc in col_2025.find({'Name': _25_pfx_sur}, _PROJ_SLIM).limit(20):
                 oid = str(doc.get('_id',''))
                 if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
 
-        # c) Broad 3-char fallback (transliteration: VEDAVYAS/WEDAWYAS)
+        # c) Broad 3-char fallback (transliteration variants: ASHW→ASHV)
         _25_pfx3 = {'$regex': f'^{re.escape(name[:3])}', '$options':'i'}
-        for doc in col_2025.find({'Name': _25_pfx3}, _PROJ_SLIM).limit(40):
+        for doc in col_2025.find({'Name': _25_pfx3}, _PROJ_SLIM).limit(30):
             oid = str(doc.get('_id',''))
             if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
 
