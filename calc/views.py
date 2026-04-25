@@ -1516,45 +1516,6 @@ def api_save_survey(request):
     data['sir_suspicious'] = bool(sir_result and sir_result.get('suspicious')) if sir_result else False
 
     # ── 5a. Upload Aadhaar photo to GCS if provided ───────────────────────────
-    # Diagnostic: always log what we received
-    print(f"[api_save_survey] aadhaar_photo_file={aadhaar_photo_file!r}, "
-          f"FILES_keys={list(request.FILES.keys())}, content_type={request.content_type!r}")
-
-    if not aadhaar_photo_file:
-        # Last-chance fallback: check if photo came as base64 string in JSON body
-        b64_photo = body.get('aadhaarPhotoBase64') or body.get('aadhaar_photo_base64')
-        if b64_photo:
-            import base64 as _b64, uuid as _uuid, io as _io
-            try:
-                # Strip data-URL prefix if present (e.g. "data:image/jpeg;base64,...")
-                if ',' in b64_photo:
-                    header, b64_photo = b64_photo.split(',', 1)
-                    content_type_b64 = header.split(':')[1].split(';')[0] if ':' in header else 'image/jpeg'
-                else:
-                    content_type_b64 = 'image/jpeg'
-                img_bytes = _b64.b64decode(b64_photo)
-                ext_map   = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp'}
-                ext       = ext_map.get(content_type_b64, '.jpg')
-                first     = (body.get('firstName') or 'unknown').replace(' ', '_').lower()
-                last      = (body.get('lastName')  or '').replace(' ', '_').lower()
-                blob_name = f"aadhaar_photos/{first}_{last}_{final_serial}_{_uuid.uuid4().hex[:8]}{ext}"
-
-                class _FakeDjangoFile:
-                    def __init__(self, data, name, ct):
-                        self._buf = _io.BytesIO(data)
-                        self.name = name
-                        self.content_type = ct
-                    def read(self, *a): return self._buf.read(*a)
-                    def seek(self, *a): return self._buf.seek(*a)
-
-                fake_file = _FakeDjangoFile(img_bytes, f"aadhaar{ext}", content_type_b64)
-                photo_url = _upload_to_gcs(fake_file, blob_name)
-                data['aadhaarPhotoUrl'] = photo_url
-                print(f"[api_save_survey] ✓ Aadhaar photo (base64 path) uploaded to GCS: {photo_url}")
-            except Exception as _b64_err:
-                data['aadhaarPhotoUrl'] = None
-                print(f"[api_save_survey] ✗ Aadhaar base64 GCS upload failed: {_b64_err}")
-
     if aadhaar_photo_file:
         try:
             import uuid as _uuid
@@ -1564,7 +1525,7 @@ def api_save_survey(request):
             blob_name = f"aadhaar_photos/{first}_{last}_{final_serial}_{_uuid.uuid4().hex[:8]}{ext}"
             photo_url = _upload_to_gcs(aadhaar_photo_file, blob_name)
             data['aadhaarPhotoUrl'] = photo_url
-            print(f"[api_save_survey] ✓ Aadhaar photo (multipart path) uploaded to GCS: {photo_url}")
+            print(f"[api_save_survey] ✓ Aadhaar photo uploaded to GCS: {photo_url}")
         except Exception as _photo_err:
             # Non-fatal — survey still saves, photo URL stays None
             data['aadhaarPhotoUrl'] = None
@@ -1651,17 +1612,23 @@ def api_save_future_voters(request):
 # ─── DECEASED ─────────────────────────────────────────────────────────────────
 
 # ── GCS helper — uploads a file-like object, returns public URL ───────────────
-# Reads credentials from env vars set on Render:
-#   GCS_BUCKET_NAME          e.g. "your-project.appspot.com"
-#   GOOGLE_APPLICATION_CREDENTIALS_JSON  — full JSON of the service account key
-#                                           (paste the entire JSON as one line)
+# Mirrors the proven pattern from the reference ecom views.py:
+#   1. Write the in-memory Django file to a local temp file
+#   2. Call upload_from_filename (same as reference code)
+#   3. Call blob.make_public() — works on fine-grained ACL buckets
+#   4. If make_public() fails (uniform bucket-level access), fall back to
+#      constructing the canonical public URL directly.
+#
+# Env vars required on Render:
+#   GCS_BUCKET_NAME                      e.g. "ecom-66993.appspot.com"
+#   GOOGLE_APPLICATION_CREDENTIALS_JSON  full service-account key JSON (one line)
 
 def _upload_to_gcs(file_obj, destination_blob_name):
     """
     Upload a Django UploadedFile / InMemoryUploadedFile to GCS.
     Returns the public HTTPS URL, or raises on error.
     """
-    import os, json as _json
+    import os, json as _json, tempfile as _tmp
     from google.cloud import storage as _gcs
     from google.oauth2 import service_account as _sa
 
@@ -1673,21 +1640,55 @@ def _upload_to_gcs(file_obj, destination_blob_name):
     if not creds_json:
         raise ValueError('GOOGLE_APPLICATION_CREDENTIALS_JSON env var is not set')
 
+    # Build credentials exactly like the reference code
+    # (same scopes that the working ecom project uses)
     creds_dict  = _json.loads(creds_json)
     credentials = _sa.Credentials.from_service_account_info(
         creds_dict,
-        scopes=['https://www.googleapis.com/auth/cloud-platform'],
+        scopes=[
+            'https://www.googleapis.com/auth/cloud-platform',
+            'https://www.googleapis.com/auth/devstorage.full_control',
+        ],
     )
-    client = _gcs.Client(credentials=credentials)
+    client = _gcs.Client(credentials=credentials, project=creds_dict.get('project_id'))
     bucket = client.bucket(bucket_name)
     blob   = bucket.blob(destination_blob_name)
 
-    # Reset read position in case Django already read part of the file
-    file_obj.seek(0)
-    blob.upload_from_file(file_obj, content_type=file_obj.content_type or 'application/octet-stream')
-    blob.make_public()
-    print(f"[GCS] Uploaded '{file_obj.name}' to '{destination_blob_name}', public URL: {blob.public_url}")
-    return blob.public_url
+    # ── Write to a temp file then upload_from_filename ────────────────────────
+    # This mirrors the reference code exactly and avoids in-memory seek issues.
+    ext = os.path.splitext(file_obj.name)[1].lower() or '.tmp'
+    content_type = getattr(file_obj, 'content_type', None) or 'application/octet-stream'
+
+    with _tmp.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp_path = tmp.name
+        file_obj.seek(0)
+        for chunk in file_obj.chunks() if hasattr(file_obj, 'chunks') else [file_obj.read()]:
+            tmp.write(chunk)
+
+    try:
+        # upload_from_filename — identical to the reference ecom code
+        blob.upload_from_filename(tmp_path, content_type=content_type)
+
+        # make_public() — works on fine-grained ACL buckets (same as reference)
+        try:
+            blob.make_public()
+            public_url = blob.public_url
+        except Exception as _acl_err:
+            # Uniform bucket-level access: IAM must grant allUsers=Storage Object Viewer
+            print(f"[GCS] make_public() skipped ({_acl_err}); falling back to direct URL. "
+                  "Grant allUsers=Storage Object Viewer in GCS Console IAM.")
+            public_url = f"https://storage.googleapis.com/{bucket_name}/{destination_blob_name}"
+
+        print(f"[GCS] ✓ Uploaded '{file_obj.name}' → gs://{bucket_name}/{destination_blob_name}")
+        print(f"[GCS] ✓ Public URL: {public_url}")
+        return public_url
+
+    finally:
+        # Always clean up the temp file
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 @csrf_exempt
