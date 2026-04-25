@@ -1296,9 +1296,9 @@ def api_save_survey(request):
     ct = (request.content_type or '').lower()
 
     if 'multipart' in ct:
-        # Aadhaar photo path: form data is JSON-stringified under key 'data'
+        # Aadhaar photo path: form data is JSON-stringified under the 'data' key
         raw_data = request.POST.get('data', '')
-        print(f"[api_save_survey] MULTIPART path — data_len={len(raw_data)} FILES={list(request.FILES.keys())}")
+        print(f"[api_save_survey] MULTIPART: data_len={len(raw_data)}, FILES={list(request.FILES.keys())}")
         try:
             body = json.loads(raw_data) if raw_data else {}
         except Exception as _me:
@@ -1307,23 +1307,23 @@ def api_save_survey(request):
         aadhaar_photo_file = request.FILES.get('aadhaar_photo')
 
     else:
-        # Always try to parse raw body as JSON first — regardless of Content-Type header.
+        # JSON / url-encoded path
         raw_body = request.body
-        print(f"[api_save_survey] JSON path — ct={ct!r} body_len={len(raw_body)} raw[:100]={raw_body[:100]!r}")
+        print(f"[api_save_survey] JSON path: ct={ct!r} len={len(raw_body)} preview={raw_body[:120]!r}")
         try:
             body = json.loads(raw_body)
         except Exception as _e:
             print(f"[api_save_survey] JSON parse failed: {_e}")
             body = {k: v for k, v in request.POST.items()}
             if not body:
-                print(f"[api_save_survey] WARN: body EMPTY after all parse attempts.")
+                print("[api_save_survey] WARN: body empty after all parse attempts")
 
-    # ── DEBUG: log all key fields ─────────────────────────────────────────────
-    print(f"[api_save_survey] PARSED keys={list(body.keys())} firstName={body.get('firstName')!r} "
-          f"lastName={body.get('lastName')!r} wardNumber={body.get('wardNumber')!r} "
-          f"boothNo={body.get('boothNo')!r} voterid={body.get('voterid')!r} "
-          f"dob={body.get('dob')!r} gender={body.get('gender')!r} "
-          f"schemes_count={len(body.get('schemes', []))}")
+    # ── Verbose debug — every key field logged so nulls are immediately visible ──
+    print(f"[api_save_survey] PARSED: keys={list(body.keys())} | "
+          f"firstName={body.get('firstName')!r} lastName={body.get('lastName')!r} | "
+          f"ward={body.get('wardNumber')!r} booth={body.get('boothNo')!r} | "
+          f"voterid={body.get('voterid')!r} dob={body.get('dob')!r} | "
+          f"gender={body.get('gender')!r} schemes={len(body.get('schemes') or [])}")
 
     # Ward / booth write check (after body is parsed so we have ward/booth)
     _ward_body  = body.get('wardNumber', '')
@@ -1336,38 +1336,36 @@ def api_save_survey(request):
             if not _can_write_booth(_user, _booth_body):
                 return JsonResponse({'success': False, 'message': f'You can only submit surveys for your assigned booth ({_user["booth"]}).'}, status=403)
 
-    dob_str = body.get('dob') or None   # treat empty string as None
+    # ── Helper: treat empty string same as missing ────────────────────────────
+    def _val(k, default=None):
+        v = body.get(k, default)
+        return default if (v == '' or v is None) else v
+
+    # ── DOB → computed age; fall back to manually typed age ──────────────────
+    dob_str = _val('dob')
     age = None
     if dob_str:
         try:
-            dob = datetime.strptime(dob_str, '%Y-%m-%d')
-            today = datetime.today()
-            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+            dob_dt = datetime.strptime(dob_str, '%Y-%m-%d')
+            today  = datetime.today()
+            age    = today.year - dob_dt.year - ((today.month, today.day) < (dob_dt.month, dob_dt.day))
         except ValueError:
-            dob_str = None   # bad format — store None, do not abort
-    # If DOB was blank, fall back to the age the user typed directly
+            dob_str = None   # bad format — store None, don't abort the whole save
     if age is None:
         try:
-            age = int(body.get('age')) if body.get('age') else None
+            age = int(body['age']) if body.get('age') not in (None, '') else None
         except (TypeError, ValueError):
             age = None
 
     is_outstation = body.get('outstationResident') == 'Yes'
 
-    # ── 1. Extract voterid (no 2025 roll lookup — all records go to SurveyRecords) ──
+    # ── 1. Extract voterid ────────────────────────────────────────────────────
     voterid = (body.get('voterid') or '').strip().upper()
 
     # ── 2. Assign sequential serial = current count + 1 (gap-proof) ──────────
     survey_db_for_serial = get_survey_db()
     survey_count   = survey_db_for_serial['SurveyRecords'].count_documents({})
     final_serial   = survey_count + 1
-
-    # Helper: return None for empty strings so DB does not store ''
-    def _val(k, default=None):
-        v = body.get(k, default)
-        if v == '' or v is None:
-            return default
-        return v
 
     data = {
         # ── Personal ──────────────────────────────────────────────
@@ -1397,7 +1395,7 @@ def api_save_survey(request):
         'outstationState':    _val('outstationState')   if is_outstation else None,
         'outstationAddress':  _val('outstationAddress') if is_outstation else None,
 
-        # ── Current location (only saved when outstation = Yes) ───
+        # ── Current location (only when outstation = Yes) ─────────
         'currentHouseNumber': _val('currentHouseNumber') if is_outstation else None,
         'currentAreaType':    _val('currentAreaType')    if is_outstation else None,
         'currentHomeType':    _val('currentHomeType')    if is_outstation else None,
@@ -1435,7 +1433,7 @@ def api_save_survey(request):
         'diseaseName':      _val('diseaseName')  if body.get('healthStatus') == 'Diseased' else None,
         'differentlyAbled': _val('differentlyAbled', 'No'),
 
-        # ── 2025 voter roll prefill fields (stored as-is from frontend) ───
+        # ── 2025 voter roll prefill fields ────────────────────────
         'relation':             _val('relation'),
         'relationName':         _val('relationName'),
         'partNo':               _val('partNo'),
