@@ -1328,37 +1328,13 @@ def api_save_survey(request):
 
     is_outstation = body.get('outstationResident') == 'Yes'
 
-    # ── 1. Look up voter in 2025 roll ─────────────────────────────────────────
-    voterid     = (body.get('voterid') or '').strip().upper()
-    col_2025    = get_db()['2025']
-    voter_2025  = None
-
-    if voterid:
-        voter_2025 = col_2025.find_one(
-            {'Epic NO': voterid},
-            {'Serial No': 1, 'Sl No': 1, 'Name': 1, 'House No': 1, 'Booth No': 1}
-        )
-
-    # If no voterid, try name + house match as fallback
-    if not voter_2025:
-        first = (body.get('firstName') or '').strip()
-        last  = (body.get('lastName')  or '').strip()
-        house = (body.get('houseNumber') or '').strip()
-        full_name = f"{first} {last}".strip()
-        if full_name and house:
-            voter_2025 = col_2025.find_one(
-                {'Name': {'$regex': f'^{re.escape(full_name)}$', '$options': 'i'}, 'House No': house},
-                {'Serial No': 1, 'Sl No': 1, 'Name': 1, 'House No': 1, 'Booth No': 1}
-            )
+    # ── 1. Extract voterid (no 2025 roll lookup — all records go to SurveyRecords) ──
+    voterid = (body.get('voterid') or '').strip().upper()
 
     # ── 2. Assign sequential serial = current count + 1 (gap-proof) ──────────
-    # We no longer use the 2025-roll serial as the survey serial number —
-    # that caused gaps whenever a save was cancelled or a record deleted.
-    # The 2025 lookup above is still used only to decide inVoterRoll routing.
     survey_db_for_serial = get_survey_db()
     survey_count   = survey_db_for_serial['SurveyRecords'].count_documents({})
     final_serial   = survey_count + 1
-    serial_from_2025 = None   # kept for serialSource flag below
 
     data = {
         # ── Personal ──────────────────────────────────────────────
@@ -1367,8 +1343,8 @@ def api_save_survey(request):
         'lastName':         body.get('lastName'),
         'addharNumber':     body.get('addharNumber'),
         'contactNumber':    body.get('contactNumber'),
-        'serialNumber':     final_serial,           # ← from 2025 roll when available
-        'serialSource':     '2025_roll' if serial_from_2025 is not None else 'manual',
+        'serialNumber':     final_serial,
+        'serialSource':     'manual',
         'dob':              dob_str,
         'age':              age,
         'gender':           body.get('gender'),
@@ -1395,6 +1371,7 @@ def api_save_survey(request):
 
         # ── Registered address ────────────────────────────────────
         'wardNumber':       body.get('wardNumber'),
+        'boothNo':          body.get('boothNo'),
         'houseNumber':      body.get('houseNumber'),
         'address':          body.get('address'),
         'areaType':         body.get('areaType'),
@@ -1499,30 +1476,17 @@ def api_save_survey(request):
             data['aadhaarPhotoUrl'] = None
             print(f"[api_save_survey] ✗ Aadhaar photo GCS upload failed: {_photo_err}")
 
-    # ── 5b. Save to correct collection ───────────────────────────────────────
-    # voter_2025 is None  →  not in 2025 voter roll → NotFoundRecordSurvey
-    # voter_2025 found    →  normal path             → SurveyRecords
-    if voter_2025 is None:
-        # Mark the reason and save to the "not found" collection
-        data['notFoundReason'] = (
-            'Voter ID not in 2025 roll' if voterid
-            else 'Name + house not matched in 2025 roll'
-        )
-        survey_db['NotFoundRecordSurvey'].insert_one(data)
-        print(f"[api_save_survey] Voter NOT in 2025 roll — saved to NotFoundRecordSurvey: {voterid or data.get('firstName')}")
-        collection_used = 'NotFoundRecordSurvey'
-    else:
-        survey_db['SurveyRecords'].insert_one(data)
-        print(f"[api_save_survey] Saved to SurveyRecords — serial {final_serial}, SIR={sir_category}")
-        collection_used = 'SurveyRecords'
+    # ── 5b. Always save directly to SurveyRecords ────────────────────────────
+    survey_db['SurveyRecords'].insert_one(data)
+    print(f"[api_save_survey] Saved to SurveyRecords — serial {final_serial}, SIR={sir_category}")
 
     return JsonResponse({
         'success':        True,
         'message':        'Survey saved successfully.',
         'serialNumber':   final_serial,
         'serialSource':   data['serialSource'],
-        'collection':     collection_used,
-        'inVoterRoll':    voter_2025 is not None,
+        'collection':     'SurveyRecords',
+        'inVoterRoll':    None,
         'sir':            sir_result,   # ← frontend SIR modal reads this
         'sir_category':   sir_category,
     })
