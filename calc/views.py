@@ -1291,19 +1291,32 @@ def api_save_survey(request):
     if not _is_approved(_user):
         return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
 
-    # ── Parse body — supports both JSON and multipart (when aadhaar photo sent) ──
+    # ── Parse body — supports JSON, multipart, and url-encoded ──────────────
     aadhaar_photo_file = None
-    if request.content_type and 'multipart' in request.content_type:
+    ct = (request.content_type or '').lower()
+
+    if 'multipart' in ct:
+        # Aadhaar photo path: form data is JSON-stringified under key 'data'
         try:
             body = json.loads(request.POST.get('data', '{}'))
         except Exception:
-            body = request.POST.dict()
+            body = {k: v for k, v in request.POST.items()}
         aadhaar_photo_file = request.FILES.get('aadhaar_photo')
+
     else:
+        # Always try to parse raw body as JSON first — regardless of Content-Type header.
+        # This handles cases where the client sends JSON but omits or mis-sets the header.
         try:
             body = json.loads(request.body)
-        except Exception:
-            body = request.POST.dict()
+        except Exception as _e:
+            # Last resort: url-encoded POST fallback
+            body = {k: v for k, v in request.POST.items()}
+            if not body:
+                print(f"[api_save_survey] WARN: body is empty after all parse attempts. "
+                      f"content_type={ct!r}, raw body[:300]={request.body[:300]!r}")
+
+    # ── DEBUG: log what arrived so null-field issues are traceable ───────────
+    print(f"[api_save_survey] content_type={ct!r} | body keys={list(body.keys())} | firstName={body.get('firstName')!r} | wardNumber={body.get('wardNumber')!r}")
 
     # Ward / booth write check (after body is parsed so we have ward/booth)
     _ward_body  = body.get('wardNumber', '')
