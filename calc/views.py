@@ -2288,27 +2288,47 @@ def _name_score(a: str, b: str) -> float:
     if not a or not b: return 0.0
     if a == b: return 100.0
 
+    la, lb = len(a), len(b)
     pa, pb = _phonetic_norm(a), _phonetic_norm(b)
     if pa == pb: return 100.0   # phonetic exact — fastest possible exit
 
     if _RAPIDFUZZ_AVAILABLE:
-        # rapidfuzz is 50-100× faster than pure-Python; skip Levenshtein entirely
-        return max(
+        raw = max(
             _rfuzz.token_sort_ratio(a, b),
             _rfuzz.token_sort_ratio(pa, pb),
             _rfuzz.partial_ratio(a, b),
             _rfdist.JaroWinkler.normalized_similarity(a, b) * 100,
             _rfdist.JaroWinkler.normalized_similarity(pa, pb) * 100,
         )
+    else:
+        # Fallback: pure-Python (no rapidfuzz installed)
+        s1 = _levenshtein_similarity(a, b)
+        if s1 >= 95: return s1           # early-exit: already excellent full match
+        s2 = _levenshtein_similarity(pa, pb)
+        if s2 >= 95: return s2
+        raw = max(s1, s2,
+                  _partial_levenshtein(a, b),
+                  _partial_levenshtein(pa, pb))
 
-    # Fallback: pure-Python (no rapidfuzz installed)
-    s1 = _levenshtein_similarity(a, b)
-    if s1 >= 95: return s1           # early-exit: already excellent
-    s2 = _levenshtein_similarity(pa, pb)
-    if s2 >= 95: return s2
-    return max(s1, s2,
-               _partial_levenshtein(a, b),
-               _partial_levenshtein(pa, pb))
+    # ── Length-ratio penalty ──────────────────────────────────────────────────
+    # partial_ratio / _partial_levenshtein find the short string as a SUBSTRING
+    # of the long string, which gives unrealistically high scores when names are
+    # very different lengths.  Examples without this fix:
+    #   "VEDA" vs "VEDAVYAS KAMATH"   → 100  (VEDA is substring of VEDAVYAS)
+    #   "RAMA" vs "RAMASUBRAMANIAN"   → 100  (RAMA is substring)
+    #   "LAKSHMI" vs "LAKSHMINARAYANA"→ 100  (LAKSHMI is substring)
+    #
+    # Formula: raw × ratio^0.7   when ratio < 0.5  (smooth decay, no penalty ≥ 0.5)
+    #   ratio=0.267 (VEDA/15)     → ×0.396 → 39.6  (< 70 threshold → no false match)
+    #   ratio=0.467 (LAKSHMI/15)  → ×0.587 → 58.7  (< 70 → no false match)
+    #   ratio=0.500 (SURESH/12)   → no penalty → 100  (first-name-only → still found)
+    #   ratio=0.538 (KRISHNA/13)  → no penalty → 100  (common abbreviation → found)
+    #   ratio=0.533 (VEDAVYAS/15) → no penalty → 100  (exact first name → found)
+    length_ratio = min(la, lb) / max(la, lb)
+    if length_ratio < 0.5:
+        raw = raw * (length_ratio ** 0.7)   # smoothly scales to 0 as ratio→0
+
+    return round(raw, 1)
 
 
 def _score_candidates(candidates, flat_fn, name, relation):
@@ -2444,13 +2464,43 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
             if best_doc and best_score >= _FUZZY_THRESHOLD:
                 return bson_clean(best_doc)
 
-    # Tier 4: prefix → fuzzy, capped at 30 with projection
+    # Tier 4: compound-first name scan — same 4-scan strategy used in similar_2025
+    # Old code used name[:3] limit 30, which cuts off "VEDAVYAS KAMATH" if 30+
+    # names start with "VED". Compound scan '^VEDAVYAS.*KAMA' guarantees the target.
     if name:
-        candidates = list(col.find(
-            {'Name': {'$regex': f'^{re.escape(name[:3])}', '$options': 'i'}}, _PROJ_25
+        _t4_ntoks = name.split()
+        _t4_ft    = _t4_ntoks[0]
+        _t4_lt    = _t4_ntoks[-1] if len(_t4_ntoks) > 1 else ''
+        _t4_seen  = set()
+        _t4_cands = []
+
+        def _t4_add(docs):
+            for d in docs:
+                oid = str(d.get('_id',''))
+                if oid not in _t4_seen: _t4_seen.add(oid); _t4_cands.append(d)
+
+        # 0) Compound: '^VEDAVYAS.*KAMA' — tiny set, exact target guaranteed
+        if len(_t4_ntoks) >= 2 and len(_t4_ft) >= 3 and len(_t4_lt) >= 3:
+            _t4_add(col.find(
+                {'Name': {'$regex': f'^{re.escape(_t4_ft)}.*{re.escape(_t4_lt[:4])}', '$options':'i'}},
+                _PROJ_25
+            ).limit(20))
+
+        # a) Full first-token prefix — no length cap
+        if len(_t4_ft) >= 3:
+            _t4_add(col.find(
+                {'Name': {'$regex': f'^{re.escape(_t4_ft)}', '$options':'i'}},
+                _PROJ_25
+            ).limit(40))
+
+        # b) Broad 3-char fallback
+        _t4_add(col.find(
+            {'Name': {'$regex': f'^{re.escape(name[:3])}', '$options':'i'}},
+            _PROJ_25
         ).limit(30))
-        if candidates:
-            best_doc, best_score = _score_candidates(candidates, _flat_2025, name, relation)
+
+        if _t4_cands:
+            best_doc, best_score = _score_candidates(_t4_cands, _flat_2025, name, relation)
             if best_doc and best_score >= _FUZZY_THRESHOLD:
                 return bson_clean(best_doc)
 
