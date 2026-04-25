@@ -2080,11 +2080,12 @@ def api_house_search(request):
         if not hn:
             continue
         vid = str(d.get('Epic NO', '')).strip()
-        _relation = str(d.get('Relation Name', '')).strip()
+        _relation      = str(d.get('Relation',      '')).strip()   # e.g. "Father", "Husband"
+        _relation_name = str(d.get('Relation Name', '')).strip()   # e.g. "HARISHCHANDRA"
         member = {
             'name':               str(d.get('Name', '')).strip(),
             'relation':           _relation,
-            'relationName':       _relation,
+            'relationName':       _relation_name,
             'voterid':            vid,
             'gender':             str(d.get('Gender', '')),
             'age':                d.get('Age', ''),
@@ -2101,7 +2102,7 @@ def api_house_search(request):
             'sourcePdfName':      str(d.get('Source PDF Name', '')).strip(),
             'pageNoOfCard':       str(d.get('Page No of card', '')).strip(),
             'predictedReligion':  str(d.get('Predicted_Religion_Label', '')).strip(),
-            'religion':           str(d.get('Predicted_Religion_Label', '')).strip(),
+            'religion':           {'H': 'Hindu', 'M': 'Muslim', 'C': 'Christian', 'J': 'Jain', 'B': 'Buddhist', 'S': 'Sikh'}.get(str(d.get('Predicted_Religion_Label', '')).strip(), ''),
             'surveyed':           False,
         }
         house_map.setdefault(hn, []).append(member)
