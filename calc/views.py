@@ -3108,13 +3108,15 @@ def api_check_sir(request):
             # Sort: most fields matched first, then by composite score
             scored.sort(key=lambda x: (-len(x['matched_by']), -x['comp']))
             seen_sigs = set()
-            _confirmed_02_voterid = r02.get('voterid','') if in_2002 else ''
+            # NOTE: do NOT skip the confirmed 2002 record here.
+            # When in_2002=True (fuzzy match found via _gen_prefixes), record_2002 is
+            # returned separately in the response, but suggestions_2002 must ALSO
+            # include it so the frontend 2002 panel renders it correctly.
             for item in scored[:25]:
                 f   = item['flat']
                 doc = item['doc']
                 sig = (f['name'], f['house'])
                 if sig in seen_sigs: continue
-                if _confirmed_02_voterid and f['voterid'] == _confirmed_02_voterid: continue
                 seen_sigs.add(sig)
                 suggestions_2002.append({
                     'name':         f['name'],
