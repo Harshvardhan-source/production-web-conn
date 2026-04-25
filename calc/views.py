@@ -1292,22 +1292,13 @@ def api_save_survey(request):
         return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
 
     # ── Parse body — supports both JSON and multipart (when aadhaar photo sent) ──
-    # IMPORTANT: when multipart, all form fields arrive as a JSON blob in POST['data'].
-    # If 'data' is missing/empty we fall back to POST.dict() so nothing is silently lost.
     aadhaar_photo_file = None
     if request.content_type and 'multipart' in request.content_type:
-        raw_data = request.POST.get('data', '')
-        if raw_data:
-            try:
-                body = json.loads(raw_data)
-            except Exception:
-                body = {k: v for k, v in request.POST.dict().items() if k != 'csrfmiddlewaretoken'}
-        else:
-            # 'data' JSON field not found in FormData — fall back to individual POST fields
-            body = {k: v for k, v in request.POST.dict().items() if k != 'csrfmiddlewaretoken'}
-            print(f'[api_save_survey] WARNING: multipart but data field missing; POST keys={list(request.POST.keys())}')
+        try:
+            body = json.loads(request.POST.get('data', '{}'))
+        except Exception:
+            body = request.POST.dict()
         aadhaar_photo_file = request.FILES.get('aadhaar_photo')
-        print(f'[api_save_survey] multipart — photo={"yes" if aadhaar_photo_file else "no"} firstName={body.get("firstName")!r} voterid={body.get("voterid")!r}')
     else:
         try:
             body = json.loads(request.body)
@@ -1371,18 +1362,18 @@ def api_save_survey(request):
 
     data = {
         # ── Personal ──────────────────────────────────────────────
-        'firstName':        body.get('firstName') or '',
-        'middleName':       body.get('middleName') or '',
-        'lastName':         body.get('lastName') or '',
-        'addharNumber':     body.get('addharNumber') or '',
-        'contactNumber':    body.get('contactNumber') or '',
-        'serialNumber':     final_serial,
+        'firstName':        body.get('firstName'),
+        'middleName':       body.get('middleName'),
+        'lastName':         body.get('lastName'),
+        'addharNumber':     body.get('addharNumber'),
+        'contactNumber':    body.get('contactNumber'),
+        'serialNumber':     final_serial,           # ← from 2025 roll when available
         'serialSource':     '2025_roll' if serial_from_2025 is not None else 'manual',
         'dob':              dob_str,
         'age':              age,
-        'gender':           body.get('gender') or '',
-        'maritalStatus':    body.get('maritalStatus') or '',
-        'voterid':          voterid or (body.get('voterid') or ''),
+        'gender':           body.get('gender'),
+        'maritalStatus':    body.get('maritalStatus'),
+        'voterid':          voterid or body.get('voterid'),
 
         # ── Aadhaar photo (GCS URL if uploaded, else None) ─────────
         'aadhaarPhotoUrl':  None,
@@ -1403,11 +1394,11 @@ def api_save_survey(request):
         'currentAddress':     body.get('currentAddress')     if is_outstation else None,
 
         # ── Registered address ────────────────────────────────────
-        'wardNumber':       body.get('wardNumber') or '',
-        'houseNumber':      body.get('houseNumber') or '',
-        'address':          body.get('address') or '',
-        'areaType':         body.get('areaType') or '',
-        'homeType':         body.get('homeType') or '',
+        'wardNumber':       body.get('wardNumber'),
+        'houseNumber':      body.get('houseNumber'),
+        'address':          body.get('address'),
+        'areaType':         body.get('areaType'),
+        'homeType':         body.get('homeType'),
 
         # ── Financial ─────────────────────────────────────────────
         'annualIncome':     body.get('annualIncome'),
@@ -1455,11 +1446,11 @@ def api_save_survey(request):
     sir_category = 'UNKNOWN'   # will be stored on the survey record
     try:
         voterid_sir = (data.get('voterid') or '').strip().upper()
-        name_sir    = _norm(((data.get('firstName') or '') + ' ' + (data.get('lastName') or '')).strip())
-        house_sir   = _norm(data.get('houseNumber') or '')
-        ward_sir    = data.get('wardNumber') or ''
-        booth_sir   = str(data.get('boothNo') or '')
-        serial_sir  = data.get('serialNumber') or ''
+        name_sir    = _norm((data.get('firstName', '') + ' ' + data.get('lastName', '')).strip())
+        house_sir   = _norm(data.get('houseNumber', ''))
+        ward_sir    = data.get('wardNumber', '')
+        booth_sir   = str(data.get('boothNo', ''))
+        serial_sir  = data.get('serialNumber', '')
 
         sir_result = _run_sir_analysis(
             read_db  = get_db(),        # voter rolls (2002 / 2025) live here
@@ -1480,7 +1471,7 @@ def api_save_survey(request):
 
         # If additional suspicious flags were found, append that info
         if sir_result and sir_result.get('suspicious') and sir_category != 'SUSPICIOUS':
-            sir_category = (sir_category or 'UNKNOWN') + '+SUSPICIOUS'
+            sir_category = sir_category + '+SUSPICIOUS'
 
         print(f'[SIR] category={sir_category} for {voterid_sir or name_sir}')
 
@@ -1518,7 +1509,7 @@ def api_save_survey(request):
             else 'Name + house not matched in 2025 roll'
         )
         survey_db['NotFoundRecordSurvey'].insert_one(data)
-        print(f"[api_save_survey] Voter NOT in 2025 roll — saved to NotFoundRecordSurvey: voterid={voterid!r} firstName={data.get('firstName')!r} house={data.get('houseNumber')!r}")
+        print(f"[api_save_survey] Voter NOT in 2025 roll — saved to NotFoundRecordSurvey: {voterid or data.get('firstName')}")
         collection_used = 'NotFoundRecordSurvey'
     else:
         survey_db['SurveyRecords'].insert_one(data)
