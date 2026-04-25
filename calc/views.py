@@ -2251,6 +2251,16 @@ _PHONETIC_RULES = [
     ('LY','L'),('VY','V'),('WA','VA'),('WI','VI'),('WE','VE'),
 ]
 
+# ── Cache phonetic_norm: same name is normalised thousands of times per bulk run
+from functools import lru_cache as _lru_cache
+
+@_lru_cache(maxsize=4096)
+def _phonetic_norm(s: str) -> str:
+    for old, new in _PHONETIC_RULES:
+        s = s.replace(old, new)
+    return s.rstrip('A')
+
+
 # ── Multi-variant prefix generator ───────────────────────────────────────────
 # Generates all search-worthy prefix variants from a name token.
 # VEDHAVYAS → ['VEDHAVYAS', 'VEDAVYAS', 'VEDHAV', 'VEDAV', 'VED']
@@ -2292,16 +2302,6 @@ def _name_variants(token: str) -> tuple:
             seen.add(v)
             result.append(v)
     return tuple(result)
-
-# ── Cache phonetic_norm: same name is normalised thousands of times per bulk run
-from functools import lru_cache as _lru_cache
-
-@_lru_cache(maxsize=4096)
-def _phonetic_norm(s: str) -> str:
-    for old, new in _PHONETIC_RULES:
-        s = s.replace(old, new)
-    return s.rstrip('A')
-
 
 def _levenshtein_similarity(a: str, b: str) -> float:
     """Normalised Levenshtein (0-100). Only called when rapidfuzz unavailable."""
