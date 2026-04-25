@@ -1516,6 +1516,45 @@ def api_save_survey(request):
     data['sir_suspicious'] = bool(sir_result and sir_result.get('suspicious')) if sir_result else False
 
     # ── 5a. Upload Aadhaar photo to GCS if provided ───────────────────────────
+    # Diagnostic: always log what we received
+    print(f"[api_save_survey] aadhaar_photo_file={aadhaar_photo_file!r}, "
+          f"FILES_keys={list(request.FILES.keys())}, content_type={request.content_type!r}")
+
+    if not aadhaar_photo_file:
+        # Last-chance fallback: check if photo came as base64 string in JSON body
+        b64_photo = body.get('aadhaarPhotoBase64') or body.get('aadhaar_photo_base64')
+        if b64_photo:
+            import base64 as _b64, uuid as _uuid, io as _io
+            try:
+                # Strip data-URL prefix if present (e.g. "data:image/jpeg;base64,...")
+                if ',' in b64_photo:
+                    header, b64_photo = b64_photo.split(',', 1)
+                    content_type_b64 = header.split(':')[1].split(';')[0] if ':' in header else 'image/jpeg'
+                else:
+                    content_type_b64 = 'image/jpeg'
+                img_bytes = _b64.b64decode(b64_photo)
+                ext_map   = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp'}
+                ext       = ext_map.get(content_type_b64, '.jpg')
+                first     = (body.get('firstName') or 'unknown').replace(' ', '_').lower()
+                last      = (body.get('lastName')  or '').replace(' ', '_').lower()
+                blob_name = f"aadhaar_photos/{first}_{last}_{final_serial}_{_uuid.uuid4().hex[:8]}{ext}"
+
+                class _FakeDjangoFile:
+                    def __init__(self, data, name, ct):
+                        self._buf = _io.BytesIO(data)
+                        self.name = name
+                        self.content_type = ct
+                    def read(self, *a): return self._buf.read(*a)
+                    def seek(self, *a): return self._buf.seek(*a)
+
+                fake_file = _FakeDjangoFile(img_bytes, f"aadhaar{ext}", content_type_b64)
+                photo_url = _upload_to_gcs(fake_file, blob_name)
+                data['aadhaarPhotoUrl'] = photo_url
+                print(f"[api_save_survey] ✓ Aadhaar photo (base64 path) uploaded to GCS: {photo_url}")
+            except Exception as _b64_err:
+                data['aadhaarPhotoUrl'] = None
+                print(f"[api_save_survey] ✗ Aadhaar base64 GCS upload failed: {_b64_err}")
+
     if aadhaar_photo_file:
         try:
             import uuid as _uuid
@@ -1525,7 +1564,7 @@ def api_save_survey(request):
             blob_name = f"aadhaar_photos/{first}_{last}_{final_serial}_{_uuid.uuid4().hex[:8]}{ext}"
             photo_url = _upload_to_gcs(aadhaar_photo_file, blob_name)
             data['aadhaarPhotoUrl'] = photo_url
-            print(f"[api_save_survey] ✓ Aadhaar photo uploaded to GCS: {photo_url}")
+            print(f"[api_save_survey] ✓ Aadhaar photo (multipart path) uploaded to GCS: {photo_url}")
         except Exception as _photo_err:
             # Non-fatal — survey still saves, photo URL stays None
             data['aadhaarPhotoUrl'] = None
