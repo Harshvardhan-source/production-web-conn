@@ -2910,18 +2910,27 @@ def api_check_sir(request):
                     _id = str(d.get('_id',''))
                     if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
 
-            # 3) Name — multi-prefix strategy
+            # 3) Name — compound-first multi-prefix strategy (same fix as 2025)
             if name and len(name) >= 2:
                 _ntoks = name.split()
-                _ft    = _ntoks[0]                              # "ASHWITH"
-                _lt    = _ntoks[-1] if len(_ntoks) > 1 else '' # "KOTTARI"
+                _ft    = _ntoks[0]
+                _lt    = _ntoks[-1] if len(_ntoks) > 1 else ''
 
-                # a) Targeted: first 5-6 chars of first token → small set, ASHWIT guaranteed
-                if len(_ft) >= 4:
-                    _pfx_tgt = {'$regex': f'^{re.escape(_ft[:min(6,len(_ft))])}', '$options':'i'}
+                # 0) COMPOUND scan: '^ASHWITH.*KOTT' → guarantees exact compound-name match
+                if len(_ntoks) >= 2 and len(_ft) >= 3 and len(_lt) >= 3:
+                    _pfx_cmp = {'$regex': f'^{re.escape(_ft)}.*{re.escape(_lt[:4])}', '$options':'i'}
+                    for d in col_2002s.find(
+                        {'$or':[{'Voter Name':_pfx_cmp},{'Name':_pfx_cmp}]}, _PROJ_02s
+                    ).limit(20):
+                        _id = str(d.get('_id',''))
+                        if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
+
+                # a) Full first-token prefix — no truncation cap
+                if len(_ft) >= 3:
+                    _pfx_tgt = {'$regex': f'^{re.escape(_ft)}', '$options':'i'}
                     for d in col_2002s.find(
                         {'$or':[{'Voter Name':_pfx_tgt},{'Name':_pfx_tgt}]}, _PROJ_02s
-                    ).limit(80):
+                    ).limit(60):
                         _id = str(d.get('_id',''))
                         if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
 
@@ -3159,21 +3168,46 @@ def api_check_sir(request):
             oid = str(doc.get('_id',''))
             if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
 
-    # 3) Name — multi-prefix (same fix as 2002)
+    # 3) Name — compound-first multi-prefix strategy
+    #
+    # THE KEY FIX:
+    # Old code used '^ASHWIT' (6 chars) with limit 80.  Mangalore has 80+ voters
+    # starting with ASHWIT/ASHWITHA, so "ASHWITH KOTTARI" sits at position 81+ in
+    # MongoDB insertion order and is NEVER fetched — can't score what you don't retrieve.
+    #
+    # New order of scans (fastest → broadest):
+    #  0) COMPOUND — '^ASHWITH.*KOTT' → ≤20 results, guaranteed to include the target
+    #  a) FULL first-token  — '^ASHWITH' (not capped at 6)  → limit 60
+    #  b) Surname-first scan — '^KOTT'                      → limit 20
+    #  c) Broad 3-char fallback — '^ASH'                    → limit 30
     if name and len(name) >= 3:
         _25_ntoks = name.split()
         _25_ft    = _25_ntoks[0]
-        if len(_25_ft) >= 4:
-            _25_pfx_tgt = {'$regex': f'^{re.escape(_25_ft[:min(6,len(_25_ft))])}', '$options':'i'}
-            for doc in col_2025.find({'Name': _25_pfx_tgt}, _PROJ_SLIM).limit(80):
+        _25_lt    = _25_ntoks[-1] if len(_25_ntoks) > 1 else ''
+
+        # 0) Compound scan — full first token + last token prefix (e.g. ^ASHWITH.*KOTT)
+        #    Returns tiny set; always contains "ASHWITH KOTTARI" for "ASHWITH KOTTARY"
+        if len(_25_ntoks) >= 2 and len(_25_ft) >= 3 and len(_25_lt) >= 3:
+            _25_cpx = {'$regex': f'^{re.escape(_25_ft)}.*{re.escape(_25_lt[:4])}', '$options':'i'}
+            for doc in col_2025.find({'Name': _25_cpx}, _PROJ_SLIM).limit(20):
                 oid = str(doc.get('_id',''))
                 if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
-        _25_lt = _25_ntoks[-1] if len(_25_ntoks) > 1 else ''
+
+        # a) Full first-token prefix — uses complete token "ASHWITH" not truncated "ASHWIT"
+        if len(_25_ft) >= 3:
+            _25_pfx_tgt = {'$regex': f'^{re.escape(_25_ft)}', '$options':'i'}
+            for doc in col_2025.find({'Name': _25_pfx_tgt}, _PROJ_SLIM).limit(60):
+                oid = str(doc.get('_id',''))
+                if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
+
+        # b) Surname-first scan — catches "KOTTARI ASHWITH" style entries
         if _25_lt and len(_25_lt) >= 3:
             _25_pfx_sur = {'$regex': f'^{re.escape(_25_lt[:4])}', '$options':'i'}
             for doc in col_2025.find({'Name': _25_pfx_sur}, _PROJ_SLIM).limit(20):
                 oid = str(doc.get('_id',''))
                 if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
+
+        # c) Broad 3-char fallback (transliteration variants: ASHW→ASHV)
         _25_pfx3 = {'$regex': f'^{re.escape(name[:3])}', '$options':'i'}
         for doc in col_2025.find({'Name': _25_pfx3}, _PROJ_SLIM).limit(30):
             oid = str(doc.get('_id',''))
