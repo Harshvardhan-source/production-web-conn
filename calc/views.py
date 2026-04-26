@@ -1776,23 +1776,27 @@ def api_scheme_voter_list(request):
         body = json.loads(request.body)
     except Exception:
         body = request.POST.dict()
-    print("Received ward for scheme lookup:", body.get('ward'))
+
     ward = body.get('ward')
     if not ward:
         return JsonResponse({'success': False, 'message': 'Ward is required.'}, status=400)
 
-    db   = get_db1()
-    coll = db.get_collection('CollDB', codec_options=None)
+    # Resolve ward number → ward name (SurveyRecords stores wardNumber as a name string)
+    ward_name = WARD_NUM_TO_NAME.get(str(ward))
+    if not ward_name:
+        return JsonResponse({'success': False, 'message': f'Unknown ward: {ward}'}, status=400)
+
+    print(f"[api_scheme_voter_list] ward={ward} → wardName={ward_name}")
 
     try:
-        from pymongo import MongoClient as MC
-        client2 = MC(settings.MONGODB_URL, tls=True, tlsCAFile=certifi.where())
-        coll = client2['MainB']['CollDB']
-        docs = list(coll.find({'WARD_NO': int(ward)}).limit(200))
-    except Exception:
+        survey_db = get_survey_db()
+        docs = list(survey_db['SurveyRecords'].find({'wardNumber': ward_name}).limit(500))
+    except Exception as e:
+        print(f"[api_scheme_voter_list] SurveyRecords query error: {e}")
         docs = []
 
     voters = [bson_clean(d) for d in docs]
+    print(f"[api_scheme_voter_list] found {len(voters)} voters for ward '{ward_name}'")
     return JsonResponse({'success': True, 'voters': voters})
 
 
@@ -1806,13 +1810,34 @@ def api_view_scheme(request):
 
     voter_data = body.get('voterData', {})
 
-    analysing_cols = {
-        'Gender', 'MaritalStatus', 'EconomicStatus', 'EmploymentStatus',
-        'EmploymentType', 'Religion', 'Community', 'SubCategory', 'Education',
-        'EducationType', 'PhysicalStatus', 'HealthStatus', 'HomeType', 'AGE'
+    # Map SurveyRecords camelCase field names → scheme eligibility PascalCase keys
+    _SURVEY_TO_SCHEME = {
+        'gender':           'Gender',
+        'maritalStatus':    'MaritalStatus',
+        'economicStatus':   'EconomicStatus',
+        'employmentStatus': 'EmploymentStatus',
+        'employmentType':   'EmploymentType',
+        'religion':         'Religion',
+        'community':        'Community',
+        'subcategory':      'SubCategory',
+        'education':        'Education',
+        'educationtype':    'EducationType',
+        'healthStatus':     'HealthStatus',
+        'homeType':         'HomeType',
+        'age':              'AGE',
+        # differentlyAbled → PhysicalStatus mapping
+        'differentlyAbled': 'PhysicalStatus',
     }
 
-    filtered = {k: str(v) for k, v in voter_data.items() if k in analysing_cols and v is not None}
+    filtered = {}
+    for survey_key, scheme_key in _SURVEY_TO_SCHEME.items():
+        val = voter_data.get(survey_key)
+        if val is not None and str(val).strip() not in ('', 'None', 'null'):
+            # Convert differentlyAbled Yes/No → Disabled/Normal for scheme matching
+            if survey_key == 'differentlyAbled':
+                filtered[scheme_key] = 'Disabled' if str(val).strip().lower() == 'yes' else 'Normal'
+            else:
+                filtered[scheme_key] = str(val).strip()
 
     eligible = []
     try:
