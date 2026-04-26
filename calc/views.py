@@ -1769,6 +1769,21 @@ def api_save_deceased(request):
 
 # ─── SCHEMES ──────────────────────────────────────────────────────────────────
 
+# ── Ward name → ward number lookup (mirrors WARD_FULL_DATA in frontend) ───────
+_WARD_NAME_TO_NUM = {
+    'PADAVU': 21, 'DEREBAIL SOUTH': 24, 'DEREBAIL WEST': 25,
+    'DEREBAIL SOUTH WEST': 26, 'BOLOOR': 27, 'MANNAGUDDA': 28,
+    'KAMBLA': 29, 'KODIALBAIL': 30, 'BEJAI': 31, 'KADRI NORTH': 32,
+    'KADRI SOUTH': 33, 'SHIVBHAG': 34, 'PADAVU CENTRAL': 35,
+    'PADAVU POORVA': 36, 'MAROLI': 37, 'BENDUR': 38, 'FALNIR': 39,
+    'COURT': 40, 'CENTRAL': 41, 'DONGERKERY': 42, 'KUDROLI': 43,
+    'NAVAYATH': 44, 'PORT': 45, 'CANTONMENT': 46, 'MILAGRIS': 47,
+    'VALENCIA': 48, 'KANKANADY': 49, 'ALAPE DAKSHINA': 50,
+    'ALAPE UTTARA': 51, 'KANNUR': 52, 'BAJAL': 53, 'JEPPINAMUGER': 54,
+    'ATTAVARA': 55, 'MANGALADEVI': 56, 'HOIGE BAZAR': 57, 'BOLAR': 58,
+    'JEPPU': 59, 'BENGRE': 60,
+}
+
 @csrf_exempt
 @require_http_methods(['POST'])
 def api_scheme_voter_list(request):
@@ -1776,25 +1791,78 @@ def api_scheme_voter_list(request):
         body = json.loads(request.body)
     except Exception:
         body = request.POST.dict()
-    print("Received ward for scheme lookup:", body.get('ward'))
-    ward = body.get('ward')
+
+    ward = str(body.get('ward', '')).strip()
     if not ward:
         return JsonResponse({'success': False, 'message': 'Ward is required.'}, status=400)
 
-    db   = get_db1()
-    coll = db.get_collection('CollDB', codec_options=None)
-
+    # Frontend sends ward number (e.g. "25") — resolve to name ("DEREBAIL WEST")
+    ward_name = None
     try:
-        from pymongo import MongoClient as MC
-        client2 = MC(settings.MONGODB_URL, tls=True, tlsCAFile=certifi.where())
-        coll = client2['MainB']['CollDB']
-        docs = list(coll.find({'WARD_NO': int(ward)}).limit(200))
-    except Exception:
+        ward_num = int(ward)
+        for name, num in _WARD_NAME_TO_NUM.items():
+            if num == ward_num:
+                ward_name = name
+                break
+    except ValueError:
+        ward_name = ward.upper().strip()
+
+    if not ward_name:
+        ward_name = ward.upper().strip()
+
+    print(f"[api_scheme_voter_list] ward={ward!r} → ward_name={ward_name!r}")
+
+    # ── Query SurveyRecords on the survey cluster ──────────────────────────────
+    try:
+        survey_db = get_survey_db()
+        docs = list(survey_db['SurveyRecords'].find(
+            {'wardNumber': {'$regex': f'^{ward_name}$', '$options': 'i'}},
+        ).limit(500))
+    except Exception as e:
+        print(f"[api_scheme_voter_list] DB error: {e}")
         docs = []
 
-    voters = [bson_clean(d) for d in docs]
-    return JsonResponse({'success': True, 'voters': voters})
+    print(f"[api_scheme_voter_list] {len(docs)} records found for ward_name={ward_name!r}")
 
+    # Normalise SurveyRecords camelCase → PascalCase keys for scheme eligibility
+    voters = []
+    for d in docs:
+        d = bson_clean(d)
+        name = ' '.join(filter(None, [
+            d.get('firstName',''), d.get('middleName',''), d.get('lastName','')
+        ])).strip()
+        voters.append({
+            'Voter_Name':       name,
+            'VoterID':          d.get('voterid',''),
+            'House_No':         d.get('houseNumber',''),
+            'MobileNumber':     d.get('contactNumber',''),
+            'DOB':              d.get('dob',''),
+            'AGE':              str(d.get('age','')),
+            'Gender':           d.get('gender',''),
+            'Religion':         d.get('religion',''),
+            'Community':        d.get('community',''),
+            'SubCategory':      d.get('subcategory',''),
+            'EconomicStatus':   d.get('economicStatus',''),
+            'EmploymentStatus': d.get('employmentStatus',''),
+            'EmploymentType':   d.get('employmentType',''),
+            'HealthStatus':     d.get('healthStatus',''),
+            'PhysicalStatus':   'Yes' if d.get('differentlyAbled','').lower() == 'yes' else 'No',
+            'HomeType':         d.get('homeType',''),
+            'MaritalStatus':    d.get('maritalStatus',''),
+            'Education':        d.get('education',''),
+            'EducationType':    d.get('educationtype',''),
+            'AnnualIncome':     d.get('annualIncome',''),
+            'FamilyIncome':     d.get('familyIncome',''),
+            'WardNumber':       d.get('wardNumber',''),
+            'BoothNo':          d.get('boothNo',''),
+            'Address':          d.get('address',''),
+            'SchemesUsed':      d.get('schemesUsed',[]),
+            'IsHeadOfHouse':    d.get('isHeadOfHouse',''),
+            'Minority':         d.get('minority',''),
+            'Student':          d.get('student',''),
+        })
+
+    return JsonResponse({'success': True, 'voters': voters})
 
 @csrf_exempt
 @require_http_methods(['POST'])
