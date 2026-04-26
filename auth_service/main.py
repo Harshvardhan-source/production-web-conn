@@ -68,8 +68,8 @@ if not ALLOWED_ORIGINS:
         "http://localhost:5173",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
-        "https://production-web-conn.onrender.com",
-        "https://frontend-production-web.onrender.com"
+        "https://production-web-conn-0tsi.onrender.com",
+        "https://frontend-production-web-ux7k.onrender.com"
     ]
 
 app.add_middleware(

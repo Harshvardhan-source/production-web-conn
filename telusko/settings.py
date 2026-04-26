@@ -35,7 +35,7 @@ MIDDLEWARE = [
 
 # CORS - allow React dev server
 CORS_ALLOWED_ORIGINS = [
-    'https://frontend-production-web.onrender.com',
+    'https://frontend-production-web-ux7k.onrender.com',
     'http://localhost:3000',
     'http://127.0.0.1:3000',
    

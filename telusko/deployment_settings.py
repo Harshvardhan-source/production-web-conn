@@ -18,8 +18,8 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 # Django checks Origin header against this list on every POST/PUT/DELETE.
 CSRF_TRUSTED_ORIGINS = [
     f"https://{RENDER_HOST}",
-    "https://production-web-conn.onrender.com",      # Django backend
-    "https://frontend-production-web.onrender.com",  # React frontend (sends requests here)
+    "https://production-web-conn-0tsi.onrender.com",      # Django backend
+    "https://frontend-production-web-ux7k.onrender.com",  # React frontend (sends requests here)
 ]
 
 CSRF_COOKIE_SAMESITE  = 'None'   # cross-site cookie requires None in production
@@ -31,8 +31,8 @@ SESSION_COOKIE_SECURE   = True
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 CORS_ALLOWED_ORIGINS = [
-    "https://frontend-production-web.onrender.com",   # React frontend
-    "https://production-web-conn-1.onrender.com",     # FastAPI (if it calls Django)
+    "https://frontend-production-web-ux7k.onrender.com",   # React frontend
+    "https://production-web-conn-1-qoya.onrender.com",     # FastAPI (if it calls Django)
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
