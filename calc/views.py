@@ -261,35 +261,22 @@ def _user_from_request(request):
     """
     Extract JWT → get email → fetch full profile (role/status/ward/booth) from DB.
     Returns None if token is absent, invalid, or user not found.
-
-    Auth order:
-    1. cc_token cookie (JWT)
-    2. Authorization: Bearer <token> header (JWT) — used by axios AND by the
-       multipart fetch() upload which reads sessionStorage('cc_token') directly.
-    3. Django session fallback — safety net in case token is missing.
     """
     token = request.COOKIES.get('cc_token')
     if not token:
         auth_header = request.META.get('HTTP_AUTHORIZATION', '')
         if auth_header.startswith('Bearer '):
             token = auth_header[7:]
-
-    if token:
-        try:
-            payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-            email = payload.get('sub')
-            if email:
-                return _get_user_profile(email)
-        except pyjwt.PyJWTError:
-            pass
-
-    # ── Session fallback (multipart fetch() sends sessionid cookie) ────────────────
-    email = request.session.get('email')
-    if email:
-        print(f'[_user_from_request] session fallback → {email}')
-        return _get_user_profile(email)
-
-    return None
+    if not token:
+        return None
+    try:
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        email = payload.get('sub')
+        if not email:
+            return None
+        return _get_user_profile(email)   # full profile with role/status/ward/booth
+    except pyjwt.PyJWTError:
+        return None
 
 
 
@@ -1529,55 +1516,20 @@ def api_save_survey(request):
     data['sir_suspicious'] = bool(sir_result and sir_result.get('suspicious')) if sir_result else False
 
     # ── 5a. Upload Aadhaar photo to GCS if provided ───────────────────────────
-    print(f"[api_save_survey] FILES={list(request.FILES.keys())} "
-          f"content_type={request.content_type!r} "
-          f"aadhaar_file={aadhaar_photo_file!r}")
-
-    def _do_gcs_upload(file_obj):
-        import uuid as _uuid
-        first     = (body.get('firstName') or 'unknown').replace(' ', '_').lower()
-        last      = (body.get('lastName')  or '').replace(' ', '_').lower()
-        ext       = os.path.splitext(file_obj.name)[1].lower() or '.jpg'
-        blob_name = f"aadhaar_photos/{first}_{last}_{final_serial}_{_uuid.uuid4().hex[:8]}{ext}"
-        return _upload_to_gcs(file_obj, blob_name)
-
     if aadhaar_photo_file:
-        # Primary path — file arrived via multipart/form-data
         try:
-            photo_url = _do_gcs_upload(aadhaar_photo_file)
+            import uuid as _uuid, os as _os
+            first = (body.get('firstName') or 'unknown').replace(' ', '_').lower()
+            last  = (body.get('lastName')  or '').replace(' ', '_').lower()
+            ext   = _os.path.splitext(aadhaar_photo_file.name)[1].lower() or '.jpg'
+            blob_name = f"aadhaar_photos/{first}_{last}_{final_serial}_{_uuid.uuid4().hex[:8]}{ext}"
+            photo_url = _upload_to_gcs(aadhaar_photo_file, blob_name)
             data['aadhaarPhotoUrl'] = photo_url
-            print(f"[api_save_survey] ✓ Aadhaar (multipart) → GCS: {photo_url}")
+            print(f"[api_save_survey] ✓ Aadhaar photo uploaded to GCS: {photo_url}")
         except Exception as _photo_err:
+            # Non-fatal — survey still saves, photo URL stays None
             data['aadhaarPhotoUrl'] = None
             print(f"[api_save_survey] ✗ Aadhaar GCS upload failed: {_photo_err}")
-    else:
-        # Fallback — photo sent as base64 string in JSON body
-        b64_photo = body.get('aadhaarPhotoBase64') or body.get('aadhaar_photo_base64')
-        if b64_photo:
-            import base64 as _b64, io as _io
-            try:
-                header, b64_data = (b64_photo.split(',', 1) if ',' in b64_photo
-                                    else ('data:image/jpeg;base64', b64_photo))
-                ct_b64  = header.split(':')[1].split(';')[0] if ':' in header else 'image/jpeg'
-                ext_map = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp'}
-                ext     = ext_map.get(ct_b64, '.jpg')
-
-                class _BytesFile:
-                    def __init__(self, data, name, ct):
-                        self._buf = _io.BytesIO(data)
-                        self.name, self.content_type = name, ct
-                    def read(self, *a): return self._buf.read(*a)
-                    def seek(self, *a): return self._buf.seek(*a)
-                    def chunks(self): yield self._buf.read()
-
-                photo_url = _do_gcs_upload(_BytesFile(_b64.b64decode(b64_data), f'aadhaar{ext}', ct_b64))
-                data['aadhaarPhotoUrl'] = photo_url
-                print(f"[api_save_survey] ✓ Aadhaar (base64 fallback) → GCS: {photo_url}")
-            except Exception as _b64_err:
-                data['aadhaarPhotoUrl'] = None
-                print(f"[api_save_survey] ✗ Aadhaar base64 GCS upload failed: {_b64_err}")
-        else:
-            print('[api_save_survey] ℹ No aadhaar photo received (no multipart file, no base64).')
 
     # ── 5b. Always save directly to SurveyRecords ────────────────────────────
     survey_db['SurveyRecords'].insert_one(data)
