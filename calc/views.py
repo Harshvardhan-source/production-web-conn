@@ -1388,6 +1388,7 @@ def api_save_survey(request):
         'contactNumber':    _val('contactNumber'),
         'serialNumber':     final_serial,
         'serialSource':     'manual',
+        'serialNo_voterlist': _val('serialNo_voterlist'),
         'dob':              dob_str,
         'age':              age,
         'gender':           _val('gender'),
