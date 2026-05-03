@@ -4423,6 +4423,163 @@ def api_admin_enable(request):
     return JsonResponse({'success': True, 'message': f'Access restored for {target_email}.'})
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# QUERY STACK API — serves QuerySwotTab in Swot.jsx
+# Collections: Data.ConstituencyQueryStack  /  Data.WardWiseQueryStack
+# Add to urls.py:
+#   path('api/query-stack/wards/',               views.api_query_stack_wards),
+#   path('api/query-stack/constituency/',        views.api_query_stack_constituency),
+#   path('api/query-stack/ward/<int:ward_no>/',  views.api_query_stack_ward),
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_QUERY_STACK_DB_NAME  = 'Data'
+_CONSTITUENCY_NUMBER  = 175
+_CONSTITUENCY_NAME    = 'Mangalore South'
+_QUERY_CHUNK_SIZE     = 500     # must match pipeline that wrote the data
+_QUERY_STRIP_FIELDS   = {'comparableQueries', '_id'}   # heavy, not needed in UI
+
+# Per-scope cache: { scope_key: {'data': [...], 'ts': float} }
+_qs_cache     = {}
+_QS_CACHE_TTL = 120   # seconds
+
+
+def _qs_get_db():
+    """Return the 'Data' database on the survey cluster (same Mongo URI)."""
+    return _get_survey_client().get_database(_QUERY_STACK_DB_NAME)
+
+
+def _qs_sanitize(obj):
+    """Recursively strip heavy fields and convert ObjectIds."""
+    if isinstance(obj, dict):
+        return {k: _qs_sanitize(v) for k, v in obj.items()
+                if k not in _QUERY_STRIP_FIELDS}
+    if isinstance(obj, list):
+        return [_qs_sanitize(i) for i in obj]
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    return obj
+
+
+def _qs_reassemble(col, filter_q: dict) -> list:
+    """Pull all chunk docs, sort by chunkIndex, return flat query list."""
+    import time as _t
+    chunks  = list(col.find(filter_q, {'_id': 0}).sort('chunkIndex', 1))
+    queries = []
+    for chunk in chunks:
+        for q in chunk.get('queries', []):
+            queries.append(_qs_sanitize(q))
+    return queries
+
+
+# ── GET /api/query-stack/wards/ ───────────────────────────────────────────────
+@require_http_methods(['GET'])
+def api_query_stack_wards(request):
+    """Return list of wards available in WardWiseQueryStack."""
+    import time as _t
+    cache_key = 'wards'
+    cached = _qs_cache.get(cache_key)
+    if cached and (_t.time() - cached['ts']) < _QS_CACHE_TTL:
+        return JsonResponse({'wards': cached['data']})
+    try:
+        db  = _qs_get_db()
+        col = db['WardWiseQueryStack']
+        docs = list(col.find(
+            {'chunkIndex': 0},
+            {'_id': 0, 'wardNumber': 1, 'wardName': 1, 'totalQueries': 1}
+        ).sort('wardNumber', 1))
+        wards = [
+            {
+                'wardNumber':   d.get('wardNumber'),
+                'wardName':     d.get('wardName', f"Ward {d.get('wardNumber')}"),
+                'totalQueries': d.get('totalQueries', 0),
+            }
+            for d in docs
+        ]
+        _qs_cache[cache_key] = {'data': wards, 'ts': _t.time()}
+        return JsonResponse({'wards': wards})
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'error': str(exc)}, status=500)
+
+
+# ── GET /api/query-stack/constituency/ ────────────────────────────────────────
+@require_http_methods(['GET'])
+def api_query_stack_constituency(request):
+    """Return all queries for Mangalore South from ConstituencyQueryStack."""
+    import time as _t
+    cache_key = f'constituency_{_CONSTITUENCY_NUMBER}'
+    cached = _qs_cache.get(cache_key)
+    if cached and (_t.time() - cached['ts']) < _QS_CACHE_TTL:
+        return JsonResponse({
+            'constituencyName':   _CONSTITUENCY_NAME,
+            'constituencyNumber': _CONSTITUENCY_NUMBER,
+            'totalQueries':       len(cached['data']),
+            'queries':            cached['data'],
+        })
+    try:
+        db  = _qs_get_db()
+        col = db['ConstituencyQueryStack']
+        filter_q = {
+            'constituencyNumber': _CONSTITUENCY_NUMBER,
+            'constituencyName':   _CONSTITUENCY_NAME,
+        }
+        queries = _qs_reassemble(col, filter_q)
+        _qs_cache[cache_key] = {'data': queries, 'ts': _t.time()}
+        return JsonResponse({
+            'constituencyName':   _CONSTITUENCY_NAME,
+            'constituencyNumber': _CONSTITUENCY_NUMBER,
+            'totalQueries':       len(queries),
+            'queries':            queries,
+        })
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'error': str(exc)}, status=500)
+
+
+# ── GET /api/query-stack/ward/<ward_no>/ ──────────────────────────────────────
+@require_http_methods(['GET'])
+def api_query_stack_ward(request, ward_no: int):
+    """Return all queries for a specific ward from WardWiseQueryStack."""
+    import time as _t
+    cache_key = f'ward_{ward_no}'
+    cached = _qs_cache.get(cache_key)
+    if cached and (_t.time() - cached['ts']) < _QS_CACHE_TTL:
+        return JsonResponse({
+            'wardNumber':   ward_no,
+            'wardName':     cached['meta']['wardName'],
+            'totalQueries': len(cached['data']),
+            'queries':      cached['data'],
+        })
+    try:
+        db  = _qs_get_db()
+        col = db['WardWiseQueryStack']
+        meta = col.find_one(
+            {'wardNumber': ward_no, 'chunkIndex': 0},
+            {'_id': 0, 'wardName': 1, 'totalQueries': 1}
+        )
+        if not meta:
+            return JsonResponse(
+                {'error': f'Ward {ward_no} not found in WardWiseQueryStack'},
+                status=404
+            )
+        queries = _qs_reassemble(col, {'wardNumber': ward_no})
+        _qs_cache[cache_key] = {
+            'data': queries,
+            'meta': {'wardName': meta.get('wardName', f'Ward {ward_no}')},
+            'ts': _t.time(),
+        }
+        return JsonResponse({
+            'wardNumber':   ward_no,
+            'wardName':     meta.get('wardName', f'Ward {ward_no}'),
+            'totalQueries': len(queries),
+            'queries':      queries,
+        })
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'error': str(exc)}, status=500)
+
 # ─── SESSION CHECK ────────────────────────────────────────────────────────────
 
 @require_http_methods(['GET'])
@@ -4439,184 +4596,3 @@ def api_me(request):
             'status':   user.get('status', 'pending'),
         })
     return JsonResponse({'loggedIn': False}, status=401)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# QUERY-BASED SWOT  — /api/query-swot/
-# Serves the QuerySwotTab in Swot.jsx
-# Reads from Data.ConstituencyQueryStack and Data.WardWiseQueryStack
-# (written by predict_query_stack.py / live_watcher.py)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_QUERY_SWOT_CONSTITUENCY_NUMBER = 175
-_QUERY_SWOT_CONSTITUENCY_NAME   = 'Mangalore South'
-
-# Ward number → name (mirrors WARD_FULL_DATA in pipeline scripts)
-_QS_WARD_NAMES = {
-    21:'PADAVU', 24:'DEREBAIL SOUTH', 25:'DEREBAIL WEST',
-    26:'DEREBAIL SOUTH WEST', 27:'BOLOOR', 28:'MANNAGUDDA',
-    29:'KAMBLA', 30:'KODIALBAIL', 31:'BEJAI', 32:'KADRI NORTH',
-    33:'KADRI SOUTH', 34:'SHIVBHAG', 35:'PADAVU CENTRAL',
-    36:'PADAVU POORVA', 37:'MAROLI', 38:'BENDUR', 39:'FALNIR',
-    40:'COURT', 41:'CENTRAL', 42:'DONGERKERY', 43:'KUDROLI',
-    44:'NAVAYATH', 45:'PORT', 46:'CANTONMENT', 47:'MILAGRIS',
-    48:'VALENCIA', 49:'KANKANADY', 50:'ALAPE DAKSHINA',
-    51:'ALAPE UTTARA', 52:'KANNUR', 53:'BAJAL', 54:'JEPPINAMUGER',
-    55:'ATTAVARA', 56:'MANGALADEVI', 57:'HOIGE BAZAR', 58:'BOLAR',
-    59:'JEPPU', 60:'BENGRE',
-}
-
-# Separate MongoClient for the Data DB (query stacks live here)
-_client_data = None
-
-def _get_data_client():
-    global _client_data
-    if _client_data is None:
-        import certifi as _c
-        _client_data = MongoClient(
-            _SURVEY_URL, tls=True, tlsCAFile=_c.where(),
-            maxPoolSize=5, minPoolSize=1,
-            serverSelectionTimeoutMS=5000, connectTimeoutMS=5000,
-        )
-    return _client_data
-
-def _get_data_db():
-    """Returns the 'Data' database that holds ConstituencyQueryStack / WardWiseQueryStack."""
-    return _get_data_client().get_database('SurveyDataBase')
-
-
-def _qs_reassemble(col, filter_q: dict) -> list:
-    """Pull all chunk documents, sort by chunkIndex, return flat query list."""
-    chunks = list(col.find(filter_q, {'_id': 0}).sort('chunkIndex', 1))
-    queries = []
-    for chunk in chunks:
-        queries.extend(chunk.get('queries', []))
-    return queries
-
-
-def _qs_slim(q: dict) -> dict:
-    """
-    Return a lightweight query dict for the frontend.
-    Drops comparableQueries (heavy / not needed by Swot.jsx).
-    """
-    return {
-        'routeKey':         q.get('routeKey', ''),
-        'columns':          q.get('columns', []),
-        'query':            q.get('query', {}),
-        'count':            q.get('count', 0),
-        'percentage':       round(float(q.get('percentage', 0) or 0), 2),
-        'label':            q.get('label', ''),
-        'labelBand':        q.get('labelBand', ''),
-        'predictedContext': q.get('predictedContext', {}),
-        'predictedAt':      str(q.get('predictedAt', '')),
-    }
-
-
-# Response cache: { cache_key: {'data': {...}, 'ts': float} }
-_qs_cache     = {}
-_QS_CACHE_TTL = 120  # seconds — query stacks change infrequently
-
-
-@require_http_methods(['GET'])
-def api_query_swot(request):
-    """
-    GET /api/query-swot/?scope=constituency
-    GET /api/query-swot/?scope=ward&ward=31
-    GET /api/query-swot/?scope=wardlist
-
-    Optional filter params (applied server-side for large datasets):
-      ?label=HA             — filter to single label
-      ?labelBand=H          — filter to H / M / L band
-    """
-    scope       = request.GET.get('scope', 'constituency').strip()
-    label_f     = request.GET.get('label',     '').strip().upper()
-    band_f      = request.GET.get('labelBand', '').strip().upper()
-
-    # ── Ward list — very cheap, skip cache ────────────────────────────────────
-    if scope == 'wardlist':
-        try:
-            db  = _get_data_db()
-            col = db['WardWiseQueryStack']
-            raw_wards = col.distinct('wardNumber')
-            wards = sorted(
-                [{'number': wn, 'name': _QS_WARD_NAMES.get(wn, f'Ward {wn}')}
-                 for wn in raw_wards if isinstance(wn, int)],
-                key=lambda w: w['number'],
-            )
-            return JsonResponse({'wards': wards})
-        except Exception as exc:
-            traceback.print_exc()
-            return JsonResponse({'error': str(exc)}, status=500)
-
-    # ── Build cache key ───────────────────────────────────────────────────────
-    ward_param = request.GET.get('ward', '').strip()
-    cache_key  = f'{scope}_{ward_param}_{label_f}_{band_f}'
-    cached     = _qs_cache.get(cache_key)
-    if cached and (_time.time() - cached['ts']) < _QS_CACHE_TTL:
-        return JsonResponse(cached['data'])
-
-    try:
-        db = _get_data_db()
-
-        # ── Constituency ──────────────────────────────────────────────────────
-        if scope == 'constituency':
-            col = db['ConstituencyQueryStack']
-            filter_q = {
-                'constituencyNumber': _QUERY_SWOT_CONSTITUENCY_NUMBER,
-                'constituencyName':   _QUERY_SWOT_CONSTITUENCY_NAME,
-            }
-            raw = _qs_reassemble(col, filter_q)
-
-            # Only queries that have been through the predictor
-            queries = [_qs_slim(q) for q in raw if q.get('predictedContext')]
-
-            # Optional label / band filter
-            if label_f:
-                queries = [q for q in queries if q['label'] == label_f]
-            elif band_f:
-                queries = [q for q in queries if q['labelBand'] == band_f]
-
-            payload = {
-                'scope':        'constituency',
-                'name':         _QUERY_SWOT_CONSTITUENCY_NAME,
-                'totalQueries': len(queries),
-                'queries':      queries,
-            }
-            _qs_cache[cache_key] = {'data': payload, 'ts': _time.time()}
-            return JsonResponse(payload)
-
-        # ── Ward ──────────────────────────────────────────────────────────────
-        if scope == 'ward':
-            if not ward_param:
-                return JsonResponse({'error': 'ward parameter required'}, status=400)
-            try:
-                ward_no = int(ward_param)
-            except ValueError:
-                return JsonResponse({'error': 'ward must be an integer'}, status=400)
-
-            col      = db['WardWiseQueryStack']
-            filter_q = {'wardNumber': ward_no}
-            raw      = _qs_reassemble(col, filter_q)
-
-            queries = [_qs_slim(q) for q in raw if q.get('predictedContext')]
-
-            if label_f:
-                queries = [q for q in queries if q['label'] == label_f]
-            elif band_f:
-                queries = [q for q in queries if q['labelBand'] == band_f]
-
-            ward_name = _QS_WARD_NAMES.get(ward_no, f'Ward {ward_no}')
-            payload = {
-                'scope':        'ward',
-                'wardNumber':   ward_no,
-                'name':         ward_name,
-                'totalQueries': len(queries),
-                'queries':      queries,
-            }
-            _qs_cache[cache_key] = {'data': payload, 'ts': _time.time()}
-            return JsonResponse(payload)
-
-        return JsonResponse({'error': f'Unknown scope: {scope}'}, status=400)
-
-    except Exception as exc:
-        traceback.print_exc()
-        return JsonResponse({'error': str(exc)}, status=500)
