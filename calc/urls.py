@@ -56,8 +56,9 @@ urlpatterns = [
     path('admin/update-role/',       views.api_admin_update_role,  name='api_admin_update_role'),
     path('api/admin/disable/', views.api_admin_disable, name='admin_disable'),
     path('api/admin/enable/',  views.api_admin_enable,  name='admin_enable'),
-    path('api/query-stack/wards/',               views.api_query_stack_wards),
-    path('api/query-stack/constituency/',        views.api_query_stack_constituency),
-    path('api/query-stack/ward/<int:ward_no>/',  views.api_query_stack_ward),
-]
+    
 
+    # ML Intelligence — ConstituencyQueryStack & WardWiseQueryStack
+    path('ml/constituency-swot/', views.api_ml_constituency_swot, name='api_ml_constituency_swot'),
+    path('ml/ward-swot/',         views.api_ml_ward_swot,         name='api_ml_ward_swot'),
+]

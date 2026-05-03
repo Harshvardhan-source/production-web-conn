@@ -4423,163 +4423,6 @@ def api_admin_enable(request):
     return JsonResponse({'success': True, 'message': f'Access restored for {target_email}.'})
 
 
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# QUERY STACK API — serves QuerySwotTab in Swot.jsx
-# Collections: Data.ConstituencyQueryStack  /  Data.WardWiseQueryStack
-# Add to urls.py:
-#   path('api/query-stack/wards/',               views.api_query_stack_wards),
-#   path('api/query-stack/constituency/',        views.api_query_stack_constituency),
-#   path('api/query-stack/ward/<int:ward_no>/',  views.api_query_stack_ward),
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_QUERY_STACK_DB_NAME  = 'Data'
-_CONSTITUENCY_NUMBER  = 175
-_CONSTITUENCY_NAME    = 'Mangalore South'
-_QUERY_CHUNK_SIZE     = 500     # must match pipeline that wrote the data
-_QUERY_STRIP_FIELDS   = {'comparableQueries', '_id'}   # heavy, not needed in UI
-
-# Per-scope cache: { scope_key: {'data': [...], 'ts': float} }
-_qs_cache     = {}
-_QS_CACHE_TTL = 120   # seconds
-
-
-def _qs_get_db():
-    """Return the 'Data' database on the survey cluster (same Mongo URI)."""
-    return _get_survey_client().get_database(_QUERY_STACK_DB_NAME)
-
-
-def _qs_sanitize(obj):
-    """Recursively strip heavy fields and convert ObjectIds."""
-    if isinstance(obj, dict):
-        return {k: _qs_sanitize(v) for k, v in obj.items()
-                if k not in _QUERY_STRIP_FIELDS}
-    if isinstance(obj, list):
-        return [_qs_sanitize(i) for i in obj]
-    if isinstance(obj, ObjectId):
-        return str(obj)
-    return obj
-
-
-def _qs_reassemble(col, filter_q: dict) -> list:
-    """Pull all chunk docs, sort by chunkIndex, return flat query list."""
-    import time as _t
-    chunks  = list(col.find(filter_q, {'_id': 0}).sort('chunkIndex', 1))
-    queries = []
-    for chunk in chunks:
-        for q in chunk.get('queries', []):
-            queries.append(_qs_sanitize(q))
-    return queries
-
-
-# ── GET /api/query-stack/wards/ ───────────────────────────────────────────────
-@require_http_methods(['GET'])
-def api_query_stack_wards(request):
-    """Return list of wards available in WardWiseQueryStack."""
-    import time as _t
-    cache_key = 'wards'
-    cached = _qs_cache.get(cache_key)
-    if cached and (_t.time() - cached['ts']) < _QS_CACHE_TTL:
-        return JsonResponse({'wards': cached['data']})
-    try:
-        db  = _qs_get_db()
-        col = db['WardWiseQueryStack']
-        docs = list(col.find(
-            {'chunkIndex': 0},
-            {'_id': 0, 'wardNumber': 1, 'wardName': 1, 'totalQueries': 1}
-        ).sort('wardNumber', 1))
-        wards = [
-            {
-                'wardNumber':   d.get('wardNumber'),
-                'wardName':     d.get('wardName', f"Ward {d.get('wardNumber')}"),
-                'totalQueries': d.get('totalQueries', 0),
-            }
-            for d in docs
-        ]
-        _qs_cache[cache_key] = {'data': wards, 'ts': _t.time()}
-        return JsonResponse({'wards': wards})
-    except Exception as exc:
-        traceback.print_exc()
-        return JsonResponse({'error': str(exc)}, status=500)
-
-
-# ── GET /api/query-stack/constituency/ ────────────────────────────────────────
-@require_http_methods(['GET'])
-def api_query_stack_constituency(request):
-    """Return all queries for Mangalore South from ConstituencyQueryStack."""
-    import time as _t
-    cache_key = f'constituency_{_CONSTITUENCY_NUMBER}'
-    cached = _qs_cache.get(cache_key)
-    if cached and (_t.time() - cached['ts']) < _QS_CACHE_TTL:
-        return JsonResponse({
-            'constituencyName':   _CONSTITUENCY_NAME,
-            'constituencyNumber': _CONSTITUENCY_NUMBER,
-            'totalQueries':       len(cached['data']),
-            'queries':            cached['data'],
-        })
-    try:
-        db  = _qs_get_db()
-        col = db['ConstituencyQueryStack']
-        filter_q = {
-            'constituencyNumber': _CONSTITUENCY_NUMBER,
-            'constituencyName':   _CONSTITUENCY_NAME,
-        }
-        queries = _qs_reassemble(col, filter_q)
-        _qs_cache[cache_key] = {'data': queries, 'ts': _t.time()}
-        return JsonResponse({
-            'constituencyName':   _CONSTITUENCY_NAME,
-            'constituencyNumber': _CONSTITUENCY_NUMBER,
-            'totalQueries':       len(queries),
-            'queries':            queries,
-        })
-    except Exception as exc:
-        traceback.print_exc()
-        return JsonResponse({'error': str(exc)}, status=500)
-
-
-# ── GET /api/query-stack/ward/<ward_no>/ ──────────────────────────────────────
-@require_http_methods(['GET'])
-def api_query_stack_ward(request, ward_no: int):
-    """Return all queries for a specific ward from WardWiseQueryStack."""
-    import time as _t
-    cache_key = f'ward_{ward_no}'
-    cached = _qs_cache.get(cache_key)
-    if cached and (_t.time() - cached['ts']) < _QS_CACHE_TTL:
-        return JsonResponse({
-            'wardNumber':   ward_no,
-            'wardName':     cached['meta']['wardName'],
-            'totalQueries': len(cached['data']),
-            'queries':      cached['data'],
-        })
-    try:
-        db  = _qs_get_db()
-        col = db['WardWiseQueryStack']
-        meta = col.find_one(
-            {'wardNumber': ward_no, 'chunkIndex': 0},
-            {'_id': 0, 'wardName': 1, 'totalQueries': 1}
-        )
-        if not meta:
-            return JsonResponse(
-                {'error': f'Ward {ward_no} not found in WardWiseQueryStack'},
-                status=404
-            )
-        queries = _qs_reassemble(col, {'wardNumber': ward_no})
-        _qs_cache[cache_key] = {
-            'data': queries,
-            'meta': {'wardName': meta.get('wardName', f'Ward {ward_no}')},
-            'ts': _t.time(),
-        }
-        return JsonResponse({
-            'wardNumber':   ward_no,
-            'wardName':     meta.get('wardName', f'Ward {ward_no}'),
-            'totalQueries': len(queries),
-            'queries':      queries,
-        })
-    except Exception as exc:
-        traceback.print_exc()
-        return JsonResponse({'error': str(exc)}, status=500)
-
 # ─── SESSION CHECK ────────────────────────────────────────────────────────────
 
 @require_http_methods(['GET'])
@@ -4596,3 +4439,113 @@ def api_me(request):
             'status':   user.get('status', 'pending'),
         })
     return JsonResponse({'loggedIn': False}, status=401)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ML INTELLIGENCE — ConstituencyQueryStack & WardWiseQueryStack endpoints
+# Returns all query objects (with predictedContext) for SWOT display in React.
+# ─────────────────────────────────────────────────────────────────────────────
+
+CONSTITUENCY_NAME   = "Mangalore South"
+CONSTITUENCY_NUMBER = 175
+ML_CHUNK_SIZE       = 500   # must match predict_query_stack.py
+
+def _get_ml_db():
+    """Return (db) for SurveyDataBase."""
+    client = MongoClient(settings.MONGO_URI, tlsCAFile=certifi.where(),
+                         serverSelectionTimeoutMS=15_000)
+    return client["SurveyDataBase"]
+
+
+def _reassemble_chunks(col, filter_q: dict) -> list:
+    """Pull all chunks matching filter_q, sort by chunkIndex, return flat list."""
+    chunks = list(col.find(filter_q, {"_id": 0}).sort("chunkIndex", 1))
+    queries = []
+    for chunk in chunks:
+        queries.extend(chunk.get("queries", []))
+    return queries
+
+
+def _sanitise_queries(queries: list) -> list:
+    """
+    Prepare query objects for JSON serialisation.
+    - Remove datetime fields (predictedAt)
+    - Keep: routeKey, columns, query, count, percentage, label, labelBand, predictedContext
+    """
+    out = []
+    for q in queries:
+        entry = {
+            "routeKey":        q.get("routeKey", ""),
+            "columns":         q.get("columns", []),
+            "query":           q.get("query", {}),
+            "count":           q.get("count", 0),
+            "percentage":      round(float(q.get("percentage", 0)), 2),
+            "label":           q.get("label", ""),
+            "labelBand":       q.get("labelBand", ""),
+            "predictedContext": {k: str(v) for k, v in
+                                 q.get("predictedContext", {}).items()
+                                 if not isinstance(v, datetime)},
+        }
+        out.append(entry)
+    return out
+
+
+@require_http_methods(["GET"])
+def api_ml_constituency_swot(request):
+    """
+    GET /api/ml/constituency-swot/
+    Returns all predicted queries for Mangalore South constituency.
+    """
+    user = _user_from_request(request)
+    if not user:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+    try:
+        db  = _get_ml_db()
+        col = db["ConstituencyQueryStack"]
+        queries = _reassemble_chunks(col, {
+            "constituencyNumber": CONSTITUENCY_NUMBER,
+            "constituencyName":   CONSTITUENCY_NAME,
+        })
+        return JsonResponse({
+            "scope":               "constituency",
+            "constituencyName":    CONSTITUENCY_NAME,
+            "constituencyNumber":  CONSTITUENCY_NUMBER,
+            "totalQueries":        len(queries),
+            "queries":             _sanitise_queries(queries),
+        })
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
+
+
+@require_http_methods(["GET"])
+def api_ml_ward_swot(request):
+    """
+    GET /api/ml/ward-swot/?ward=<wardNumber>
+    Returns all predicted queries for a specific ward.
+    """
+    user = _user_from_request(request)
+    if not user:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    ward_param = request.GET.get("ward", "").strip()
+    if not ward_param:
+        return JsonResponse({"error": "ward parameter required"}, status=400)
+
+    try:
+        ward_no = int(ward_param)
+    except ValueError:
+        return JsonResponse({"error": "ward must be an integer"}, status=400)
+
+    try:
+        db        = _get_ml_db()
+        col       = db["WardWiseQueryStack"]
+        queries   = _reassemble_chunks(col, {"wardNumber": ward_no})
+        ward_name = WARD_NUM_TO_NAME.get(ward_no, f"Ward {ward_no}")
+        return JsonResponse({
+            "scope":        "ward",
+            "wardNumber":   ward_no,
+            "wardName":     ward_name,
+            "totalQueries": len(queries),
+            "queries":      _sanitise_queries(queries),
+        })
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
