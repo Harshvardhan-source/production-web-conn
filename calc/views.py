@@ -786,10 +786,6 @@ def api_dashboard(request):
 _ward_dash_cache = {}   # { ward_str: {'data': {...}, 'ts': float} }
 _WARD_CACHE_TTL  = 300  # 5 minutes
 
-# ── SIR preview cache — read-only check results, keyed by (name,voterid,house,relation)
-_SIR_PREVIEW_CACHE     = {}   # { tuple: {'data': {...}, 'ts': float} }
-_SIR_PREVIEW_CACHE_TTL = 120  # 2 minutes — voter rolls don't change during a session
-
 
 @require_http_methods(['GET'])
 def api_ward_dashboard(request):
@@ -2621,15 +2617,26 @@ def _get_xlsx():
 threading.Thread(target=_get_xlsx, daemon=True).start()   # ← ADD THIS LINE
 # ── Lookup helpers ────────────────────────────────────────────────────────────
 
+def _build_name_or_query_25(name_prefixes):
+    """
+    Build a single $or query that matches any of the given name prefixes.
+    ONE round-trip instead of one per prefix variant.
+    """
+    return {'$or': [
+        {'Name': {'$regex': f'^{re.escape(p)}', '$options': 'i'}}
+        for p in name_prefixes
+    ]}
+
+
 def _find_voter_in_2025(col, voterid, name, house, relation=''):
     """
     Look up a voter in the MongoDB 2025 collection.
 
     Tier 1 — EPIC No       (exact, indexed — O(1))
-    Tier 2 — Exact regex   (name + house — fast, catches clean data)
-    Tier 3 — Fuzzy match   (all voters in same house → score each → best ≥ 80)
-                           handles: Vishvanath/Vishwanath, Lakshmi/Laxmi, etc.
-    Tier 4 — Fuzzy name-only (no house available — top-3 candidates across DB)
+    Tier 2 — Exact regex   (name + house — fast)
+    Tier 3 — Fuzzy house   (all at same house → score → best ≥ threshold)
+    Tier 3b — House prefix fuzzy
+    Tier 4 — ALL phonetic prefix variants in ONE batched $or query (was N queries)
     """
     # Tier 1: EPIC No exact
     if voterid:
@@ -2648,7 +2655,7 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
 
     _PROJ_25 = {'Name':1,'Relation Name':1,'Epic NO':1,'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1}
 
-    # Tier 3: fuzzy — all voters at same house (projection → less network transfer)
+    # Tier 3: fuzzy — all voters at same house
     if house and (name or relation):
         candidates = list(col.find({'House No': house}, _PROJ_25))
         if candidates:
@@ -2656,7 +2663,7 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
             if best_doc and best_score >= _FUZZY_THRESHOLD:
                 return bson_clean(best_doc)
 
-    # Tier 3b: house prefix fuzzy — catches "2-14-1223" when record is "2-14-1223/1"
+    # Tier 3b: house prefix fuzzy
     if house and (name or relation):
         house_pfx_rx = {'$regex': f'^{re.escape(house)}', '$options': 'i'}
         candidates = list(col.find({'House No': house_pfx_rx}, _PROJ_25).limit(30))
@@ -2665,19 +2672,13 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
             if best_doc and best_score >= _FUZZY_THRESHOLD:
                 return bson_clean(best_doc)
 
-    # Tier 4: phonetic-aware prefix → fuzzy, tries all variant prefixes
+    # Tier 4: ALL phonetic prefix variants in ONE batched query (was one query per variant)
     if name:
         _ft4 = name.split()[0]
-        _seen_tier4 = set()
-        all_candidates = []
-        for _pfx_v in _gen_prefixes(_ft4):
-            for doc in col.find(
-                {'Name': {'$regex': f'^{re.escape(_pfx_v)}', '$options': 'i'}}, _PROJ_25
-            ).limit(40):
-                oid = str(doc.get('_id',''))
-                if oid not in _seen_tier4:
-                    _seen_tier4.add(oid)
-                    all_candidates.append(doc)
+        all_prefixes = _gen_prefixes(_ft4)
+        # Single $or query instead of a loop of individual regex queries
+        batch_q = _build_name_or_query_25(all_prefixes)
+        all_candidates = list(col.find(batch_q, _PROJ_25).limit(120))
         if all_candidates:
             best_doc, best_score = _score_candidates(all_candidates, _flat_2025, name, relation)
             if best_doc and best_score >= _FUZZY_THRESHOLD:
@@ -2686,21 +2687,28 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
     return None
 
 
+def _build_name_or_query_02(name_prefixes):
+    """Single $or for all name prefix variants across both 2002 field name schemas."""
+    clauses = []
+    for p in name_prefixes:
+        rx = {'$regex': f'^{re.escape(p)}', '$options': 'i'}
+        clauses.append({'Voter Name': rx})
+        clauses.append({'Name': rx})
+    return {'$or': clauses}
+
+
 def _find_voter_in_2002(col, voterid, name, house, relation=''):
     """
     Look up a voter in MongoDB SurveyDataBase.2002.
-
-    Schema-agnostic: handles BOTH old field names (Name / House No / Epic NO /
-    Relation Name) and new field names (Voter Name / House / Flat No /
-    Voter ID / EPIC No / Relative Name).
+    Schema-agnostic: handles both old (Name/House No) and new (Voter Name/House / Flat No) fields.
 
     Tier 1 — EPIC exact          (both field name variants)
     Tier 2 — Exact regex         (name + house, schema-agnostic)
-    Tier 3 — Fuzzy house         (all docs at same house, threshold 60 — house
-                                   already narrows candidates enough)
-    Tier 4 — Relation + house    (when name is very different, match by relation)
-    Tier 5 — Fuzzy prefix        (name prefix scan, 60 docs, adaptive threshold)
-    Tier 6 — House-only fallback (best name match within same house, threshold 50)
+    Tier 3 — Fuzzy house         (all docs at same house)
+    Tier 3b — House prefix fuzzy
+    Tier 4 — Relation + house
+    Tier 5 — ALL phonetic prefix variants in ONE batched $or query (was N queries)
+    Tier 6 — House-only fallback
     """
     _PROJ_02 = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
                 'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,'Gender':1,'Age':1}
@@ -2724,7 +2732,7 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
         if doc:
             return bson_clean(doc)
 
-    # Tier 3: fuzzy within same house — threshold 60 (house confirms locality)
+    # Tier 3: fuzzy within same house
     if house and (name or relation):
         candidates = list(col.find(_house_q(house), _PROJ_02))
         if candidates:
@@ -2732,7 +2740,7 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
             if best_doc and best_score >= 60:
                 return bson_clean(best_doc)
 
-    # Tier 3b: house prefix fuzzy — catches "2-14-1223" when record is stored as "2-14-1223/1"
+    # Tier 3b: house prefix fuzzy
     if house and (name or relation):
         house_pfx_rx = {'$regex': f'^{re.escape(house)}', '$options': 'i'}
         pfx_q = {'$or': [{'House / Flat No': house_pfx_rx}, {'House No': house_pfx_rx}]}
@@ -2742,7 +2750,7 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
             if best_doc and best_score >= 60:
                 return bson_clean(best_doc)
 
-    # Tier 4: relation prefix + same house (catches cases where name spelling is very different)
+    # Tier 4: relation prefix + same house
     if relation and house and len(relation) >= 3:
         rpx = {'$regex': f'^{re.escape(relation[:4])}', '$options': 'i'}
         candidates = list(col.find({'$and': [
@@ -2754,28 +2762,19 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
             if best_doc and best_score >= 55:
                 return bson_clean(best_doc)
 
-    # Tier 5: phonetic-aware prefix scan — tries all variant prefixes
+    # Tier 5: ALL phonetic prefix variants in ONE batched $or query (was N queries)
     if name and len(name) >= 3:
         _ft5 = name.split()[0]
-        _seen_tier5 = set()
-        all_candidates_02 = []
-        for _pfx_v in _gen_prefixes(_ft5):
-            px = {'$regex': f'^{re.escape(_pfx_v)}', '$options': 'i'}
-            for doc in col.find(
-                {'$or': [{'Voter Name': px}, {'Name': px}]}, _PROJ_02
-            ).limit(40):
-                oid = str(doc.get('_id',''))
-                if oid not in _seen_tier5:
-                    _seen_tier5.add(oid)
-                    all_candidates_02.append(doc)
+        all_prefixes = _gen_prefixes(_ft5)
+        batch_q = _build_name_or_query_02(all_prefixes)
+        all_candidates_02 = list(col.find(batch_q, _PROJ_02).limit(120))
         if all_candidates_02:
             best_doc, best_score = _score_candidates(all_candidates_02, _flat_2002, name, relation)
-            # Lower threshold when house is also known (double-confirms the match)
             threshold = 68 if house else _FUZZY_THRESHOLD
             if best_doc and best_score >= threshold:
                 return bson_clean(best_doc)
 
-    # Tier 6: house-only fallback — any doc at same house with name score ≥ 50
+    # Tier 6: house-only fallback
     if house and name:
         candidates = list(col.find(_house_q(house), _PROJ_02).limit(30))
         if candidates:
@@ -3012,21 +3011,102 @@ def api_check_sir(request):
         sir = _run_sir_analysis(voterid, name, house, ward, booth, serial, relation, db=db)
         return JsonResponse({'success': True, **sir})
 
-    # ── Cache key for read-only preview — avoid re-running the same query ────
-    _sir_cache_key = (name, voterid, house, relation)
-    _sir_cached    = _SIR_PREVIEW_CACHE.get(_sir_cache_key)
-    if _sir_cached and (_time.time() - _sir_cached['ts']) < _SIR_PREVIEW_CACHE_TTL:
-        return JsonResponse(_sir_cached['data'])
+    # ── Read-only preview (no DB writes) ──────────────────────────────────────
     col_2025 = db['2025']
     col_2002 = db['2002']
 
-    # Run 2025 and 2002 lookups in parallel threads — each is an independent query
+    # ── Pre-compute prefix variants ONCE — used by all 4 parallel phases ──────
+    _name_prefixes    = _gen_prefixes(name.split()[0]) if name else ()
+    _PROJ_25_slim     = {'Name':1,'Relation Name':1,'Epic NO':1,'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1}
+    _PROJ_02_slim     = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
+                         'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,'Gender':1,'Age':1,
+                         'Booth No':1,'Part No':1,'Serial No':1}
+
+    # ── Phase 1+2: confirmed match lookups (unchanged — already parallel) ─────
     _res = [None, None]
     def _t25(): _res[0] = _find_voter_in_2025(col_2025, voterid, name, house, relation)
     def _t02(): _res[1] = _find_voter_in_2002(col_2002, voterid, name, house, relation)
-    _ta = threading.Thread(target=_t25, daemon=True)
-    _tb = threading.Thread(target=_t02, daemon=True)
-    _ta.start(); _tb.start(); _ta.join(); _tb.join()
+
+    # ── Phase 3: suggestions_2002 — ONE batched query instead of N per variant ─
+    _sugg02_raw = []
+    def _t_sugg02():
+        try:
+            seen_ids = set()
+
+            def _add(docs):
+                for d in docs:
+                    _id = str(d.get('_id',''))
+                    if _id not in seen_ids:
+                        seen_ids.add(_id); _sugg02_raw.append(d)
+
+            if voterid:
+                _add(col_2002.find(
+                    {'$or':[{'Voter ID / EPIC No':voterid},{'Epic NO':voterid}]}, _PROJ_02_slim
+                ).limit(5))
+
+            if house:
+                _add(col_2002.find(
+                    {'$or':[{'House / Flat No':house},{'House No':house}]}, _PROJ_02_slim
+                ).limit(40))
+                h_pfx = {'$regex': f'^{re.escape(house)}', '$options':'i'}
+                _add(col_2002.find(
+                    {'$or':[{'House / Flat No':h_pfx},{'House No':h_pfx}]}, _PROJ_02_slim
+                ).limit(40))
+
+            # ONE batched $or for ALL name prefix variants
+            if _name_prefixes:
+                batch_q_02 = _build_name_or_query_02(_name_prefixes)
+                _add(col_2002.find(batch_q_02, _PROJ_02_slim).limit(150))
+
+            if relation and len(relation) >= 2:
+                _frt = relation.split()[0]
+                rpfx = {'$regex': f'^{re.escape(_frt[:min(5,len(_frt))])}', '$options':'i'}
+                _add(col_2002.find(
+                    {'$or':[{'Relative Name':rpfx},{'Relation Name':rpfx}]}, _PROJ_02_slim
+                ).limit(60))
+        except Exception:
+            pass
+
+    # ── Phase 4: similar_2025 — ONE batched query instead of N per variant ────
+    _sim25_raw = []
+    def _t_sim25():
+        try:
+            seen_ids = set()
+
+            def _add(docs):
+                for d in docs:
+                    oid = str(d.get('_id',''))
+                    if oid not in seen_ids:
+                        seen_ids.add(oid); _sim25_raw.append(bson_clean(d))
+
+            if voterid:
+                _add(col_2025.find({'Epic NO': voterid}, _PROJ_25_slim).limit(5))
+
+            if house:
+                _add(col_2025.find({'House No': house}, _PROJ_25_slim).limit(20))
+                h_pfx = {'$regex': f'^{re.escape(house)}', '$options':'i'}
+                _add(col_2025.find({'House No': h_pfx}, _PROJ_25_slim).limit(20))
+
+            # ONE batched $or for ALL name prefix variants
+            if _name_prefixes:
+                batch_q_25 = _build_name_or_query_25(_name_prefixes)
+                _add(col_2025.find(batch_q_25, _PROJ_25_slim).limit(150))
+
+            if relation and len(relation) >= 3:
+                _frt = relation.split()[0]
+                rpfx = {'$regex': f'^{re.escape(_frt[:min(5,len(_frt))])}', '$options':'i'}
+                _add(col_2025.find({'Relation Name': rpfx}, _PROJ_25_slim).limit(40))
+        except Exception:
+            pass
+
+    # ── Launch ALL 4 phases in parallel ───────────────────────────────────────
+    _ta   = threading.Thread(target=_t25,       daemon=True)
+    _tb   = threading.Thread(target=_t02,       daemon=True)
+    _tc   = threading.Thread(target=_t_sugg02,  daemon=True)
+    _td   = threading.Thread(target=_t_sim25,   daemon=True)
+    _ta.start(); _tb.start(); _tc.start(); _td.start()
+    _ta.join();  _tb.join();  _tc.join();  _td.join()
+
     r25 = _flat_2025(_res[0])
     r02 = _flat_2002(_res[1])
 
@@ -3107,274 +3187,88 @@ def api_check_sir(request):
                 'value': net,
             })
 
-    # ── 2002 suggestions — always computed regardless of in_2002 ─────────────────
-    # When in_2002=True  → shows OTHER similar records beside the confirmed one.
-    # When in_2002=False → fuzzy candidates for manual confirmation.
-    #
-    # KEY FIX: Multi-prefix candidate strategy.
-    #   "ASHWITH KOTTARI" → 3-char prefix "ASH" with limit 80 misses "ASHWIT" if
-    #   80+ ASHOK/ASHWIN records come first.  We now ALSO run a targeted scan with
-    #   the first 5–6 chars of the first token ("ASHWI") which returns a tiny set
-    #   and always includes ASHWIT.
+    # ── Score suggestions_2002 from the pre-fetched raw candidates ────────────
+    has_name  = bool(name)
+    has_house = bool(house)
+    has_rel   = bool(relation)
+    has_epic  = bool(voterid)
+
     suggestions_2002 = []
-    if name or house or relation or voterid:
-        _PROJ_02s = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
-                     'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,'Gender':1,'Age':1,
-                     'Booth No':1,'Part No':1,'Serial No':1}
-        col_2002s = col_2002
+    scored_02 = []
+    seen_sigs_02 = set()
+    for doc in _sugg02_raw:
+        flat  = _flat_2002(doc)
+        n_sc  = _name_score(name, flat['name'])         if has_name  else 0.0
+        r_sc  = _name_score(relation, flat['relation']) if has_rel   else 0.0
+        h_ok  = (flat['house'].upper() == house.upper()) if has_house else False
+        e_ok  = bool(has_epic and flat['voterid'] and flat['voterid'].upper() == voterid.upper())
 
-        def _house_q2(h):
-            return {'$or': [{'House / Flat No': h}, {'House No': h}]}
+        if has_name and has_house and has_rel:
+            comp = 0.55*n_sc + 0.25*r_sc + 0.20*(100.0 if h_ok else 0.0)
+        elif has_name and has_house:
+            comp = 0.70*n_sc + 0.30*(100.0 if h_ok else 0.0)
+        elif has_name and has_rel:
+            comp = 0.60*n_sc + 0.40*r_sc
+        elif has_name:
+            comp = n_sc
+        elif has_house:
+            comp = 100.0
+        elif has_rel:
+            comp = r_sc
+        else:
+            comp = 100.0 if e_ok else 0.0
 
-        def _house_q2_prefix(h):
-            pfx_rx = {'$regex': f'^{re.escape(h)}', '$options': 'i'}
-            return {'$or': [{'House / Flat No': pfx_rx}, {'House No': pfx_rx}]}
+        if e_ok:
+            comp = max(comp, 95.0)
 
-        try:
-            raw_candidates = []
-            seen_ids = set()
+        if has_name and n_sc < 30 and not e_ok and not h_ok: continue
+        if has_rel and not has_name and r_sc < 30 and not e_ok: continue
 
-            # 1) EPIC exact
-            if voterid:
-                for d in col_2002s.find(
-                    {'$or': [{'Voter ID / EPIC No': voterid}, {'Epic NO': voterid}]}, _PROJ_02s
-                ).limit(5):
-                    _id = str(d.get('_id',''))
-                    if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
+        matched_by = []
+        if e_ok:                        matched_by.append('voterid')
+        if has_name  and n_sc >= 70:    matched_by.append('name')
+        if has_house and h_ok:          matched_by.append('house')
+        if has_rel   and r_sc >= 70:    matched_by.append('relation')
 
-            # 2) House exact + prefix
-            if house:
-                for d in col_2002s.find(_house_q2(house), _PROJ_02s).limit(40):
-                    _id = str(d.get('_id',''))
-                    if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
-                for d in col_2002s.find(_house_q2_prefix(house), _PROJ_02s).limit(40):
-                    _id = str(d.get('_id',''))
-                    if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
+        scored_02.append({
+            'comp': comp, 'flat': flat, 'doc': doc,
+            'field_scores': {
+                'name':     round(n_sc) if has_name  else 0,
+                'relation': round(r_sc) if has_rel   else 0,
+                'house':    100 if h_ok and has_house else 0,
+                'voterid':  100 if e_ok else 0,
+            },
+            'matched_by': matched_by,
+        })
 
-            # 3) Name — phonetic-aware multi-prefix strategy (same fix as 2025)
-            if name and len(name) >= 2:
-                _ntoks = name.split()
-                _ft    = _ntoks[0]
-                _lt    = _ntoks[-1] if len(_ntoks) > 1 else ''
+    scored_02.sort(key=lambda x: (-len(x['matched_by']), -x['comp']))
+    for item in scored_02[:25]:
+        f   = item['flat']
+        doc = item['doc']
+        sig = (f['name'], f['house'])
+        if sig in seen_sigs_02: continue
+        seen_sigs_02.add(sig)
+        suggestions_2002.append({
+            'name':         f['name'],
+            'relation':     f['relation'],
+            'house':        f['house'],
+            'gender':       f['gender'],
+            'age':          f['age'],
+            'voterid':      f['voterid'],
+            'booth':        str(doc.get('Booth No', doc.get('Part No',''))).strip(),
+            'serial':       str(doc.get('Serial No','')).strip(),
+            'score':        round(item['comp']),
+            'source':       'mongodb',
+            'field_scores': item['field_scores'],
+            'matched_by':   item['matched_by'],
+        })
+    suggestions_2002.sort(key=lambda x: (-len(x.get('matched_by',[])), -x['score']))
+    suggestions_2002 = suggestions_2002[:20]
 
-                # 0) COMPOUND scan: all first-token variants + last-token prefix
-                if len(_ntoks) >= 2 and len(_ft) >= 3 and len(_lt) >= 3:
-                    for _ft_v in _gen_prefixes(_ft):
-                        _pfx_cmp = {'$regex': f'^{re.escape(_ft_v)}.*{re.escape(_lt[:4])}', '$options':'i'}
-                        for d in col_2002s.find(
-                            {'$or':[{'Voter Name':_pfx_cmp},{'Name':_pfx_cmp}]}, _PROJ_02s
-                        ).limit(20):
-                            _id = str(d.get('_id',''))
-                            if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
-
-                # a) All phonetic variants of first token as prefix
-                for _ft_v in _gen_prefixes(_ft):
-                    _pfx_tgt = {'$regex': f'^{re.escape(_ft_v)}', '$options':'i'}
-                    for d in col_2002s.find(
-                        {'$or':[{'Voter Name':_pfx_tgt},{'Name':_pfx_tgt}]}, _PROJ_02s
-                    ).limit(60):
-                        _id = str(d.get('_id',''))
-                        if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
-
-                # b) Surname scan: DB might store family name first — use variants too
-                if _lt and len(_lt) >= 3:
-                    for _lt_v in _gen_prefixes(_lt)[:3]:
-                        _pfx_sur = {'$regex': f'^{re.escape(_lt_v[:5])}', '$options':'i'}
-                        for d in col_2002s.find(
-                            {'$or':[{'Voter Name':_pfx_sur},{'Name':_pfx_sur}]}, _PROJ_02s
-                        ).limit(30):
-                            _id = str(d.get('_id',''))
-                            if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
-
-            # 4) Relation — use full first token, not just 3 chars
-            # "BABU KOTTARI" → "BABU" (4 chars) is far more targeted than "BAB"
-            if relation and len(relation) >= 2:
-                _rtoks = relation.split()
-                _frt   = _rtoks[0]
-                rpfx   = {'$regex': f'^{re.escape(_frt[:min(5,len(_frt))])}', '$options':'i'}
-                for d in col_2002s.find(
-                    {'$or':[{'Relative Name':rpfx},{'Relation Name':rpfx}]}, _PROJ_02s
-                ).limit(60):
-                    _id = str(d.get('_id',''))
-                    if _id not in seen_ids: seen_ids.add(_id); raw_candidates.append(d)
-
-            # ── Score all candidates ──────────────────────────────────────────────
-            has_name  = bool(name)
-            has_house = bool(house)
-            has_rel   = bool(relation)
-            has_epic  = bool(voterid)
-
-            scored = []
-            for doc in raw_candidates:
-                flat  = _flat_2002(doc)
-                n_sc  = _name_score(name, flat['name'])         if has_name  else 0.0
-                r_sc  = _name_score(relation, flat['relation']) if has_rel   else 0.0
-                h_ok  = (flat['house'].upper() == house.upper()) if has_house else False
-                e_ok  = bool(has_epic and flat['voterid'] and
-                             flat['voterid'].upper() == voterid.upper())
-
-                if has_name and has_house and has_rel:
-                    comp = 0.55*n_sc + 0.25*r_sc + 0.20*(100.0 if h_ok else 0.0)
-                elif has_name and has_house:
-                    comp = 0.70*n_sc + 0.30*(100.0 if h_ok else 0.0)
-                elif has_name and has_rel:
-                    comp = 0.60*n_sc + 0.40*r_sc
-                elif has_name:
-                    comp = n_sc
-                elif has_house:
-                    comp = 100.0
-                elif has_rel:
-                    comp = r_sc
-                else:
-                    comp = 100.0 if e_ok else 0.0
-
-                if e_ok:
-                    comp = max(comp, 95.0)
-
-                # Minimum gate
-                if has_name and n_sc < 30 and not e_ok and not h_ok: continue
-                if has_rel and not has_name and r_sc < 30 and not e_ok: continue
-
-                # matched_by — threshold 70 prevents false positives like ASHOK≈ASHWITH KOTTARI
-                matched_by = []
-                if e_ok:                        matched_by.append('voterid')
-                if has_name  and n_sc >= 70:    matched_by.append('name')
-                if has_house and h_ok:          matched_by.append('house')
-                if has_rel   and r_sc >= 70:    matched_by.append('relation')
-
-                scored.append({
-                    'comp': comp, 'flat': flat, 'doc': doc,
-                    'field_scores': {
-                        'name':     round(n_sc) if has_name  else 0,
-                        'relation': round(r_sc) if has_rel   else 0,
-                        'house':    100 if h_ok and has_house else 0,
-                        'voterid':  100 if e_ok else 0,
-                    },
-                    'matched_by': matched_by,
-                })
-
-            # Sort: most fields matched first, then by composite score
-            scored.sort(key=lambda x: (-len(x['matched_by']), -x['comp']))
-            seen_sigs = set()
-            # NOTE: do NOT skip the confirmed 2002 record here.
-            # When in_2002=True (fuzzy match found via _gen_prefixes), record_2002 is
-            # returned separately in the response, but suggestions_2002 must ALSO
-            # include it so the frontend 2002 panel renders it correctly.
-            for item in scored[:25]:
-                f   = item['flat']
-                doc = item['doc']
-                sig = (f['name'], f['house'])
-                if sig in seen_sigs: continue
-                seen_sigs.add(sig)
-                suggestions_2002.append({
-                    'name':         f['name'],
-                    'relation':     f['relation'],
-                    'house':        f['house'],
-                    'gender':       f['gender'],
-                    'age':          f['age'],
-                    'voterid':      f['voterid'],
-                    'booth':        str(doc.get('Booth No', doc.get('Part No',''))).strip(),
-                    'serial':       str(doc.get('Serial No','')).strip(),
-                    'score':        round(item['comp']),
-                    'source':       'mongodb',
-                    'field_scores': item['field_scores'],
-                    'matched_by':   item['matched_by'],
-                })
-        except Exception:
-            pass   # suggestions are best-effort
-
-        # ── Excel fallback — only if MongoDB gave fewer than 5 suggestions ──────
-        if len(suggestions_2002) < 5:
-            try:
-                df_x, cx, hidx = _get_xlsx()
-                if df_x is not None:
-                    CN, CR = cx.get('name'), cx.get('rel')
-                    CH, CE = cx.get('house'), cx.get('epic')
-                    CG, CA = cx.get('gender'), cx.get('age')
-
-                    xl_indices = set()
-                    if house and hidx:
-                        for idx in hidx.get(house.strip().upper(), []):
-                            xl_indices.add(idx)
-                    if name and CN:
-                        _xl_ntoks = name.split()
-                        _xl_ft    = _xl_ntoks[0]
-                        col_up = df_x[CN].str.upper()
-                        # Use all phonetic variants of first token
-                        for _xl_ft_v in _gen_prefixes(_xl_ft):
-                            for idx in df_x.index[col_up.str.startswith(_xl_ft_v, na=False)].tolist()[:150]:
-                                xl_indices.add(idx)
-                    if relation and CR:
-                        _xl_rtoks = relation.split()
-                        _xl_frt   = _xl_rtoks[0]
-                        rpfx5 = _xl_frt[:min(5,len(_xl_frt))].upper()
-                        rel_up = df_x[CR].str.upper()
-                        for idx in df_x.index[rel_up.str.startswith(rpfx5, na=False)].tolist()[:80]:
-                            xl_indices.add(idx)
-
-                    subset = df_x.iloc[sorted(xl_indices)] if xl_indices else df_x
-                    existing_names = {s['name'] for s in suggestions_2002}
-
-                    rows_s = []
-                    for _, row in subset.iterrows():
-                        _nsc = _name_score(name.upper(), str(row.get(CN,'')).strip().upper()) if (has_name and CN) else 0.0
-                        _rsc = _name_score(relation.upper(), str(row.get(CR,'')).strip().upper()) if (has_rel and CR) else 0.0
-                        _hok = (str(row.get(CH,'')).strip().upper() == house.upper()) if (has_house and CH) else False
-
-                        if has_name and has_house and has_rel:
-                            _comp = 0.55*_nsc + 0.25*_rsc + 0.20*(100.0 if _hok else 0.0)
-                        elif has_name and has_house:
-                            _comp = 0.70*_nsc + 0.30*(100.0 if _hok else 0.0)
-                        elif has_name and has_rel:
-                            _comp = 0.60*_nsc + 0.40*_rsc
-                        elif has_name:
-                            _comp = _nsc
-                        elif has_house:
-                            _comp = 100.0
-                        else:
-                            _comp = _rsc
-
-                        if has_name and _nsc < 30: continue
-                        nm = str(row.get(CN,''))
-                        if nm in existing_names: continue
-                        _xl_mb = []
-                        if has_name  and _nsc >= 70: _xl_mb.append('name')
-                        if has_house and _hok:       _xl_mb.append('house')
-                        if has_rel   and _rsc >= 70: _xl_mb.append('relation')
-                        rows_s.append({'_r': row, 'c': _comp, 'mb': _xl_mb,
-                                       'fs': {'name': round(_nsc), 'relation': round(_rsc),
-                                              'house': 100 if _hok and has_house else 0}})
-                        if _comp >= 97: break
-
-                    rows_s.sort(key=lambda x: (-len(x['mb']), -x['c']))
-                    for item in rows_s[:8]:
-                        r   = item['_r']
-                        nm  = str(r.get(CN,''))
-                        if nm in existing_names: continue
-                        existing_names.add(nm)
-                        suggestions_2002.append({
-                            'name':         nm,
-                            'relation':     str(r.get(CR,'')),
-                            'house':        str(r.get(CH,'')),
-                            'gender':       str(r.get(CG,'')) if CG else '',
-                            'age':          str(r.get(CA,'')) if CA else '',
-                            'voterid':      str(r.get(CE,'')) if CE else '',
-                            'score':        round(item['c']),
-                            'source':       'excel',
-                            'field_scores': item['fs'],
-                            'matched_by':   item['mb'],
-                        })
-            except Exception:
-                pass
-
-        suggestions_2002.sort(key=lambda x: (-len(x.get('matched_by',[])), -x['score']))
-        suggestions_2002 = suggestions_2002[:20]
-
-    # ── Similar 2025 records — all 4 field dimensions, matched_by tagged ─────────
+    # ── Score similar_2025 from the pre-fetched raw candidates ───────────────
     similar_2025 = []
-    _PROJ_SLIM  = {'Name':1,'Relation Name':1,'Epic NO':1,'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1}
-    _seen_25_ids  = set()
     _seen_25_epics = {r25.get('voterid','')} if in_2025 else set()
+    _confirmed_25_voterid = r25.get('voterid','') if in_2025 else ''
 
     def _match_flags_25(rn, rr, rh, re_):
         flags = []
@@ -3385,77 +3279,8 @@ def api_check_sir(request):
         if relation and len(relation) >= 2 and _name_score(relation, rr) >= 70: flags.append('relation')
         return flags
 
-    _raw_25 = []
-
-    # 1) EPIC exact
-    if voterid:
-        for doc in col_2025.find({'Epic NO': voterid}, _PROJ_SLIM).limit(5):
-            oid = str(doc.get('_id',''))
-            if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
-
-    # 2) House exact + prefix
-    if house:
-        for doc in col_2025.find({'House No': house}, _PROJ_SLIM).limit(20):
-            oid = str(doc.get('_id',''))
-            if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
-        _h_pfx_rx = {'$regex': f'^{re.escape(house)}', '$options':'i'}
-        for doc in col_2025.find({'House No': _h_pfx_rx}, _PROJ_SLIM).limit(20):
-            oid = str(doc.get('_id',''))
-            if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
-
-    # 3) Name — phonetic-aware multi-prefix strategy
-    #
-    # Uses _gen_prefixes() to generate transliteration variants of each token:
-    #   "VEDHAVYAS" → ["VEDHAVYAS", "VEDAVYAS", "VEDHAVYA", "VEDAVYA", "VED"]
-    # This means a typo/variant like VEDH vs VED will still find the right record.
-    #
-    # Order of scans (most-specific → broadest):
-    #  0) COMPOUND — '^FIRST.*LAST4' → tiny result set, catches exact compound match
-    #  a) All _gen_prefixes variants of first token → limit 60 each
-    #  b) Surname-first scan (last token variants) → limit 20 each
-    if name and len(name) >= 3:
-        _25_ntoks = name.split()
-        _25_ft    = _25_ntoks[0]
-        _25_lt    = _25_ntoks[-1] if len(_25_ntoks) > 1 else ''
-
-        # 0) Compound scan — for "VEDHAVYAS KAMATH" → '^VEDHAVYAS.*KAMA' AND '^VEDAVYAS.*KAMA'
-        if len(_25_ntoks) >= 2 and len(_25_ft) >= 3 and len(_25_lt) >= 3:
-            for _ft_v in _gen_prefixes(_25_ft):
-                _25_cpx = {'$regex': f'^{re.escape(_ft_v)}.*{re.escape(_25_lt[:4])}', '$options':'i'}
-                for doc in col_2025.find({'Name': _25_cpx}, _PROJ_SLIM).limit(20):
-                    oid = str(doc.get('_id',''))
-                    if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
-
-        # a) All phonetic variants of first token as prefix
-        for _ft_v in _gen_prefixes(_25_ft):
-            _25_pfx_tgt = {'$regex': f'^{re.escape(_ft_v)}', '$options':'i'}
-            for doc in col_2025.find({'Name': _25_pfx_tgt}, _PROJ_SLIM).limit(60):
-                oid = str(doc.get('_id',''))
-                if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
-
-        # b) Surname-first scan — catches "KAMATH VEDAVYAS" style entries + variants
-        if _25_lt and len(_25_lt) >= 3:
-            for _lt_v in _gen_prefixes(_25_lt)[:3]:  # top-3 variants only
-                _25_pfx_sur = {'$regex': f'^{re.escape(_lt_v[:5])}', '$options':'i'}
-                for doc in col_2025.find({'Name': _25_pfx_sur}, _PROJ_SLIM).limit(20):
-                    oid = str(doc.get('_id',''))
-                    if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
-
-    # 4) Relation — first-token prefix
-    if relation and len(relation) >= 3:
-        _25_rtoks = relation.split()
-        _25_frt   = _25_rtoks[0]
-        _25_rpx   = {'$regex': f'^{re.escape(_25_frt[:min(5,len(_25_frt))])}', '$options':'i'}
-        for doc in col_2025.find({'Relation Name': _25_rpx}, _PROJ_SLIM).limit(40):
-            oid = str(doc.get('_id',''))
-            if oid not in _seen_25_ids: _seen_25_ids.add(oid); _raw_25.append(bson_clean(doc))
-
     _scored_25 = []
-    for d in _raw_25:
-        # Apply _norm() so case matches user input — 2025 DB stores Relation Name
-        # in mixed case ("Babu Kottari") while user input is uppercased by _norm().
-        # Without this, _name_score("BABU KOTTARI","Babu Kottari") = 25 (case mismatch)
-        # and 'relation' never gets tagged even for a perfect match.
+    for d in _sim25_raw:
         rn  = _norm(d.get('Name',''))
         rr  = _norm(d.get('Relation Name',''))
         rh  = _norm(d.get('House No',''))
@@ -3463,7 +3288,6 @@ def api_check_sir(request):
         flags = _match_flags_25(rn, rr, rh, re_)
         if not flags: continue
 
-        # Compute composite score so best match floats to top within same flag group
         _n_sc = _name_score(name, rn)     if name     else 0.0
         _r_sc = _name_score(relation, rr) if relation else 0.0
         _h_ok = house and (rh == _norm(house) or rh.startswith(_norm(house)))
@@ -3485,9 +3309,7 @@ def api_check_sir(request):
             'matched_by': flags,
         }))
 
-    # Sort: most fields matched first, then by composite score (best match rises to top)
     _scored_25.sort(key=lambda x: (-x[0], -x[1]))
-    _confirmed_25_voterid = r25.get('voterid','') if in_2025 else ''
     for _, _score25, rec in _scored_25:
         epic = rec['voterid']
         if epic and epic in _seen_25_epics: continue
@@ -3505,8 +3327,7 @@ def api_check_sir(request):
         'in_2025':    in_2025,
         'in_2002':    in_2002,
         'similar_2025': similar_2025,
-        'suggestions_2002': suggestions_2002,   # ← fuzzy suggestions when 2002 not found
-        # Full 2002 voter record
+        'suggestions_2002': suggestions_2002,
         'record_2002': {
             'name':     r02.get('name',     ''),
             'relation': r02.get('relation', ''),
@@ -3515,7 +3336,6 @@ def api_check_sir(request):
             'age':      r02.get('age',      ''),
             'voterid':  r02.get('voterid',  ''),
         } if in_2002 else {},
-        # Full 2025 voter record
         'record_2025': {
             'name':     r25.get('name',     ''),
             'relation': r25.get('relation', ''),
@@ -3529,7 +3349,6 @@ def api_check_sir(request):
     }
     # Store in preview cache — same query in next 2 min returns instantly
     _SIR_PREVIEW_CACHE[_sir_cache_key] = {'data': _response_data, 'ts': _time.time()}
-    # Evict old entries if cache grows large (keep last 500 keys)
     if len(_SIR_PREVIEW_CACHE) > 500:
         oldest = sorted(_SIR_PREVIEW_CACHE, key=lambda k: _SIR_PREVIEW_CACHE[k]['ts'])
         for k in oldest[:100]:
