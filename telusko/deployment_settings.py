@@ -18,7 +18,7 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 # Django checks Origin header against this list on every POST/PUT/DELETE.
 CSRF_TRUSTED_ORIGINS = [
     f"https://{RENDER_HOST}",
-    "https://production-web-conn-0tsi.onrender.com",      # Django backend
+    "https://production-web-conn-2.onrender.com",      # Django backend
     "https://frontend-production-web-ux7k.onrender.com",  # React frontend (sends requests here)
 ]
 
