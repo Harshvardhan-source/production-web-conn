@@ -786,6 +786,10 @@ def api_dashboard(request):
 _ward_dash_cache = {}   # { ward_str: {'data': {...}, 'ts': float} }
 _WARD_CACHE_TTL  = 300  # 5 minutes
 
+# SIR instant-check preview cache — keyed by (name, voterid, house, relation)
+_SIR_PREVIEW_CACHE     = {}
+_SIR_PREVIEW_CACHE_TTL = 120  # 2 minutes
+
 
 @require_http_methods(['GET'])
 def api_ward_dashboard(request):
@@ -3006,6 +3010,13 @@ def api_check_sir(request):
     do_store = bool(body.get('store', False))
 
     db = get_db()
+
+    # ── Cache check (read-only preview only) ──────────────────────────────────
+    _sir_cache_key = (name, voterid, house, relation)
+    if not do_store:
+        _cached = _SIR_PREVIEW_CACHE.get(_sir_cache_key)
+        if _cached and (_time.time() - _cached['ts']) < _SIR_PREVIEW_CACHE_TTL:
+            return JsonResponse(_cached['data'])
 
     if do_store:
         sir = _run_sir_analysis(voterid, name, house, ward, booth, serial, relation, db=db)
