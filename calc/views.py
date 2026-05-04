@@ -2793,7 +2793,8 @@ def _epic_prefix(vid):
 def _run_sir_analysis(voterid, name, house, ward, booth, serial, relation='',
                       read_db=None, write_db=None, db=None):
     """
-    read_db  — cluster holding 2002/2025 voter rolls (main cluster, get_db()).
+    read_db  — cluster holding 2025 voter roll (main cluster, get_db()).
+               2002 voter roll is always read from get_survey_db() (_SURVEY_URL).
     write_db — cluster holding SIR_* collections   (survey cluster, get_survey_db()).
 
     Legacy callers that pass a positional `db` argument still work:
@@ -2808,7 +2809,7 @@ def _run_sir_analysis(voterid, name, house, ward, booth, serial, relation='',
         write_db = read_db
 
     col_2025 = read_db['2025']
-    col_2002 = read_db['2002']   # ← MongoDB, uploaded from Google Sheet
+    col_2002 = get_survey_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
 
     # ── Look up in both rolls — parallel threads ─────────────────────────────────
     _rr = [None, None]
@@ -3020,7 +3021,7 @@ def api_check_sir(request):
 
     # ── Read-only preview (no DB writes) ──────────────────────────────────────
     col_2025 = db['2025']
-    col_2002 = db['2002']
+    col_2002 = get_survey_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
 
     # Pre-compute prefix variants ONCE — reused by all 4 parallel phases
     _name_tok      = name.split()[0] if name else ''
@@ -3620,7 +3621,7 @@ def api_sir_bulk(request):
     """
     db        = get_db()
     col_2025  = db['2025']
-    col_2002  = db['2002']
+    col_2002  = get_survey_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
     processed = 0
     errors    = 0
 
