@@ -786,6 +786,10 @@ def api_dashboard(request):
 _ward_dash_cache = {}   # { ward_str: {'data': {...}, 'ts': float} }
 _WARD_CACHE_TTL  = 300  # 5 minutes
 
+# ── SIR preview cache — read-only check results, keyed by (name,voterid,house,relation)
+_SIR_PREVIEW_CACHE     = {}   # { tuple: {'data': {...}, 'ts': float} }
+_SIR_PREVIEW_CACHE_TTL = 120  # 2 minutes — voter rolls don't change during a session
+
 
 @require_http_methods(['GET'])
 def api_ward_dashboard(request):
@@ -3008,7 +3012,11 @@ def api_check_sir(request):
         sir = _run_sir_analysis(voterid, name, house, ward, booth, serial, relation, db=db)
         return JsonResponse({'success': True, **sir})
 
-    # ── Read-only preview (no DB writes) ──────────────────────────────────────
+    # ── Cache key for read-only preview — avoid re-running the same query ────
+    _sir_cache_key = (name, voterid, house, relation)
+    _sir_cached    = _SIR_PREVIEW_CACHE.get(_sir_cache_key)
+    if _sir_cached and (_time.time() - _sir_cached['ts']) < _SIR_PREVIEW_CACHE_TTL:
+        return JsonResponse(_sir_cached['data'])
     col_2025 = db['2025']
     col_2002 = db['2002']
 
@@ -3488,7 +3496,7 @@ def api_check_sir(request):
         similar_2025.append(rec)
         if len(similar_2025) >= 30: break
 
-    return JsonResponse({
+    _response_data = {
         'success':    True,
         'results':    results,
         'suspicious': suspicious,
@@ -3518,7 +3526,15 @@ def api_check_sir(request):
             'booth':    r25.get('booth',    ''),
             'ward':     r25.get('ward',     ''),
         } if in_2025 else {},
-    })
+    }
+    # Store in preview cache — same query in next 2 min returns instantly
+    _SIR_PREVIEW_CACHE[_sir_cache_key] = {'data': _response_data, 'ts': _time.time()}
+    # Evict old entries if cache grows large (keep last 500 keys)
+    if len(_SIR_PREVIEW_CACHE) > 500:
+        oldest = sorted(_SIR_PREVIEW_CACHE, key=lambda k: _SIR_PREVIEW_CACHE[k]['ts'])
+        for k in oldest[:100]:
+            _SIR_PREVIEW_CACHE.pop(k, None)
+    return JsonResponse(_response_data)
 
 
 @require_http_methods(['GET'])
