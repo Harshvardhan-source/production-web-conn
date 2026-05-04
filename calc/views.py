@@ -3069,6 +3069,13 @@ def api_check_sir(request):
                 frt = relation.split()[0]
                 rpfx = {'$regex':f'^{re.escape(frt[:min(5,len(frt))])}','$options':'i'}
                 _add(col_2002.find({'$or':[{'Relative Name':rpfx},{'Relation Name':rpfx}]}, _PROJ_02).limit(100))
+
+            # e) Broadest 3-char fallback — runs only when name-only search yields too few candidates
+            if name and len(_raw02) < 5 and len(name) >= 3:
+                p3 = name[:3]
+                rx3 = {'$regex': f'^{re.escape(p3)}', '$options': 'i'}
+                _add(col_2002.find({'$or':[{'Voter Name':rx3},{'Name':rx3}]}, _PROJ_02).limit(200))
+
         except Exception:
             pass
 
@@ -3109,6 +3116,13 @@ def api_check_sir(request):
     _td = threading.Thread(target=_t_sim25,  daemon=True)
     _ta.start(); _tb.start(); _tc.start(); _td.start()
     _ta.join();  _tb.join();  _tc.join();  _td.join()
+
+    # Ensure the confirmed 2002 doc (if any) is always present in _raw02 for scoring.
+    # _t_sugg02 may have missed it if it ran into a timeout or field-name mismatch.
+    if _res[1]:
+        _conf_oid = str(_res[1].get('_id', ''))
+        if _conf_oid not in {str(d.get('_id','')) for d in _raw02}:
+            _raw02.insert(0, _res[1])
 
     r25 = _flat_2025(_res[0])
     r02 = _flat_2002(_res[1])
@@ -3269,33 +3283,6 @@ def api_check_sir(request):
     suggestions_2002.sort(key=lambda x: (-len(x.get('matched_by',[])), -x['score']))
     suggestions_2002 = suggestions_2002[:30]
 
-    # ── Build similar_2002 — ALL scored 2002 candidates (mirrors similar_2025) ─
-    # Excludes the already-confirmed record so it's not duplicated in the table.
-    _conf02_sig = (r02.get('name',''), r02.get('house','')) if in_2002 else None
-    similar_2002 = []
-    _seen_sigs02b = set()
-    if _conf02_sig:
-        _seen_sigs02b.add(_conf02_sig)  # skip confirmed record — shown separately
-    for item in _scored02:
-        f   = item['flat']
-        doc = item['doc']
-        sig = (f['name'], f['house'])
-        if sig in _seen_sigs02b: continue
-        _seen_sigs02b.add(sig)
-        similar_2002.append({
-            'name':         f['name'],
-            'relation':     f['relation'],
-            'house':        f['house'],
-            'gender':       f['gender'],
-            'age':          f['age'],
-            'voterid':      f['voterid'],
-            'booth':        str(doc.get('Booth No', doc.get('Part No',''))).strip(),
-            'serial':       str(doc.get('Serial No','')).strip(),
-            'matched_by':   item['matched_by'],
-            'score':        round(item['comp']),
-        })
-        if len(similar_2002) >= 30: break
-
     # ── Score similar_2025 from pre-fetched _raw25 ────────────────────────────
     similar_2025 = []
     _seen25_epics = {r25.get('voterid','')} if in_2025 else set()
@@ -3355,7 +3342,7 @@ def api_check_sir(request):
         'in_2025':    in_2025,
         'in_2002':    in_2002,
         'similar_2025': similar_2025,
-        'similar_2002': similar_2002,
+        'similar_2002': suggestions_2002,   # same scored candidates, exposed as similar_2002 for the table
         'suggestions_2002': suggestions_2002,
         'record_2002': {
             'name':     r02.get('name',     ''),
