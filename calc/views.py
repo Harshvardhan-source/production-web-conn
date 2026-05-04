@@ -2349,8 +2349,8 @@ def _flat_2002(doc):
         'voterid':  _norm(_get2002(doc, 'Voter ID / EPIC No', 'Epic NO')),
         'gender':   _norm(_get2002(doc, 'Gender')),
         'age':      _get2002(doc, 'Age'),
-        'booth':    '',
-        'ward':     '',
+        'booth':    _get2002(doc, 'Booth No', 'Part No'),
+        'ward':     _get2002(doc, 'Ward No', 'Ward'),
     }
 
 
@@ -3237,9 +3237,9 @@ def api_check_sir(request):
 
         matched_by = []
         if e_ok:                        matched_by.append('voterid')
-        if has_name  and n_sc >= 70:    matched_by.append('name')
+        if has_name  and n_sc >= 60:    matched_by.append('name')
         if has_house and h_ok:          matched_by.append('house')
-        if has_rel   and r_sc >= 70:    matched_by.append('relation')
+        if has_rel   and r_sc >= 60:    matched_by.append('relation')
 
         scored_02.append({
             'comp': comp, 'flat': flat, 'doc': doc,
