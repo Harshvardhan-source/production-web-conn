@@ -4450,8 +4450,10 @@ CONSTITUENCY_NUMBER = 175
 ML_CHUNK_SIZE       = 500   # must match predict_query_stack.py
 
 def _get_ml_db():
-    """Return SurveyDataBase from the survey cluster (same cluster as ConstituencyQueryStack)."""
-    return _get_survey_client()["SurveyDataBase"]
+    """Return (db) for SurveyDataBase."""
+    client = MongoClient(settings.MONGO_URI, tlsCAFile=certifi.where(),
+                         serverSelectionTimeoutMS=15_000)
+    return client["SurveyDataBase"]
 
 
 def _reassemble_chunks(col, filter_q: dict) -> list:
