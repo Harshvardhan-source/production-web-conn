@@ -3269,6 +3269,33 @@ def api_check_sir(request):
     suggestions_2002.sort(key=lambda x: (-len(x.get('matched_by',[])), -x['score']))
     suggestions_2002 = suggestions_2002[:30]
 
+    # ── Build similar_2002 — ALL scored 2002 candidates (mirrors similar_2025) ─
+    # Excludes the already-confirmed record so it's not duplicated in the table.
+    _conf02_sig = (r02.get('name',''), r02.get('house','')) if in_2002 else None
+    similar_2002 = []
+    _seen_sigs02b = set()
+    if _conf02_sig:
+        _seen_sigs02b.add(_conf02_sig)  # skip confirmed record — shown separately
+    for item in _scored02:
+        f   = item['flat']
+        doc = item['doc']
+        sig = (f['name'], f['house'])
+        if sig in _seen_sigs02b: continue
+        _seen_sigs02b.add(sig)
+        similar_2002.append({
+            'name':         f['name'],
+            'relation':     f['relation'],
+            'house':        f['house'],
+            'gender':       f['gender'],
+            'age':          f['age'],
+            'voterid':      f['voterid'],
+            'booth':        str(doc.get('Booth No', doc.get('Part No',''))).strip(),
+            'serial':       str(doc.get('Serial No','')).strip(),
+            'matched_by':   item['matched_by'],
+            'score':        round(item['comp']),
+        })
+        if len(similar_2002) >= 30: break
+
     # ── Score similar_2025 from pre-fetched _raw25 ────────────────────────────
     similar_2025 = []
     _seen25_epics = {r25.get('voterid','')} if in_2025 else set()
@@ -3328,6 +3355,7 @@ def api_check_sir(request):
         'in_2025':    in_2025,
         'in_2002':    in_2002,
         'similar_2025': similar_2025,
+        'similar_2002': similar_2002,
         'suggestions_2002': suggestions_2002,
         'record_2002': {
             'name':     r02.get('name',     ''),
