@@ -4477,7 +4477,17 @@ def _get_anthropic():
                 "Add 'anthropic' to requirements.txt and redeploy."
             )
         import os
-        api_key = getattr(settings, 'ANTHROPIC_API_KEY', None) or os.environ.get('ANTHROPIC_API_KEY', '')
+        api_key = (
+            getattr(settings, 'ANTHROPIC_API_KEY', None)
+            or os.environ.get('ANTHROPIC_API_KEY', '')
+            or None
+        )
+        if not api_key:
+            raise RuntimeError(
+                'ANTHROPIC_API_KEY is not set. '
+                'Add it in your Render dashboard: Environment -> Add Environment Variable -> '
+                'Key: ANTHROPIC_API_KEY, Value: your-key'
+            )
         _ANTHROPIC_CLIENT = _anthropic_mod.Anthropic(api_key=api_key)
     return _ANTHROPIC_CLIENT
 
@@ -4758,3 +4768,5 @@ def api_ai_birdseye_view(request):
         })
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)
+    
+    
