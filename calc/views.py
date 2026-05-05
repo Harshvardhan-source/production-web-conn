@@ -1805,7 +1805,7 @@ _COMMUNITY_MAP = {
 }
 
 # ── Excel scheme file path (relative to Django project root) ───────────────────
-_SCHEME_XLSX = 'StoreAllSheetData_modified.xlsx'
+_SCHEME_XLSX = 'StoreAllSheetData.xlsx'
 
 # ── Scheme DataFrame cache — loaded once, reused for every eligibility check ───
 _SCHEME_DF_LOCK = threading.Lock()
