@@ -1957,10 +1957,18 @@ def api_view_scheme(request):
     except Exception:
         return JsonResponse({'success': False, 'message': 'Invalid JSON'}, status=400)
 
-    voter_data = body.get('voterData', {})
+    # Support both { voterData: {...} } (correct) and flat { Gender: ..., AGE: ... } (legacy)
+    if 'voterData' in body and isinstance(body['voterData'], dict):
+        voter_data = body['voterData']
+    else:
+        voter_data = body  # flat payload — treat entire body as voter data
+
+    print(f'[api_view_scheme] voter_data keys: {list(voter_data.keys())}')
+    print(f'[api_view_scheme] voter_data: {voter_data}')
 
     # Normalize community + rename PhysicalStatus → DifferentlyAbled to match Excel columns
     normalized = _normalize_voter_for_scheme(voter_data)
+    print(f'[api_view_scheme] normalized: {normalized}')
 
     eligible = []
     try:
