@@ -1789,6 +1789,76 @@ _WARD_NAME_TO_NUM = {
     'JEPPU': 59, 'BENGRE': 60,
 }
 
+# ── Community mapping: MongoDB stored value → Excel scheme sheet value ─────────
+# MongoDB stores community as "General" / "OBC" / "SC" / "ST".
+# The Excel scheme sheet uses "GC" for General Category.
+# Without this mapping, General-category voters match zero schemes.
+_COMMUNITY_MAP = {
+    'General': 'GC',
+    'general': 'GC',
+    'GC':      'GC',
+    'OBC':     'OBC',
+    'SC':      'SC',
+    'ST':      'ST',
+    # OBC sub-caste codes stored verbatim in some records
+    '2A': 'OBC', '2B': 'OBC', '3A': 'OBC', '3B': 'OBC',
+}
+
+# ── Excel scheme file path (relative to Django project root) ───────────────────
+_SCHEME_XLSX = 'StoreAllSheetData_modified.xlsx'
+
+# ── Scheme DataFrame cache — loaded once, reused for every eligibility check ───
+_SCHEME_DF_LOCK = threading.Lock()
+_SCHEME_DF      = None   # pd.DataFrame, populated on first call
+
+def _get_scheme_df():
+    """Load and cache the scheme Excel file. Thread-safe."""
+    global _SCHEME_DF
+    if _SCHEME_DF is not None:
+        return _SCHEME_DF
+    with _SCHEME_DF_LOCK:
+        if _SCHEME_DF is not None:
+            return _SCHEME_DF
+        try:
+            _SCHEME_DF = pd.read_excel(_SCHEME_XLSX)
+            print(f'[Schemes] Loaded {len(_SCHEME_DF)} schemes from {_SCHEME_XLSX}')
+        except Exception as e:
+            print(f'[Schemes] Failed to load {_SCHEME_XLSX}: {e}')
+            _SCHEME_DF = pd.DataFrame()
+        return _SCHEME_DF
+
+
+def _normalize_voter_for_scheme(voter_data: dict) -> dict:
+    """
+    Convert a voter dict (as returned by api_scheme_voter_list) into the
+    exact field names and values expected by the Excel scheme sheet columns.
+
+    Key transformations applied:
+      1. Community  : "General" → "GC"  (and sub-caste codes 2A/2B → "OBC")
+      2. PhysicalStatus → DifferentlyAbled  (field rename; value stays Yes/No)
+    """
+    community_raw = str(voter_data.get('Community', '') or '').strip()
+    community     = _COMMUNITY_MAP.get(community_raw, community_raw)
+
+    return {
+        'Gender':           str(voter_data.get('Gender',           '') or '').strip(),
+        'MaritalStatus':    str(voter_data.get('MaritalStatus',    '') or '').strip(),
+        'EconomicStatus':   str(voter_data.get('EconomicStatus',   '') or '').strip(),
+        'EmploymentStatus': str(voter_data.get('EmploymentStatus', '') or '').strip(),
+        'EmploymentType':   str(voter_data.get('EmploymentType',   '') or '').strip(),
+        'Religion':         str(voter_data.get('Religion',         '') or '').strip(),
+        'Community':        community,
+        'SubCategory':      str(voter_data.get('SubCategory',      '') or '').strip(),
+        'Education':        str(voter_data.get('Education',        '') or '').strip(),
+        'EducationType':    str(voter_data.get('EducationType',    '') or '').strip(),
+        # PhysicalStatus (voter key) → DifferentlyAbled (Excel column name)
+        'DifferentlyAbled': str(voter_data.get('PhysicalStatus',  'No') or 'No').strip(),
+        'HealthStatus':     str(voter_data.get('HealthStatus',     '') or '').strip(),
+        'HomeType':         str(voter_data.get('HomeType',         '') or '').strip(),
+        'AGE':              str(voter_data.get('AGE',              '') or '').strip(),
+    }
+
+
 @csrf_exempt
 @require_http_methods(['POST'])
 def api_scheme_voter_list(request):
@@ -1829,45 +1899,55 @@ def api_scheme_voter_list(request):
 
     print(f"[api_scheme_voter_list] {len(docs)} records found for ward_name={ward_name!r}")
 
-    # Normalise SurveyRecords camelCase → PascalCase keys for scheme eligibility
+    # Normalise SurveyRecords camelCase → PascalCase keys expected by the frontend
+    # and by _normalize_voter_for_scheme() during eligibility matching.
     voters = []
     for d in docs:
         d = bson_clean(d)
-        name = ' '.join(filter(None, [
-            d.get('firstName',''), d.get('middleName',''), d.get('lastName','')
+        voter_name = ' '.join(filter(None, [
+            d.get('firstName', ''), d.get('middleName', ''), d.get('lastName', '')
         ])).strip()
+
+        # differentlyAbled → both PhysicalStatus (UI display) and DifferentlyAbled (scheme match)
+        differently_abled = 'Yes' if str(d.get('differentlyAbled', '') or '').lower() == 'yes' else 'No'
+
         voters.append({
-            'Voter_Name':       name,
-            'VoterID':          d.get('voterid',''),
-            'House_No':         d.get('houseNumber',''),
-            'MobileNumber':     d.get('contactNumber',''),
-            'DOB':              d.get('dob',''),
-            'AGE':              str(d.get('age','')),
-            'Gender':           d.get('gender',''),
-            'Religion':         d.get('religion',''),
-            'Community':        d.get('community',''),
-            'SubCategory':      d.get('subcategory',''),
-            'EconomicStatus':   d.get('economicStatus',''),
-            'EmploymentStatus': d.get('employmentStatus',''),
-            'EmploymentType':   d.get('employmentType',''),
-            'HealthStatus':     d.get('healthStatus',''),
-            'PhysicalStatus':   'Yes' if d.get('differentlyAbled','').lower() == 'yes' else 'No',
-            'HomeType':         d.get('homeType',''),
-            'MaritalStatus':    d.get('maritalStatus',''),
-            'Education':        d.get('education',''),
-            'EducationType':    d.get('educationtype',''),
-            'AnnualIncome':     d.get('annualIncome',''),
-            'FamilyIncome':     d.get('familyIncome',''),
-            'WardNumber':       d.get('wardNumber',''),
-            'BoothNo':          d.get('boothNo',''),
-            'Address':          d.get('address',''),
-            'SchemesUsed':      d.get('schemesUsed',[]),
-            'IsHeadOfHouse':    d.get('isHeadOfHouse',''),
-            'Minority':         d.get('minority',''),
-            'Student':          d.get('student',''),
+            'Voter_Name':       voter_name,
+            'VoterID':          d.get('voterid',         ''),
+            'House_No':         d.get('houseNumber',      ''),
+            'MobileNumber':     d.get('contactNumber',    ''),
+            'DOB':              d.get('dob',              ''),
+            'AGE':              str(d.get('age',          '')),
+            'Gender':           d.get('gender',           ''),
+            'Religion':         d.get('religion',         ''),
+            # Community stored raw (e.g. "General") — mapping applied in _normalize_voter_for_scheme
+            'Community':        d.get('community',        ''),
+            'SubCategory':      d.get('subcategory',      ''),
+            'EconomicStatus':   d.get('economicStatus',   ''),
+            'EmploymentStatus': d.get('employmentStatus', ''),
+            'EmploymentType':   d.get('employmentType',   ''),
+            'HealthStatus':     d.get('healthStatus',     ''),
+            # PhysicalStatus — kept for UI display in modal
+            'PhysicalStatus':   differently_abled,
+            # DifferentlyAbled — matches the Excel column name; used by scheme matching
+            'DifferentlyAbled': differently_abled,
+            'HomeType':         d.get('homeType',         ''),
+            'MaritalStatus':    d.get('maritalStatus',    ''),
+            'Education':        d.get('education',        ''),
+            'EducationType':    d.get('educationtype',    ''),
+            'AnnualIncome':     d.get('annualIncome',     ''),
+            'FamilyIncome':     d.get('familyIncome',     ''),
+            'WardNumber':       d.get('wardNumber',       ''),
+            'BoothNo':          d.get('boothNo',          ''),
+            'Address':          d.get('address',          ''),
+            'SchemesUsed':      d.get('schemesUsed',      []),
+            'IsHeadOfHouse':    d.get('isHeadOfHouse',    ''),
+            'Minority':         d.get('minority',         ''),
+            'Student':          d.get('student',          ''),
         })
 
     return JsonResponse({'success': True, 'voters': voters})
+
 
 @csrf_exempt
 @require_http_methods(['POST'])
@@ -1879,50 +1959,64 @@ def api_view_scheme(request):
 
     voter_data = body.get('voterData', {})
 
-    analysing_cols = {
-        'Gender', 'MaritalStatus', 'EconomicStatus', 'EmploymentStatus',
-        'EmploymentType', 'Religion', 'Community', 'SubCategory', 'Education',
-        'EducationType', 'PhysicalStatus', 'HealthStatus', 'HomeType', 'AGE'
-    }
-
-    filtered = {k: str(v) for k, v in voter_data.items() if k in analysing_cols and v is not None}
+    # Normalize community + rename PhysicalStatus → DifferentlyAbled to match Excel columns
+    normalized = _normalize_voter_for_scheme(voter_data)
 
     eligible = []
     try:
-        df = pd.read_excel('StoreAllSheetData.xlsx')
+        df = _get_scheme_df()
         for _, row in df.iterrows():
             row_d = {k: str(v) for k, v in row.to_dict().items()}
-            if _is_eligible(filtered, row_d):
+            if _is_eligible(normalized, row_d):
                 eligible.append({
-                    'Name':        row_d.get('Name', ''),
-                    'Type':        row_d.get('type', ''),
-                    'Link':        row_d.get('Link', ''),
-                    'Ministry':    row_d.get('ministry', ''),
+                    'Name':        row_d.get('Name',        ''),
+                    'Type':        row_d.get('type',        ''),
+                    'Link':        row_d.get('Link',        ''),
+                    'Ministry':    row_d.get('ministry',    ''),
                     'Description': row_d.get('Description', ''),
                 })
-    except FileNotFoundError:
-        eligible = []
-    except Exception:
+    except Exception as e:
+        print(f'[api_view_scheme] Error: {e}')
         eligible = []
 
     return JsonResponse({'success': True, 'schemes': eligible})
 
 
-def _is_eligible(voter, scheme_row):
+def _is_eligible(voter: dict, scheme_row: dict) -> bool:
+    """
+    Return True if the voter satisfies every non-blank criterion in scheme_row.
+
+    voter     : normalised dict keyed by Excel column names
+    scheme_row: one row of the scheme DataFrame as {col: str(value)}
+
+    Fixes applied vs original:
+      - Trailing-space tokens: .strip() on every allowed value from the Excel cell
+        (some cells contain "Employed, UnEmployed " with trailing space).
+      - Empty voter values: skip matching when the voter field is blank/None
+        (previously "" was looked up in the allowed list and always failed).
+      - AGE range: unchanged logic, just cleaner error handling.
+    """
     for key, voter_val in voter.items():
         if key not in scheme_row:
             continue
-        scheme_val = scheme_row[key]
-        if str(scheme_val).lower() in ('nan', 'none', ''):
-            continue
+
+        scheme_val = str(scheme_row[key]).strip()
+        if scheme_val.lower() in ('nan', 'none', ''):
+            continue   # scheme has no restriction on this field
+
+        voter_str = str(voter_val).strip()
+        if not voter_str:
+            continue   # voter field empty — treat as no constraint
+
         if key == 'AGE':
             try:
-                age = int(float(voter_val))
+                age = int(float(voter_str))
                 in_range = False
                 for r in scheme_val.split(','):
                     parts = r.strip().split('-')
                     if len(parts) == 2:
-                        low, high = int(parts[0].strip()), int(parts[1].strip())
+                        low  = int(parts[0].strip())
+                        high = int(parts[1].strip())
                         if low <= age <= high:
                             in_range = True
                             break
@@ -1931,9 +2025,11 @@ def _is_eligible(voter, scheme_row):
             except Exception:
                 return False
         else:
+            # Strip every token — handles trailing-space values in Excel cells
             allowed = [v.strip() for v in scheme_val.split(',')]
-            if voter_val not in allowed:
+            if voter_str not in allowed:
                 return False
+
     return True
 
 
