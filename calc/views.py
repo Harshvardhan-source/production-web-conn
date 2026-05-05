@@ -4382,7 +4382,7 @@ def api_me(request):
     return JsonResponse({'loggedIn': False}, status=401)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ML INTELLIGENCE — NewQueryStack1 endpoint
+# ML INTELLIGENCE — NewQueryStack1 endpoints
 # Returns all query objects (with predictedContext) for SWOT display in React.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4396,12 +4396,14 @@ def _get_ml_db():
 
 
 def _reassemble_chunks(col, filter_q: dict) -> list:
-    """Pull all chunks matching filter_q, sort by chunkIndex, return flat list."""
+    """Pull all chunks matching filter_q, sort by chunkIndex, return flat list.
+    NewQueryStack1 stores rows under 'records'; legacy stacks used 'queries'.
+    """
     chunks = list(col.find(filter_q, {"_id": 0}).sort("chunkIndex", 1))
-    queries = []
+    rows = []
     for chunk in chunks:
-        queries.extend(chunk.get("queries", []))
-    return queries
+        rows.extend(chunk.get("records") or chunk.get("queries") or [])
+    return rows
 
 
 def _sanitise_queries(queries: list) -> list:
@@ -4432,18 +4434,17 @@ def _sanitise_queries(queries: list) -> list:
 def api_ml_constituency_swot(request):
     """
     GET /api/ml/constituency-swot/
-    Returns all predicted queries for Mangalore South constituency from NewQueryStack1.
+    Returns all predicted queries for Mangalore South from NewQueryStack1.
+    NewQueryStack1 stores all constituency records across chunked documents;
+    no constituencyNumber/Name filter — fetch all chunks and return flat list.
     """
     user = _user_from_request(request)
     if not user:
         return JsonResponse({"error": "Unauthorized"}, status=401)
     try:
-        db  = _get_ml_db()
-        col = db["NewQueryStack1"]
-        queries = _reassemble_chunks(col, {
-            "constituencyNumber": CONSTITUENCY_NUMBER,
-            "constituencyName":   CONSTITUENCY_NAME,
-        })
+        db      = _get_ml_db()
+        col     = db["NewQueryStack1"]
+        queries = _reassemble_chunks(col, {})   # no filter — all chunks belong to this constituency
         return JsonResponse({
             "scope":               "constituency",
             "constituencyName":    CONSTITUENCY_NAME,
@@ -4459,7 +4460,8 @@ def api_ml_constituency_swot(request):
 def api_ml_ward_swot(request):
     """
     GET /api/ml/ward-swot/?ward=<wardNumber>
-    Returns all predicted queries for a specific ward from NewQueryStack1.
+    Returns predicted queries for a specific ward from NewQueryStack1.
+    Ward-wise is in progress on the frontend; endpoint kept for future use.
     """
     user = _user_from_request(request)
     if not user:
