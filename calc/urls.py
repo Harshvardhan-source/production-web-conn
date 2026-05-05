@@ -61,4 +61,8 @@ urlpatterns = [
     # ML Intelligence — ConstituencyQueryStack & WardWiseQueryStack
     path('ml/constituency-swot/', views.api_ml_constituency_swot, name='api_ml_constituency_swot'),
     path('ml/ward-swot/',         views.api_ml_ward_swot,         name='api_ml_ward_swot'),
+
+    # AI Insights — Anthropic-powered analysis (per-query and bird's eye)
+    path('ai/query-insight/',     views.api_ai_query_insight,     name='api_ai_query_insight'),
+    path('ai/birdseye-view/',     views.api_ai_birdseye_view,     name='api_ai_birdseye_view'),
 ]
