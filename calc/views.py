@@ -4456,8 +4456,276 @@ def api_ml_constituency_swot(request):
         return JsonResponse({"error": str(e)}, status=500)
 
 
-@require_http_methods(["GET"])
-def api_ml_ward_swot(request):
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI INSIGHT ENDPOINTS — Anthropic-powered analysis for SWOT queries
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ANTHROPIC_CLIENT = None
+
+def _get_anthropic():
+    """Lazy-init Anthropic client. Import is deferred so a missing package only
+    errors when an AI endpoint is actually called, not at Django startup."""
+    global _ANTHROPIC_CLIENT
+    if _ANTHROPIC_CLIENT is None:
+        try:
+            import anthropic as _anthropic_mod
+        except ImportError:
+            raise ImportError(
+                "The 'anthropic' package is required for AI endpoints. "
+                "Add 'anthropic' to requirements.txt and redeploy."
+            )
+        import os
+        api_key = getattr(settings, 'ANTHROPIC_API_KEY', None) or os.environ.get('ANTHROPIC_API_KEY', '')
+        _ANTHROPIC_CLIENT = _anthropic_mod.Anthropic(api_key=api_key)
+    return _ANTHROPIC_CLIENT
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_ai_query_insight(request):
+    """
+    POST /api/ai/query-insight/
+    Body: {
+        "query": {...},          # filter dict  e.g. {"economicStatus":"APL"}
+        "columns": [...],        # dimension names
+        "count": 3950,           # voter count
+        "percentage": 51.0,
+        "label": "Dominant",
+        "routeKey": "...",
+        "predictedContext": {...}
+    }
+
+    Returns a structured JSON insight from Claude claude-sonnet-4-20250514.
+    Response schema:
+    {
+        "headline": str,
+        "summary": str,
+        "keyFigures": [...],
+        "barChart": {...},
+        "swotBreakdown": {...},
+        "recommendation": str,
+        "riskLevel": str,
+        "riskColor": str
+    }
+    """
+    user = _user_from_request(request)
+    if not user:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+    query_obj    = body.get("query", {})
+    columns      = body.get("columns", [])
+    count        = body.get("count", 0)
+    percentage   = body.get("percentage", 0)
+    label        = body.get("label", "")
+    route_key    = body.get("routeKey", "")
+    pred_ctx     = body.get("predictedContext", {})
+
+    filter_tags = ", ".join(f"{k}: {v}" for k, v in query_obj.items() if v and v != "Unknown")
+
+    user_prompt = (
+        f"Voter segment analysis for Mangalore South (Constituency 175, Karnataka):\n"
+        f"- Demographic filters: {filter_tags or 'All voters'}\n"
+        f"- Segment size: {count:,} voters ({percentage:.1f}% of constituency)\n"
+        f"- SWOT classification: {label}\n"
+        f"- Column dimensions: {', '.join(columns) or route_key}\n"
+        f"- All predicted political contexts: {json.dumps(pred_ctx)}"
+    )
+
+    system_prompt = (
+        "You are a senior political analyst for Mangalore South constituency (Karnataka, India). "
+        "Analyse the given voter segment and return a JSON object ONLY (no markdown, no extra text) with this exact structure:\n"
+        '{"headline":"One punchy 8-12 word insight title",'
+        '"summary":"2-3 sentence plain-language explanation",'
+        '"keyFigures":['
+        '{"label":"Segment Size","value":"<X voters>","note":"short context"},'
+        '{"label":"Share of Constituency","value":"<X%>","note":"short context"},'
+        '{"label":"Political Lean","value":"BJP/INC/Swing","note":"brief reason"},'
+        '{"label":"Impact Level","value":"<label>","note":"Dominant/Major/Moderate/Minor"}],'
+        '"barChart":{"title":"Estimated Vote Split",'
+        '"bars":['
+        '{"party":"BJP","pct":<0-100>,"color":"#fb923c"},'
+        '{"party":"INC","pct":<0-100>,"color":"#f87171"},'
+        '{"party":"Others","pct":<0-100>,"color":"#6b7280"}]},'
+        '"swotBreakdown":{"title":"Context-wise SWOT Signal",'
+        '"items":['
+        '{"ctx":"Economic","signal":"S/W/O/T/N","color":"#10b981","note":"1 line"},'
+        '{"ctx":"Health","signal":"S/W/O/T/N","color":"#22d3ee","note":"1 line"},'
+        '{"ctx":"Political","signal":"S/W/O/T/N","color":"#f59e0b","note":"1 line"}]},'
+        '"recommendation":"One specific actionable recommendation for 2028",'
+        '"riskLevel":"Low/Medium/High/Critical",'
+        '"riskColor":"#10b981 or #f59e0b or #fb923c or #f87171"}'
+    )
+
+    try:
+        client = _get_anthropic()
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1200,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        raw = "".join(b.text for b in message.content if hasattr(b, "text")).strip()
+        # Strip markdown fences if present
+        raw = raw.lstrip("```json").lstrip("```").rstrip("```").strip()
+        try:
+            insight = json.loads(raw)
+        except json.JSONDecodeError:
+            insight = {"_raw": raw}
+        return JsonResponse({"success": True, "insight": insight})
+    except Exception as exc:
+        return JsonResponse({"error": str(exc)}, status=500)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_ai_birdseye_view(request):
+    """
+    POST /api/ai/birdseye-view/
+    Body: {
+        "contextKey": "economic",
+        "queries": [... list of sanitised query objects ...],  # from api_ml_constituency_swot
+        "totalVoters": 246952   # optional, for context
+    }
+
+    Synthesises ALL queries for the selected context into a high-level
+    constituency-wide strategic overview with win probability estimate.
+
+    Response schema:
+    {
+        "headline": str,
+        "executiveSummary": str,
+        "swotRadar": [...],
+        "keyMetrics": [...],
+        "trendBars": {...},
+        "strategicPillars": [...],
+        "winProbability": int,
+        "confidenceNote": str
+    }
+    """
+    user = _user_from_request(request)
+    if not user:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+    ctx_key      = body.get("contextKey", "economic")
+    queries      = body.get("queries", [])
+    total_voters = body.get("totalVoters", 246952)
+
+    if not queries:
+        return JsonResponse({"error": "queries list is required."}, status=400)
+
+    # ── Aggregate stats ─────────────────────────────────────────────────────
+    swot_count   = {"Strength": 0, "Weakness": 0, "Opportunity": 0, "Threat": 0, "None": 0}
+    label_count  = {}
+    filter_freq  = {}
+
+    # Simple label-to-SWOT mapping (mirrors JS ctxToSwot logic)
+    _SWOT_MAP = {
+        "S": "Strength", "W": "Weakness", "O": "Opportunity", "T": "Threat",
+        "Strength": "Strength", "Weakness": "Weakness",
+        "Opportunity": "Opportunity", "Threat": "Threat",
+    }
+
+    for q in queries:
+        raw_ctx = (q.get("predictedContext") or {}).get(ctx_key, "")
+        # Extract S/W/O/T tokens from the label string
+        found = False
+        for token, swot in _SWOT_MAP.items():
+            if token in str(raw_ctx):
+                swot_count[swot] += 1
+                found = True
+                break
+        if not found:
+            swot_count["None"] += 1
+
+        lb = q.get("label", "None")
+        label_count[lb] = label_count.get(lb, 0) + 1
+
+        for k, v in (q.get("query") or {}).items():
+            if v and v != "Unknown":
+                key = f"{k}:{v}"
+                filter_freq[key] = filter_freq.get(key, 0) + 1
+
+    top_filters = ", ".join(
+        f"{k} ({c}x)" for k, c in
+        sorted(filter_freq.items(), key=lambda x: -x[1])[:10]
+    )
+    total_query_voter_refs = sum(q.get("count", 0) for q in queries)
+
+    user_prompt = (
+        f"Mangalore South Constituency (175) — Bird's Eye SWOT Overview\n"
+        f"Context analysed: {ctx_key}\n"
+        f"Total query groups: {len(queries)}\n"
+        f"Total voter-mentions: {total_query_voter_refs:,}\n"
+        f"SWOT distribution: Strength={swot_count['Strength']}, "
+        f"Weakness={swot_count['Weakness']}, "
+        f"Opportunity={swot_count['Opportunity']}, "
+        f"Threat={swot_count['Threat']}, "
+        f"Unclassified={swot_count['None']}\n"
+        f"Impact label distribution: {json.dumps(label_count)}\n"
+        f"Most frequent demographic filters: {top_filters}"
+    )
+
+    system_prompt = (
+        "You are a senior political strategist for Mangalore South constituency. "
+        "Provide a comprehensive bird's eye strategic view. "
+        "Return ONLY a JSON object (no markdown, no extra text):\n"
+        '{"headline":"Strategic overview title (10-15 words)",'
+        '"executiveSummary":"3-4 sentence overall picture",'
+        '"swotRadar":['
+        '{"axis":"Strength","score":<0-100>,"color":"#10b981","note":"1-line reason"},'
+        '{"axis":"Weakness","score":<0-100>,"color":"#f87171","note":"1-line reason"},'
+        '{"axis":"Opportunity","score":<0-100>,"color":"#22d3ee","note":"1-line reason"},'
+        '{"axis":"Threat","score":<0-100>,"color":"#fb923c","note":"1-line reason"}],'
+        '"keyMetrics":['
+        '{"label":"Dominant Quadrant","value":"...","color":"#10b981"},'
+        '{"label":"Query Groups","value":"<N>","color":"#a78bfa"},'
+        '{"label":"Voter Reach","value":"<N>","color":"#22d3ee"},'
+        '{"label":"Top Risk Factor","value":"short phrase","color":"#f87171"}],'
+        '"trendBars":{"title":"SWOT Distribution (% of groups)",'
+        '"bars":['
+        '{"label":"Strength","pct":<0-100>,"color":"#10b981"},'
+        '{"label":"Weakness","pct":<0-100>,"color":"#f87171"},'
+        '{"label":"Opportunity","pct":<0-100>,"color":"#22d3ee"},'
+        '{"label":"Threat","pct":<0-100>,"color":"#fb923c"}]},'
+        '"strategicPillars":['
+        '{"title":"Consolidate","body":"What to protect/double down on","color":"#10b981"},'
+        '{"title":"Fix","body":"Top weakness to address before 2028","color":"#f87171"},'
+        '{"title":"Capitalise","body":"Best opportunity to act on now","color":"#22d3ee"},'
+        '{"title":"Neutralise","body":"Most urgent threat to defuse","color":"#fb923c"}],'
+        '"winProbability":<0-100>,'
+        '"confidenceNote":"1 sentence on data confidence"}'
+    )
+
+    try:
+        client = _get_anthropic()
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1800,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        raw = "".join(b.text for b in message.content if hasattr(b, "text")).strip()
+        raw = raw.lstrip("```json").lstrip("```").rstrip("```").strip()
+        try:
+            insight = json.loads(raw)
+        except json.JSONDecodeError:
+            insight = {"_raw": raw}
+        return JsonResponse({"success": True, "insight": insight})
+    except Exception as exc:
+        return JsonResponse({"error": str(exc)}, status=500)
+
     """
     GET /api/ml/ward-swot/?ward=<wardNumber>
     Returns predicted queries for a specific ward from NewQueryStack1.
