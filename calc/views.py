@@ -4382,7 +4382,7 @@ def api_me(request):
     return JsonResponse({'loggedIn': False}, status=401)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ML INTELLIGENCE — ConstituencyQueryStack & WardWiseQueryStack endpoints
+# ML INTELLIGENCE — NewQueryStack1 endpoint
 # Returns all query objects (with predictedContext) for SWOT display in React.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4391,7 +4391,7 @@ CONSTITUENCY_NUMBER = 175
 ML_CHUNK_SIZE       = 500   # must match predict_query_stack.py
 
 def _get_ml_db():
-    """Return SurveyDataBase from the survey cluster (same cluster as ConstituencyQueryStack)."""
+    """Return SurveyDataBase from the survey cluster (same cluster as NewQueryStack1)."""
     return _get_survey_client()["SurveyDataBase"]
 
 
@@ -4432,14 +4432,14 @@ def _sanitise_queries(queries: list) -> list:
 def api_ml_constituency_swot(request):
     """
     GET /api/ml/constituency-swot/
-    Returns all predicted queries for Mangalore South constituency.
+    Returns all predicted queries for Mangalore South constituency from NewQueryStack1.
     """
     user = _user_from_request(request)
     if not user:
         return JsonResponse({"error": "Unauthorized"}, status=401)
     try:
         db  = _get_ml_db()
-        col = db["ConstituencyQueryStack"]
+        col = db["NewQueryStack1"]
         queries = _reassemble_chunks(col, {
             "constituencyNumber": CONSTITUENCY_NUMBER,
             "constituencyName":   CONSTITUENCY_NAME,
@@ -4459,7 +4459,7 @@ def api_ml_constituency_swot(request):
 def api_ml_ward_swot(request):
     """
     GET /api/ml/ward-swot/?ward=<wardNumber>
-    Returns all predicted queries for a specific ward.
+    Returns all predicted queries for a specific ward from NewQueryStack1.
     """
     user = _user_from_request(request)
     if not user:
@@ -4476,7 +4476,7 @@ def api_ml_ward_swot(request):
 
     try:
         db        = _get_ml_db()
-        col       = db["WardWiseQueryStack"]
+        col       = db["NewQueryStack1"]
         queries   = _reassemble_chunks(col, {"wardNumber": ward_no})
         ward_name = WARD_NUM_TO_NAME.get(ward_no, f"Ward {ward_no}")
         return JsonResponse({
