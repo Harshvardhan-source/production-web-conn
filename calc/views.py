@@ -2579,7 +2579,9 @@ from functools import lru_cache as _lru_cache
 def _phonetic_norm(s: str) -> str:
     for old, new in _PHONETIC_RULES:
         s = s.replace(old, new)
-    return s.rstrip('A')
+    # FIX: strip trailing 'A' per token, not on the full multi-word string.
+    # Previously "SANTHA KUMARA" → "SANTHA KUM" (wrong), now → "SANTH KUMAR" (correct).
+    return ' '.join(tok.rstrip('A') for tok in s.split())
 
 
 # ── _gen_prefixes: phonetic-aware prefix variants for candidate fetching ───────
@@ -2853,7 +2855,9 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
             if best_doc and best_score >= _FUZZY_THRESHOLD:
                 return bson_clean(best_doc)
 
-    # Tier 4: phonetic-aware prefix → fuzzy, tries all variant prefixes
+    # Tier 4: phonetic-aware prefix → fuzzy, tries all variant prefixes.
+    # FIX: limit raised 40→200 so common first names like "RAJESH" (26+ records)
+    # are not silently truncated before the target record is reached.
     if name:
         _ft4 = name.split()[0]
         _seen_tier4 = set()
@@ -2861,13 +2865,50 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
         for _pfx_v in _gen_prefixes(_ft4):
             for doc in col.find(
                 {'Name': {'$regex': f'^{re.escape(_pfx_v)}', '$options': 'i'}}, _PROJ_25
-            ).limit(40):
+            ).limit(200):                                       # ← was 40
                 oid = str(doc.get('_id',''))
                 if oid not in _seen_tier4:
                     _seen_tier4.add(oid)
                     all_candidates.append(doc)
         if all_candidates:
             best_doc, best_score = _score_candidates(all_candidates, _flat_2025, name, relation)
+            if best_doc and best_score >= _FUZZY_THRESHOLD:
+                return bson_clean(best_doc)
+
+    # Tier 4b: surname / last-token contains search.
+    # Catches "RAJESH SHETTY" even when first-name prefix scan returned too many
+    # generic hits and the specific "SHETTY" token was not in the top-200.
+    # Only runs when name has ≥ 2 tokens and the surname is ≥ 4 chars.
+    _name_toks_t4b = name.split() if name else []
+    if len(_name_toks_t4b) >= 2:
+        _surname_t4b = _name_toks_t4b[-1]
+        if len(_surname_t4b) >= 4:
+            _seen_t4b = set()
+            _cands_t4b = []
+            for doc in col.find(
+                {'Name': {'$regex': re.escape(_surname_t4b), '$options': 'i'}}, _PROJ_25
+            ).limit(200):
+                oid = str(doc.get('_id', ''))
+                if oid not in _seen_t4b:
+                    _seen_t4b.add(oid)
+                    _cands_t4b.append(doc)
+            if _cands_t4b:
+                best_doc, best_score = _score_candidates(_cands_t4b, _flat_2025, name, relation)
+                if best_doc and best_score >= _FUZZY_THRESHOLD:
+                    return bson_clean(best_doc)
+
+    # Tier 4c: full-name contains — fetches any record containing ALL query tokens.
+    # Last safety net: "RAJESH SHETTY" → find docs where Name contains both
+    # "RAJESH" and "SHETTY" regardless of order (handles "SHETTY RAJESH" storage).
+    _name_toks_t4c = [t for t in (name.split() if name else []) if len(t) >= 4]
+    if len(_name_toks_t4c) >= 2:
+        _and_clauses = [
+            {'Name': {'$regex': re.escape(tok), '$options': 'i'}}
+            for tok in _name_toks_t4c
+        ]
+        _cands_t4c = list(col.find({'$and': _and_clauses}, _PROJ_25).limit(100))
+        if _cands_t4c:
+            best_doc, best_score = _score_candidates(_cands_t4c, _flat_2025, name, relation)
             if best_doc and best_score >= _FUZZY_THRESHOLD:
                 return bson_clean(best_doc)
 
@@ -2942,7 +2983,8 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
             if best_doc and best_score >= 55:
                 return bson_clean(best_doc)
 
-    # Tier 5: phonetic-aware prefix scan — tries all variant prefixes
+    # Tier 5: phonetic-aware prefix scan — tries all variant prefixes.
+    # FIX: limit raised 40→200 so common first names don't get truncated.
     if name and len(name) >= 3:
         _ft5 = name.split()[0]
         _seen_tier5 = set()
@@ -2951,7 +2993,7 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
             px = {'$regex': f'^{re.escape(_pfx_v)}', '$options': 'i'}
             for doc in col.find(
                 {'$or': [{'Voter Name': px}, {'Name': px}]}, _PROJ_02
-            ).limit(40):
+            ).limit(200):                                       # ← was 40
                 oid = str(doc.get('_id',''))
                 if oid not in _seen_tier5:
                     _seen_tier5.add(oid)
@@ -2959,6 +3001,44 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
         if all_candidates_02:
             best_doc, best_score = _score_candidates(all_candidates_02, _flat_2002, name, relation)
             # Lower threshold when house is also known (double-confirms the match)
+            threshold = 68 if house else _FUZZY_THRESHOLD
+            if best_doc and best_score >= threshold:
+                return bson_clean(best_doc)
+
+    # Tier 5b: surname / last-token contains search (schema-agnostic).
+    # Catches "RAJESH SHETTY" when 2002 stores it as "SHETTY RAJESH" or
+    # the first-name prefix scan was exhausted by common names.
+    _name_toks_t5b = name.split() if name else []
+    if len(_name_toks_t5b) >= 2:
+        _surname_t5b = _name_toks_t5b[-1]
+        if len(_surname_t5b) >= 4:
+            _seen_t5b = set()
+            _cands_t5b = []
+            sn_rx = {'$regex': re.escape(_surname_t5b), '$options': 'i'}
+            for doc in col.find(
+                {'$or': [{'Voter Name': sn_rx}, {'Name': sn_rx}]}, _PROJ_02
+            ).limit(200):
+                oid = str(doc.get('_id', ''))
+                if oid not in _seen_t5b:
+                    _seen_t5b.add(oid)
+                    _cands_t5b.append(doc)
+            if _cands_t5b:
+                best_doc, best_score = _score_candidates(_cands_t5b, _flat_2002, name, relation)
+                threshold = 68 if house else _FUZZY_THRESHOLD
+                if best_doc and best_score >= threshold:
+                    return bson_clean(best_doc)
+
+    # Tier 5c: full-name AND-contains — all query tokens must appear in the name.
+    # Handles inverted storage order "SHETTY RAJESH" when query is "RAJESH SHETTY".
+    _name_toks_t5c = [t for t in (name.split() if name else []) if len(t) >= 4]
+    if len(_name_toks_t5c) >= 2:
+        _and_clauses_02 = []
+        for tok in _name_toks_t5c:
+            tok_rx = {'$regex': re.escape(tok), '$options': 'i'}
+            _and_clauses_02.append({'$or': [{'Voter Name': tok_rx}, {'Name': tok_rx}]})
+        _cands_t5c = list(col.find({'$and': _and_clauses_02}, _PROJ_02).limit(100))
+        if _cands_t5c:
+            best_doc, best_score = _score_candidates(_cands_t5c, _flat_2002, name, relation)
             threshold = 68 if house else _FUZZY_THRESHOLD
             if best_doc and best_score >= threshold:
                 return bson_clean(best_doc)
