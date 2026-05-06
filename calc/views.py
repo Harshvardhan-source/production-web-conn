@@ -2700,9 +2700,11 @@ def _name_score(a: str, b: str) -> float:
 
     if _RAPIDFUZZ_AVAILABLE:
         # rapidfuzz is 50-100× faster than pure-Python; skip Levenshtein entirely
+        # token_set_ratio added: handles "RAJESH SHETTY" vs "SHETTY RAJESH" (word-order variants)
         return max(
             _rfuzz.token_sort_ratio(a, b),
             _rfuzz.token_sort_ratio(pa, pb),
+            _rfuzz.token_set_ratio(a, b),
             _rfuzz.partial_ratio(a, b),
             _rfdist.JaroWinkler.normalized_similarity(a, b) * 100,
             _rfdist.JaroWinkler.normalized_similarity(pa, pb) * 100,
@@ -3283,6 +3285,18 @@ def api_check_sir(request):
                     {'Name':       _surname_contains_rx},
                 ]}, _PROJ_02).limit(200))
 
+            # c4) All-token contains: fetch records containing ANY query token (≥4 chars)
+            # anywhere in the name.  Catches inverted or middle-name storage order.
+            if _name_tokens:
+                _ct_clauses = []
+                for tok in _name_tokens:
+                    if len(tok) >= 4:
+                        rx = {'$regex': re.escape(tok), '$options': 'i'}
+                        _ct_clauses.append({'Voter Name': rx})
+                        _ct_clauses.append({'Name': rx})
+                if _ct_clauses:
+                    _add(col_2002.find({'$or': _ct_clauses}, _PROJ_02).limit(300))
+
             # d) Relation prefix
             if relation and len(relation) >= 2:
                 frt = relation.split()[0]
@@ -3322,6 +3336,16 @@ def api_check_sir(request):
             # Surname "contains" fallback
             if _surname_contains_rx:
                 _add(col_2025.find({'Name': _surname_contains_rx}, _PROJ_25).limit(200))
+
+            # All-token contains search: fetch records containing ANY query token (≥4 chars)
+            # anywhere in the Name field.  Catches "SHETTY RAJESH" when query is "RAJESH SHETTY".
+            if _name_tokens:
+                _contains_clauses = [
+                    {'Name': {'$regex': re.escape(tok), '$options': 'i'}}
+                    for tok in _name_tokens if len(tok) >= 4
+                ]
+                if _contains_clauses:
+                    _add(col_2025.find({'$or': _contains_clauses}, _PROJ_25).limit(300))
 
             if relation and len(relation) >= 3:
                 frt = relation.split()[0]
@@ -3450,10 +3474,14 @@ def api_check_sir(request):
             comp = 100.0 if e_ok else 0.0
         if e_ok: comp = max(comp, 95.0)
 
-        # Gate: drop very poor name matches when name was the primary search key
-        # Lowered from 30 → 20 so that surname-matched candidates (e.g. "Shetty") are not dropped
-        # when the first-name score alone is weak but the full-name token_sort score is good.
-        if has_name and n_sc < 20 and not e_ok and not h_ok: continue
+        # Gate: drop candidates with no meaningful signal.
+        # Surname-contains bypass: if any query token (≥4 chars) appears verbatim in
+        # the stored name, never drop the candidate — it will be ranked low but visible.
+        _surname_hit = has_name and any(
+            len(tok) >= 4 and tok in flat['name']
+            for tok in name.split()
+        )
+        if has_name and n_sc < 15 and not e_ok and not h_ok and not _surname_hit: continue
         if has_rel and not has_name and r_sc < 30 and not e_ok: continue
 
         matched_by = []
@@ -3506,10 +3534,19 @@ def api_check_sir(request):
 
     def _flags25(rn, rr, rh, re_):
         flags = []
-        if voterid and re_ and voterid.upper() == re_.upper():          flags.append('voterid')
-        if name and len(name) >= 2 and _name_score(name, rn) >= 60:    flags.append('name')
+        if voterid and re_ and voterid.upper() == re_.upper():           flags.append('voterid')
+        # Lowered 60→45: two-word query like "RAJESH SHETTY" may score 50-58 against
+        # a stored single-word first-name token; we still want to surface the candidate.
+        if name and len(name) >= 2 and _name_score(name, rn) >= 45:     flags.append('name')
+        # Surname-contains fast-pass: if ANY token of the query appears inside the stored name,
+        # count it as a weak 'name' hit so the candidate is NOT silently dropped.
+        if name and 'name' not in flags:
+            for _qtok in name.split():
+                if len(_qtok) >= 4 and _qtok in rn:
+                    flags.append('name')
+                    break
         if house and rh and (rh.upper() == house.upper() or rh.upper().startswith(house.upper())):
-                                                                         flags.append('house')
+                                                                          flags.append('house')
         if relation and len(relation) >= 2 and _name_score(relation, rr) >= 60: flags.append('relation')
         return flags
 
