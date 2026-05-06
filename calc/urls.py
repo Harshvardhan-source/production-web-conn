@@ -39,13 +39,11 @@ urlpatterns = [
     path('sir-bulk/',                views.api_sir_bulk,           name='api_sir_bulk'),
     path('sir/records/',             views.api_sir_records,        name='api_sir_records'),
     path('sir/stats/',               views.api_sir_stats,          name='api_sir_stats'),
-    
-    # Add these two lines to api/urls.py urlpatterns list:
-    
+
     path('update-voter/',  views.api_update_voter,  name='api_update_voter'),
     path('update-survey/', views.api_update_survey, name='api_update_survey'),
     path('large-families/', views.api_large_families, name='api_large_families'),
-    
+
     # Wards
     path('wards/',                   views.api_wards,              name='api_wards'),
 
@@ -56,11 +54,15 @@ urlpatterns = [
     path('admin/update-role/',       views.api_admin_update_role,  name='api_admin_update_role'),
     path('api/admin/disable/', views.api_admin_disable, name='admin_disable'),
     path('api/admin/enable/',  views.api_admin_enable,  name='admin_enable'),
-    
+
+    # ── NEW: Survey Progress & Location Tracking (Admin only) ─────────────────
+    path('admin/survey-progress/',   views.api_admin_survey_progress,  name='api_admin_survey_progress'),
+    path('location/ping/',           views.api_location_ping,          name='api_location_ping'),
+    path('admin/locations/',         views.api_admin_locations,        name='api_admin_locations'),
+    path('admin/location-dates/',    views.api_admin_location_dates,   name='api_admin_location_dates'),
 
     # ML Intelligence — ConstituencyQueryStack & WardWiseQueryStack
     path('ml/constituency-swot/', views.api_ml_constituency_swot, name='api_ml_constituency_swot'),
-   
 
     # AI Insights — Anthropic-powered analysis (per-query and bird's eye)
     path('ai/query-insight/',     views.api_ai_query_insight,     name='api_ai_query_insight'),

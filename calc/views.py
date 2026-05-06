@@ -15,7 +15,8 @@ import pandas as pd
 import json
 import re
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
+import math
 from bson import ObjectId
 import ast
 import jwt as pyjwt
@@ -4830,3 +4831,319 @@ def api_ai_birdseye_view(request):
         })
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SURVEY PROGRESS  — booth-worker progress visible in Admin Panel
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@require_http_methods(['GET'])
+@_require_superuser
+def api_admin_survey_progress(request):
+    """
+    GET /api/admin/survey-progress/
+    Returns per-booth-worker survey completion stats.
+
+    For each approved booth_worker:
+      - boothNumber
+      - wardNumber / wardName
+      - housesCompleted  — distinct houseNumber values in SurveyRecords for their booth
+      - totalHouses      — distinct 'House No' values in 2025 roll for their booth
+      - votersSurveyed   — count of SurveyRecords docs for their booth
+      - totalVoters      — count of 2025 roll docs for their booth
+      - housesPct / votersPct  (0-100 floats)
+      - lastSurveyAt     — timestamp of their most recent submission
+
+    Query params (all optional):
+      ?booth=<n>   — filter to a specific booth
+      ?ward=<n>    — filter to a specific ward number (returns all workers in that ward)
+    """
+    db         = get_db()
+    survey_db  = get_survey_db()
+    survey_col = survey_db['SurveyRecords']
+    voter_col  = db['2025']
+    user_col   = db['UserReg']
+
+    booth_filter = request.GET.get('booth', '').strip()
+    ward_filter  = request.GET.get('ward',  '').strip()
+
+    # ── 1. Fetch all approved booth_workers ──────────────────────────────────
+    query = {'role': 'booth_worker', 'status': 'approved'}
+    if booth_filter:
+        query['booth'] = booth_filter
+    if ward_filter:
+        # workers whose booth falls inside the requested ward
+        ward_booths = [str(b) for b in WARD_FULL_DATA.get(int(ward_filter), {}).get('booths', [])]
+        query['booth'] = {'$in': ward_booths}
+
+    workers = list(user_col.find(query, {
+        'Password': 0,
+        'Username': 1, 'Email': 1, 'booth': 1, 'ward': 1,
+        'approvedAt': 1, 'approvedBy': 1,
+    }))
+
+    if not workers:
+        return JsonResponse({'success': True, 'workers': []})
+
+    # ── 2. Aggregate SurveyRecords per booth in ONE pipeline ─────────────────
+    booths_needed = list({str(w.get('booth', '')) for w in workers if w.get('booth')})
+
+    # Convert booth strings to ints where possible for flexible matching
+    booth_query_vals = []
+    for b in booths_needed:
+        booth_query_vals.append(b)
+        try:
+            booth_query_vals.append(int(b))
+        except ValueError:
+            pass
+
+    survey_pipeline = [
+        {'$match': {'boothNumber': {'$in': booth_query_vals}}},
+        {'$group': {
+            '_id': {'$toString': '$boothNumber'},
+            'votersSurveyed': {'$sum': 1},
+            'housesSet':      {'$addToSet': '$houseNumber'},
+            'lastSurveyAt':   {'$max': '$Time_stamp'},
+        }},
+    ]
+    survey_stats = {
+        doc['_id']: doc
+        for doc in survey_col.aggregate(survey_pipeline)
+    }
+
+    # ── 3. Aggregate 2025 voter roll per booth ────────────────────────────────
+    voter_pipeline = [
+        {'$match': {'Part No': {'$in': booth_query_vals}}},
+        {'$group': {
+            '_id': {'$toString': '$Part No'},
+            'totalVoters': {'$sum': 1},
+            'totalHouses': {'$addToSet': '$House No'},
+        }},
+    ]
+    voter_stats = {
+        doc['_id']: doc
+        for doc in voter_col.aggregate(voter_pipeline)
+    }
+
+    # ── 4. Build response ─────────────────────────────────────────────────────
+    result = []
+    for w in workers:
+        booth_str  = str(w.get('booth', ''))
+        ward_num   = BOOTH_TO_WARD.get(booth_str, '')
+        ward_name  = WARD_NUM_TO_NAME.get(ward_num, '') or WARD_NUM_TO_NAME.get(int(ward_num) if ward_num.isdigit() else '', '')
+
+        s = survey_stats.get(booth_str, {})
+        v = voter_stats.get(booth_str, {})
+
+        houses_completed = len(s.get('housesSet', []))
+        voters_surveyed  = s.get('votersSurveyed', 0)
+        total_houses     = len(v.get('totalHouses', []))
+        total_voters     = v.get('totalVoters', 0)
+        last_at          = s.get('lastSurveyAt')
+
+        houses_pct = round(houses_completed / total_houses * 100, 1) if total_houses else 0
+        voters_pct = round(voters_surveyed  / total_voters  * 100, 1) if total_voters  else 0
+
+        result.append({
+            'email':            w.get('Email', ''),
+            'username':         w.get('Username', ''),
+            'boothNumber':      booth_str,
+            'wardNumber':       ward_num,
+            'wardName':         ward_name,
+            'housesCompleted':  houses_completed,
+            'totalHouses':      total_houses,
+            'housesPct':        houses_pct,
+            'votersSurveyed':   voters_surveyed,
+            'totalVoters':      total_voters,
+            'votersPct':        voters_pct,
+            'lastSurveyAt':     last_at.isoformat() if hasattr(last_at, 'isoformat') else str(last_at or ''),
+        })
+
+    # Sort by booth number
+    result.sort(key=lambda x: int(x['boothNumber']) if x['boothNumber'].isdigit() else 0)
+
+    return JsonResponse({'success': True, 'workers': result})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOCATION TRACKING
+# Workers ping their location every N seconds while the app is open.
+# Admin can query the live / history view per worker.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def api_location_ping(request):
+    """
+    POST /api/location/ping/
+    Body: { "lat": 12.8762, "lng": 74.8425, "accuracy": 15.0 }
+
+    Called by the React app at regular intervals (every 30–60 s) while open.
+    Stores a single document in SurveyDataBase.LocationHistory.
+
+    Auth: any approved user (booth_worker, corporator, mla, pa).
+    """
+    user = _user_from_request(request)
+    if not user:
+        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+    if not _is_approved(user):
+        return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
+
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        return JsonResponse({'success': False, 'message': 'Invalid JSON.'}, status=400)
+
+    lat      = body.get('lat')
+    lng      = body.get('lng')
+    accuracy = body.get('accuracy', None)
+
+    if lat is None or lng is None:
+        return JsonResponse({'success': False, 'message': 'lat and lng are required.'}, status=400)
+
+    try:
+        lat = float(lat)
+        lng = float(lng)
+    except (TypeError, ValueError):
+        return JsonResponse({'success': False, 'message': 'lat/lng must be numbers.'}, status=400)
+
+    doc = {
+        'email':      user['email'],
+        'username':   user['username'],
+        'role':       user['role'],
+        'booth':      user.get('booth', ''),
+        'ward':       user.get('ward',  ''),
+        'lat':        lat,
+        'lng':        lng,
+        'accuracy':   accuracy,
+        'timestamp':  datetime.utcnow(),
+    }
+
+    get_survey_db()['LocationHistory'].insert_one(doc)
+    return JsonResponse({'success': True})
+
+
+@require_http_methods(['GET'])
+@_require_superuser
+def api_admin_locations(request):
+    """
+    GET /api/admin/locations/
+    Returns location data for all workers.
+
+    Query params (all optional):
+      ?email=<email>   — filter to one worker
+      ?mode=live       — only the most recent ping per worker (default)
+      ?mode=history    — all pings for the specified worker (requires ?email=)
+      ?date=YYYY-MM-DD — filter history to a specific date (UTC)
+      ?limit=<n>       — max history records (default 200)
+
+    Live response (mode=live):
+    {
+      "success": true,
+      "mode": "live",
+      "workers": [
+        {
+          "email": "...", "username": "...", "role": "...",
+          "booth": "...", "ward": "...",
+          "lat": 12.87, "lng": 74.84, "accuracy": 12.0,
+          "timestamp": "2026-04-19T10:23:11"
+        }, ...
+      ]
+    }
+
+    History response (mode=history):
+    {
+      "success": true,
+      "mode": "history",
+      "email": "...",
+      "pings": [ { "lat":..., "lng":..., "accuracy":..., "timestamp":... }, ... ]
+    }
+    """
+    loc_col = get_survey_db()['LocationHistory']
+    mode    = request.GET.get('mode',  'live').strip().lower()
+    email   = request.GET.get('email', '').strip().lower()
+    date_str= request.GET.get('date',  '').strip()
+    limit   = int(request.GET.get('limit', 200))
+
+    if mode == 'history':
+        if not email:
+            return JsonResponse({'success': False, 'message': 'email is required for history mode.'}, status=400)
+
+        match = {'email': email}
+        if date_str:
+            try:
+                day_start = datetime.strptime(date_str, '%Y-%m-%d')
+                day_end   = day_start.replace(hour=23, minute=59, second=59)
+                match['timestamp'] = {'$gte': day_start, '$lte': day_end}
+            except ValueError:
+                return JsonResponse({'success': False, 'message': 'date must be YYYY-MM-DD.'}, status=400)
+
+        pings = list(
+            loc_col.find(match, {'_id': 0, 'email': 0, 'username': 0, 'role': 0, 'booth': 0, 'ward': 0})
+                   .sort('timestamp', -1)
+                   .limit(limit)
+        )
+        # reverse so oldest first (chronological path on map)
+        pings.reverse()
+        for p in pings:
+            if hasattr(p.get('timestamp'), 'isoformat'):
+                p['timestamp'] = p['timestamp'].isoformat()
+
+        return JsonResponse({'success': True, 'mode': 'history', 'email': email, 'pings': pings})
+
+    else:
+        # ── Live: latest ping per worker ──────────────────────────────────────
+        match = {}
+        if email:
+            match['email'] = email
+
+        pipeline = [
+            {'$match': match} if match else {'$match': {}},
+            {'$sort': {'timestamp': -1}},
+            {'$group': {
+                '_id':       '$email',
+                'email':     {'$first': '$email'},
+                'username':  {'$first': '$username'},
+                'role':      {'$first': '$role'},
+                'booth':     {'$first': '$booth'},
+                'ward':      {'$first': '$ward'},
+                'lat':       {'$first': '$lat'},
+                'lng':       {'$first': '$lng'},
+                'accuracy':  {'$first': '$accuracy'},
+                'timestamp': {'$first': '$timestamp'},
+            }},
+            {'$sort': {'booth': 1}},
+        ]
+
+        workers = list(loc_col.aggregate(pipeline))
+        for w in workers:
+            w.pop('_id', None)
+            if hasattr(w.get('timestamp'), 'isoformat'):
+                w['timestamp'] = w['timestamp'].isoformat()
+
+        return JsonResponse({'success': True, 'mode': 'live', 'workers': workers})
+
+
+@require_http_methods(['GET'])
+@_require_superuser
+def api_admin_location_dates(request):
+    """
+    GET /api/admin/location-dates/?email=<email>
+    Returns distinct calendar dates on which a worker sent location pings.
+    Useful for the date-picker in the history view.
+    """
+    email = request.GET.get('email', '').strip().lower()
+    if not email:
+        return JsonResponse({'success': False, 'message': 'email is required.'}, status=400)
+
+    loc_col = get_survey_db()['LocationHistory']
+    pipeline = [
+        {'$match': {'email': email}},
+        {'$project': {
+            'date': {'$dateToString': {'format': '%Y-%m-%d', 'date': '$timestamp'}}
+        }},
+        {'$group': {'_id': '$date'}},
+        {'$sort': {'_id': -1}},
+        {'$limit': 90},
+    ]
+    dates = [doc['_id'] for doc in loc_col.aggregate(pipeline)]
+    return JsonResponse({'success': True, 'dates': dates})
