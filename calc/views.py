@@ -1450,6 +1450,16 @@ def api_save_survey(request):
         'diseaseName':      _val('diseaseName')  if body.get('healthStatus') == 'Diseased' else None,
         'differentlyAbled': _val('differentlyAbled', 'No'),
 
+        # ── Party Membership ─────────────────────────────────────
+        # partyMember: 'Yes' | 'No'
+        # partyMembershipId: unique ID string supplied by the surveyor (only when partyMember='Yes')
+        # bjpMember: True | False | None
+        #   True/False = verified via BJP DB (once connected)
+        #   None       = DB not yet connected; ID stored for future verification
+        'partyMember':        _val('partyMember', 'No'),
+        'partyMembershipId':  _val('partyMembershipId') if body.get('partyMember') == 'Yes' else None,
+        'bjpMember':          body.get('bjpMember'),   # True / False / None
+
         # ── 2025 voter roll prefill fields ────────────────────────
         'relation':             _val('relation'),
         'relationName':         _val('relationName'),
@@ -4768,5 +4778,3 @@ def api_ai_birdseye_view(request):
         })
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)
-    
-    
