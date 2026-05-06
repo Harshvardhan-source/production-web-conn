@@ -1298,6 +1298,7 @@ def api_save_survey(request):
 
     # ── Parse body — supports JSON, multipart, and url-encoded ──────────────
     aadhaar_photo_file = None
+    sir_form_photo_file = None
     ct = (request.content_type or '').lower()
 
     if 'multipart' in ct:
@@ -1310,6 +1311,7 @@ def api_save_survey(request):
             print(f"[api_save_survey] multipart JSON parse error: {_me}")
             body = {k: v for k, v in request.POST.items()}
         aadhaar_photo_file = request.FILES.get('aadhaar_photo')
+        sir_form_photo_file = request.FILES.get('sir_form_photo')
 
     else:
         # JSON / url-encoded path
@@ -1403,6 +1405,9 @@ def api_save_survey(request):
 
         # ── Aadhaar photo (GCS URL if uploaded, else None) ─────────
         'aadhaarPhotoUrl':  None,
+
+        # ── SIR application form photo (GCS URL if uploaded, else None) ──
+        'sirFormPhotoUrl':  None,
 
         # ── Government schemes used ────────────────────────────────
         'schemesUsed':      body.get('schemes') or [],
@@ -1546,6 +1551,21 @@ def api_save_survey(request):
             # Non-fatal — survey still saves, photo URL stays None
             data['aadhaarPhotoUrl'] = None
             print(f"[api_save_survey] ✗ Aadhaar GCS upload failed: {_photo_err}")
+
+    # ── 5a-ii. Upload SIR form photo to GCS if provided ──────────────────────
+    if sir_form_photo_file:
+        try:
+            import uuid as _uuid, os as _os
+            first = (body.get('firstName') or 'unknown').replace(' ', '_').lower()
+            last  = (body.get('lastName')  or '').replace(' ', '_').lower()
+            ext   = _os.path.splitext(sir_form_photo_file.name)[1].lower() or '.jpg'
+            blob_name = f"sir_form_photos/{first}_{last}_{final_serial}_{_uuid.uuid4().hex[:8]}{ext}"
+            sir_photo_url = _upload_to_gcs(sir_form_photo_file, blob_name)
+            data['sirFormPhotoUrl'] = sir_photo_url
+            print(f"[api_save_survey] ✓ SIR form photo uploaded to GCS: {sir_photo_url}")
+        except Exception as _sir_photo_err:
+            data['sirFormPhotoUrl'] = None
+            print(f"[api_save_survey] ✗ SIR form photo GCS upload failed: {_sir_photo_err}")
 
     # ── 5b. Always save directly to SurveyRecords ────────────────────────────
     survey_db['SurveyRecords'].insert_one(data)
