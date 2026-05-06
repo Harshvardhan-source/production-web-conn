@@ -2115,6 +2115,31 @@ def api_data_view(request):
             else:
                 query = {}
 
+        elif view_type == 'outstation_voters':
+            # ── Outstation voters: SurveyRecords where outstationResident = 'Yes' ──
+            per_page = min(int(request.GET.get('per_page', 100)), 500)
+            db       = get_survey_db()
+            coll     = db['SurveyRecords']
+            PROJ     = None
+            base_filter = {'outstationResident': 'Yes'}
+            if search:
+                regex = {'$regex': search, '$options': 'i'}
+                query = {'$and': [
+                    base_filter,
+                    {'$or': [
+                        {'firstName':      regex},
+                        {'lastName':       regex},
+                        {'voterid':        regex},
+                        {'outstationCity': regex},
+                        {'outstationState':regex},
+                        {'wardNumber':     regex},
+                        {'houseNumber':    regex},
+                        {'contactNumber':  regex},
+                    ]}
+                ]}
+            else:
+                query = base_filter
+
         else:  # survey (default)
             per_page = min(int(request.GET.get('per_page', 100)), 500)
             db       = get_survey_db()
@@ -2152,10 +2177,11 @@ def api_data_view(request):
         display_cols = [k for k in all_keys if k != '_id']
 
         coll_name = {
-            'voter':         '2025',
-            'survey':        'SurveyRecords',
-            'future_voters': 'FutureVoters',
-            'deceased':      'Deceased',
+            'voter':              '2025',
+            'survey':             'SurveyRecords',
+            'future_voters':      'FutureVoters',
+            'deceased':           'Deceased',
+            'outstation_voters':  'SurveyRecords',
         }.get(view_type, view_type)
 
         return JsonResponse({
