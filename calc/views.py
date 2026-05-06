@@ -2115,6 +2115,31 @@ def api_data_view(request):
             else:
                 query = {}
 
+        elif view_type == 'bjp_members':
+            # ── BJP Members: SurveyRecords where partyMember = 'Yes' ────────────
+            per_page = min(int(request.GET.get('per_page', 100)), 500)
+            db       = get_survey_db()
+            coll     = db['SurveyRecords']
+            PROJ     = None
+            base_filter = {'partyMember': 'Yes'}
+            if search:
+                regex = {'$regex': search, '$options': 'i'}
+                query = {'$and': [
+                    base_filter,
+                    {'$or': [
+                        {'firstName':         regex},
+                        {'lastName':          regex},
+                        {'voterid':           regex},
+                        {'partyMembershipId': regex},
+                        {'wardNumber':        regex},
+                        {'houseNumber':       regex},
+                        {'contactNumber':     regex},
+                        {'community':         regex},
+                    ]}
+                ]}
+            else:
+                query = base_filter
+
         elif view_type == 'outstation_voters':
             # ── Outstation voters: SurveyRecords where outstationResident = 'Yes' ──
             per_page = min(int(request.GET.get('per_page', 100)), 500)
@@ -2182,6 +2207,7 @@ def api_data_view(request):
             'future_voters':      'FutureVoters',
             'deceased':           'Deceased',
             'outstation_voters':  'SurveyRecords',
+            'bjp_members':        'SurveyRecords',
         }.get(view_type, view_type)
 
         return JsonResponse({
