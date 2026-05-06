@@ -3211,8 +3211,23 @@ def api_check_sir(request):
     col_2002 = get_survey_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
 
     # Pre-compute prefix variants ONCE — reused by all 4 parallel phases
-    _name_tok      = name.split()[0] if name else ''
+    # FIX: generate prefixes for EVERY token in the name (first name, surname, middle),
+    #      not just the first word.  "Rajesh Shetty" now searches both "RAJ…" and "SHET…".
+    _name_tokens   = name.split() if name else []
+    _name_tok      = _name_tokens[0] if _name_tokens else ''
     _name_prefixes = _gen_prefixes(_name_tok) if _name_tok else ()
+    # Additional per-token prefixes for each remaining word (surname, middle name, etc.)
+    _extra_token_prefixes = []
+    for _tok in _name_tokens[1:]:
+        if len(_tok) >= 3:
+            _extra_token_prefixes.extend(_gen_prefixes(_tok))
+    _extra_token_prefixes = list(dict.fromkeys(_extra_token_prefixes))  # deduplicate, preserve order
+    # Also build a "contains surname" regex for the last token if multi-word name
+    _surname_contains_rx = None
+    if len(_name_tokens) >= 2:
+        _last_tok = _name_tokens[-1]
+        if len(_last_tok) >= 3:
+            _surname_contains_rx = {'$regex': re.escape(_last_tok[:max(4, len(_last_tok))]), '$options': 'i'}
 
     _PROJ_25 = {'Name':1,'Relation Name':1,'Epic NO':1,'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1}
     _PROJ_02 = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
@@ -3252,6 +3267,22 @@ def api_check_sir(request):
                     clauses.append({'Voter Name':rx}); clauses.append({'Name':rx})
                 _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(300))
 
+            # c2) Extra tokens (surname / middle name) — prefix search
+            if _extra_token_prefixes:
+                clauses = []
+                for p in _extra_token_prefixes:
+                    rx = {'$regex':f'^{re.escape(p)}','$options':'i'}
+                    clauses.append({'Voter Name':rx}); clauses.append({'Name':rx})
+                _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(300))
+
+            # c3) Surname "contains" fallback — catches "RAJESH SHETTY" even when
+            #     stored as "SHETTY RAJESH" or "RAJESH KUMAR SHETTY"
+            if _surname_contains_rx:
+                _add(col_2002.find({'$or':[
+                    {'Voter Name': _surname_contains_rx},
+                    {'Name':       _surname_contains_rx},
+                ]}, _PROJ_02).limit(200))
+
             # d) Relation prefix
             if relation and len(relation) >= 2:
                 frt = relation.split()[0]
@@ -3282,6 +3313,15 @@ def api_check_sir(request):
             if _name_prefixes:
                 clauses = [{'Name':{'$regex':f'^{re.escape(p)}','$options':'i'}} for p in _name_prefixes]
                 _add(col_2025.find({'$or':clauses}, _PROJ_25).limit(300))
+
+            # Extra tokens (surname / middle name) — prefix search
+            if _extra_token_prefixes:
+                clauses = [{'Name':{'$regex':f'^{re.escape(p)}','$options':'i'}} for p in _extra_token_prefixes]
+                _add(col_2025.find({'$or':clauses}, _PROJ_25).limit(300))
+
+            # Surname "contains" fallback
+            if _surname_contains_rx:
+                _add(col_2025.find({'Name': _surname_contains_rx}, _PROJ_25).limit(200))
 
             if relation and len(relation) >= 3:
                 frt = relation.split()[0]
@@ -3411,7 +3451,9 @@ def api_check_sir(request):
         if e_ok: comp = max(comp, 95.0)
 
         # Gate: drop very poor name matches when name was the primary search key
-        if has_name and n_sc < 30 and not e_ok and not h_ok: continue
+        # Lowered from 30 → 20 so that surname-matched candidates (e.g. "Shetty") are not dropped
+        # when the first-name score alone is weak but the full-name token_sort score is good.
+        if has_name and n_sc < 20 and not e_ok and not h_ok: continue
         if has_rel and not has_name and r_sc < 30 and not e_ok: continue
 
         matched_by = []
