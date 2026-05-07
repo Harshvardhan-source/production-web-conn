@@ -3224,9 +3224,14 @@ def api_check_sir(request):
                 'Gender':1,'Age':1,'Booth No':1,'Part No':1,'Serial No':1}
 
     # ── Phase 1+2: confirmed-match lookups ────────────────────────────────────
+    # Skip confirmed-match lookup when ONLY name is provided (no EPIC, no house,
+    # no relation). In that case there are too many candidates to pick one —
+    # we return 100 similar records instead and let the user choose.
+    _name_only_search = bool(name and not voterid and not house and not relation)
+
     _res = [None, None]
-    def _t25(): _res[0] = _find_voter_in_2025(col_2025, voterid, name, house, relation)
-    def _t02(): _res[1] = _find_voter_in_2002(col_2002, voterid, name, house, relation)
+    def _t25(): _res[0] = (None if _name_only_search else _find_voter_in_2025(col_2025, voterid, name, house, relation))
+    def _t02(): _res[1] = (None if _name_only_search else _find_voter_in_2002(col_2002, voterid, name, house, relation))
 
     # ── Phase 3: fetch ALL 2002 candidates – token-aware contains + intersection ────────
     _raw02 = []
@@ -3251,9 +3256,10 @@ def api_check_sir(request):
             if _name_tokens_list:
                 # c) Single-token search: contains each token anywhere in name
                 #    This catches "AKSHAYA RAJESH", "B RAJESH BALIGA" etc.
+                _tok_lim = 500 if _name_only_search else 200
                 for tok in _name_tokens_list:
                     rx = {'$regex': re.escape(tok), '$options': 'i'}
-                    _add(col_2002.find({'$or':[{'Voter Name':rx},{'Name':rx}]}, _PROJ_02).limit(200))
+                    _add(col_2002.find({'$or':[{'Voter Name':rx},{'Name':rx}]}, _PROJ_02).limit(_tok_lim))
 
                 # d) Multi-token AND: all tokens must appear somewhere in the name
                 #    "RAJESH SHETTY" -> Name contains RAJESH AND Name contains SHETTY
@@ -3263,7 +3269,7 @@ def api_check_sir(request):
                     for tok in _name_tokens_list:
                         rx = {'$regex': re.escape(tok), '$options': 'i'}
                         and_clauses.append({'$or':[{'Voter Name':rx},{'Name':rx}]})
-                    _add(col_2002.find({'$and': and_clauses}, _PROJ_02).limit(300))
+                    _add(col_2002.find({'$and': and_clauses}, _PROJ_02).limit(500))
 
                 # e) Phonetic prefix variants (original fallback for transliteration)
                 if _name_tok:
@@ -3271,7 +3277,7 @@ def api_check_sir(request):
                     for p in _name_prefixes:
                         rx = {'$regex':f'^{re.escape(p)}','$options':'i'}
                         clauses.append({'Voter Name':rx}); clauses.append({'Name':rx})
-                    _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(300))
+                    _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(500))
 
             # f) Relation prefix
             if relation and len(relation) >= 2:
@@ -3301,19 +3307,20 @@ def api_check_sir(request):
 
             if _name_tokens_list:
                 # c) Contains search for each token — catches mid-name occurrences
+                _tok_lim25 = 500 if _name_only_search else 200
                 for tok in _name_tokens_list:
                     rx = {'$regex': re.escape(tok), '$options': 'i'}
-                    _add(col_2025.find({'Name': rx}, _PROJ_25).limit(200))
+                    _add(col_2025.find({'Name': rx}, _PROJ_25).limit(_tok_lim25))
 
                 # d) Multi-token AND intersection — highest precision for multi-word queries
                 if len(_name_tokens_list) >= 2:
                     and_clauses = [{'Name':{'$regex':re.escape(tok),'$options':'i'}} for tok in _name_tokens_list]
-                    _add(col_2025.find({'$and': and_clauses}, _PROJ_25).limit(300))
+                    _add(col_2025.find({'$and': and_clauses}, _PROJ_25).limit(500))
 
                 # e) Phonetic prefix variants fallback
                 if _name_tok:
                     clauses = [{'Name':{'$regex':f'^{re.escape(p)}','$options':'i'}} for p in _name_prefixes]
-                    _add(col_2025.find({'$or':clauses}, _PROJ_25).limit(300))
+                    _add(col_2025.find({'$or':clauses}, _PROJ_25).limit(500))
 
             if relation and len(relation) >= 3:
                 frt = relation.split()[0]
@@ -3378,9 +3385,14 @@ def api_check_sir(request):
                             'color': '#10b981', 'icon': '✓',
                             'detail': 'Voter is consistently registered in both 2002 and 2025 rolls — 23-year continuous voter.'})
     else:
-        results.append({'category': 'NOT_FOUND', 'label': 'Unregistered / Not Traced',
-                        'color': '#6b7fa0', 'icon': '?',
-                        'detail': 'Voter not found in either roll. May be unregistered, new to the area, or try different spelling.'})
+        if _name_only_search:
+            results.append({'category': 'NAME_SEARCH', 'label': 'Name Search',
+                            'color': '#6366f1', 'icon': '🔍',
+                            'detail': 'Showing all records matching this name. Add House No or EPIC for an exact match.'})
+        else:
+            results.append({'category': 'NOT_FOUND', 'label': 'Unregistered / Not Traced',
+                            'color': '#6b7fa0', 'icon': '?',
+                            'detail': 'Voter not found in either roll. May be unregistered, new to the area, or try different spelling.'})
 
     # ── Anomaly flags ─────────────────────────────────────────────────────────
     suspicious = []
@@ -3477,7 +3489,7 @@ def api_check_sir(request):
 
     _scored02.sort(key=lambda x: (-len([f for f in x['matched_by'] if f != 'partial']), -x['comp']))
     _seen_sigs02 = set()
-    for item in _scored02[:31]:
+    for item in _scored02[:100]:
         f   = item['flat']
         doc = item['doc']
         sig = (f['name'], f['house'])
@@ -3499,7 +3511,7 @@ def api_check_sir(request):
         })
 
     suggestions_2002.sort(key=lambda x: (-len([f for f in x.get('matched_by',[]) if f != 'partial']), -x['score']))
-    suggestions_2002 = suggestions_2002[:31]
+    suggestions_2002 = suggestions_2002[:100]
 
     # ── Score similar_2025 from pre-fetched _raw25 ────────────────────────────────────
     similar_2025 = []
@@ -3569,7 +3581,7 @@ def api_check_sir(request):
         if _conf25_epic and epic == _conf25_epic: continue
         _seen25_epics.add(epic)
         similar_2025.append(rec)
-        if len(similar_2025) >= 31: break
+        if len(similar_2025) >= 100: break
 
     _response_data = {
         'success':    True,
