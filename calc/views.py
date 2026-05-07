@@ -787,8 +787,54 @@ def api_dashboard(request):
 _ward_dash_cache = {}   # { ward_str: {'data': {...}, 'ts': float} }
 _WARD_CACHE_TTL  = 300  # 5 minutes
 
-_SIR_PREVIEW_CACHE     = {}   # { (name,voterid,house,relation): {'data':{...},'ts':float} }
-_SIR_PREVIEW_CACHE_TTL = 120  # 2 minutes
+# ── SIR Preview Cache — MongoDB-backed (survives server restarts/sleep) ────────
+# Falls back to an in-process dict when the DB is unreachable.
+_SIR_PREVIEW_CACHE     = {}   # in-process fallback
+_SIR_PREVIEW_CACHE_TTL = 300  # 5 minutes (raised from 2 min)
+
+def _sir_cache_get(key_tuple):
+    """Try MongoDB first, fall back to in-process dict."""
+    import time as _t
+    cache_id = str(key_tuple)
+    # 1. In-process dict (fastest)
+    hit = _SIR_PREVIEW_CACHE.get(key_tuple)
+    if hit and (_t.time() - hit['ts']) < _SIR_PREVIEW_CACHE_TTL:
+        return hit['data']
+    # 2. MongoDB persistent cache
+    try:
+        db = get_survey_db()
+        doc = db['SIRPreviewCache'].find_one({'_id': cache_id})
+        if doc and (_t.time() - doc.get('ts', 0)) < _SIR_PREVIEW_CACHE_TTL:
+            data = doc.get('data')
+            # Warm the in-process dict too
+            _SIR_PREVIEW_CACHE[key_tuple] = {'data': data, 'ts': doc['ts']}
+            return data
+    except Exception:
+        pass
+    return None
+
+def _sir_cache_set(key_tuple, data):
+    """Write to both in-process dict and MongoDB."""
+    import time as _t
+    now = _t.time()
+    cache_id = str(key_tuple)
+    # In-process
+    _SIR_PREVIEW_CACHE[key_tuple] = {'data': data, 'ts': now}
+    # Evict oldest entries if in-process dict grows too large
+    if len(_SIR_PREVIEW_CACHE) > 500:
+        for k in sorted(_SIR_PREVIEW_CACHE, key=lambda k: _SIR_PREVIEW_CACHE[k]['ts'])[:100]:
+            _SIR_PREVIEW_CACHE.pop(k, None)
+    # MongoDB persistent write (fire-and-forget — never block the response)
+    def _write():
+        try:
+            get_survey_db()['SIRPreviewCache'].replace_one(
+                {'_id': cache_id},
+                {'_id': cache_id, 'data': data, 'ts': now},
+                upsert=True,
+            )
+        except Exception:
+            pass
+    threading.Thread(target=_write, daemon=True).start()
 
 
 @require_http_methods(['GET'])
@@ -3287,9 +3333,9 @@ def api_check_sir(request):
     # Cache check (read-only preview only — not for store=true calls)
     _sir_cache_key = (name, voterid, house, relation)
     if not do_store:
-        _cached = _SIR_PREVIEW_CACHE.get(_sir_cache_key)
-        if _cached and (_time.time() - _cached['ts']) < _SIR_PREVIEW_CACHE_TTL:
-            return JsonResponse(_cached['data'])
+        _cached_data = _sir_cache_get(_sir_cache_key)
+        if _cached_data is not None:
+            return JsonResponse(_cached_data)
 
     if do_store:
         sir = _run_sir_analysis(voterid, name, house, ward, booth, serial, relation, db=db)
@@ -3316,11 +3362,14 @@ def api_check_sir(request):
     # Skip confirmed-match lookup when ONLY name is provided (no EPIC, no house,
     # no relation). In that case there are too many candidates to pick one —
     # we return 100 similar records instead and let the user choose.
-    _name_only_search = bool(name and not voterid and not house and not relation)
+    _name_only_search     = bool(name     and not voterid and not house and not relation)
+    # Relation-only: only relation provided, nothing else — confirmed-match lookups
+    # can't pin a single voter, so skip them and rely on similarity scoring instead.
+    _relation_only_search = bool(relation and not name   and not voterid and not house)
 
     _res = [None, None]
-    def _t25(): _res[0] = (None if _name_only_search else _find_voter_in_2025(col_2025, voterid, name, house, relation))
-    def _t02(): _res[1] = (None if _name_only_search else _find_voter_in_2002(col_2002, voterid, name, house, relation))
+    def _t25(): _res[0] = (None if (_name_only_search or _relation_only_search) else _find_voter_in_2025(col_2025, voterid, name, house, relation))
+    def _t02(): _res[1] = (None if (_name_only_search or _relation_only_search) else _find_voter_in_2002(col_2002, voterid, name, house, relation))
 
     # ── Phase 3: fetch ALL 2002 candidates – token-aware contains + intersection ────────
     _raw02 = []
@@ -3368,11 +3417,18 @@ def api_check_sir(request):
                         clauses.append({'Voter Name':rx}); clauses.append({'Name':rx})
                     _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(500))
 
-            # f) Relation prefix
+            # f) Relation prefix — greatly expanded for relation-only searches
             if relation and len(relation) >= 2:
                 frt = relation.split()[0]
                 rpfx = {'$regex':f'^{re.escape(frt[:min(5,len(frt))])}','$options':'i'}
-                _add(col_2002.find({'$or':[{'Relative Name':rpfx},{'Relation Name':rpfx}]}, _PROJ_02).limit(100))
+                _rel_lim = 500 if _relation_only_search else 100
+                _add(col_2002.find({'$or':[{'Relative Name':rpfx},{'Relation Name':rpfx}]}, _PROJ_02).limit(_rel_lim))
+                # For relation-only: also fetch all tokens of the relation name individually
+                if _relation_only_search:
+                    for _rtok in relation.split():
+                        if len(_rtok) >= 3:
+                            _rx = {'$regex': re.escape(_rtok), '$options': 'i'}
+                            _add(col_2002.find({'$or':[{'Relative Name':_rx},{'Relation Name':_rx}]}, _PROJ_02).limit(200))
         except Exception:
             pass
 
@@ -3414,7 +3470,14 @@ def api_check_sir(request):
             if relation and len(relation) >= 3:
                 frt = relation.split()[0]
                 rpfx = {'$regex':f'^{re.escape(frt[:min(5,len(frt))])}','$options':'i'}
-                _add(col_2025.find({'Relation Name':rpfx}, _PROJ_25).limit(100))
+                _rel_lim25 = 500 if _relation_only_search else 100
+                _add(col_2025.find({'Relation Name':rpfx}, _PROJ_25).limit(_rel_lim25))
+                # For relation-only: also fetch per-token contains matches
+                if _relation_only_search:
+                    for _rtok in relation.split():
+                        if len(_rtok) >= 3:
+                            _rx = {'$regex': re.escape(_rtok), '$options': 'i'}
+                            _add(col_2025.find({'Relation Name': _rx}, _PROJ_25).limit(200))
         except Exception:
             pass
 
@@ -3478,6 +3541,10 @@ def api_check_sir(request):
             results.append({'category': 'NAME_SEARCH', 'label': 'Name Search',
                             'color': '#6366f1', 'icon': '🔍',
                             'detail': 'Showing all records matching this name. Add House No or EPIC for an exact match.'})
+        elif _relation_only_search:
+            results.append({'category': 'NAME_SEARCH', 'label': 'Relation Search',
+                            'color': '#6366f1', 'icon': '🔍',
+                            'detail': 'Showing all records with this relative name. Add Voter Name or House No for an exact match.'})
         else:
             results.append({'category': 'NOT_FOUND', 'label': 'Unregistered / Not Traced',
                             'color': '#6b7fa0', 'icon': '?',
@@ -3537,42 +3604,37 @@ def api_check_sir(request):
         full_cov02 = (total_toks02 > 0 and cov02 == total_toks02)
         coverage_bonus02 = 15.0 if (total_toks02 > 1 and full_cov02) else 0.0
 
-        # ── Relation token coverage bonus ────────────────────────────────────
-        # "vaman kamath" should rank "VAMANA KAMATH" above "VAMANA" alone.
-        # Count how many relation query tokens appear in the candidate relation field.
-        _rel_tokens = relation.split() if has_rel else []
-        _rel_cov = sum(1 for t in _rel_tokens if t.upper() in flat['relation'].upper()) if _rel_tokens else 0
-        _rel_full_cov = (len(_rel_tokens) > 1 and _rel_cov == len(_rel_tokens))
-        # +20 when ALL relation tokens are present, +8 for each extra matched token beyond first
-        _rel_cov_bonus = (20.0 if _rel_full_cov else (8.0 * max(0, _rel_cov - 1))) if has_rel else 0.0
-
         # Composite relevance score
         if has_name and has_house and has_rel:
-            comp = 0.55*n_sc + 0.25*r_sc + 0.20*(100.0 if h_ok else 0.0) + coverage_bonus02 + _rel_cov_bonus
+            comp = 0.55*n_sc + 0.25*r_sc + 0.20*(100.0 if h_ok else 0.0) + coverage_bonus02
         elif has_name and has_house:
             comp = 0.70*n_sc + 0.30*(100.0 if h_ok else 0.0) + coverage_bonus02
         elif has_name and has_rel:
-            comp = 0.60*n_sc + 0.40*r_sc + coverage_bonus02 + _rel_cov_bonus
+            comp = 0.60*n_sc + 0.40*r_sc + coverage_bonus02
         elif has_name:
             comp = min(100.0, n_sc + coverage_bonus02)
         elif has_house:
             comp = 100.0
         elif has_rel:
-            comp = min(100.0, r_sc + _rel_cov_bonus)
+            comp = r_sc
         else:
             comp = 100.0 if e_ok else 0.0
         if e_ok: comp = max(comp, 95.0)
 
         # Gate: must have at least partial token coverage, EPIC match, or house match
         if has_name and n_sc < 20 and cov02 == 0 and not e_ok and not h_ok: continue
-        if has_rel and not has_name and r_sc < 30 and not e_ok: continue
+        # Relation-only gate: accept anything with even partial relation similarity
+        _rel_gate = 20 if _relation_only_search else 30
+        if has_rel and not has_name and r_sc < _rel_gate and not e_ok: continue
 
         matched_by = []
         if e_ok:                                          matched_by.append('voterid')
         if has_name and (n_sc >= 60 or full_cov02):       matched_by.append('name')
         elif has_name and cov02 > 0:                      matched_by.append('partial')
         if has_house and h_ok:                            matched_by.append('house')
-        if has_rel   and r_sc >= 60:                      matched_by.append('relation')
+        # For relation-only lower the threshold so results surface even for transliteration variants
+        _rel_match_threshold = 35 if _relation_only_search else 60
+        if has_rel   and r_sc >= _rel_match_threshold:    matched_by.append('relation')
 
         _scored02.append({
             'comp': comp, 'flat': flat, 'doc': doc,
@@ -3633,8 +3695,12 @@ def api_check_sir(request):
                 flags.append('partial')
         if house and rh and (rh.upper() == house.upper() or rh.upper().startswith(house.upper())):
             flags.append('house')
-        if relation and len(relation) >= 2 and _name_score(relation, rr) >= 60:
-            flags.append('relation')
+        if relation and len(relation) >= 2:
+            # For relation-only searches use a lower threshold (35) so transliteration
+            # variants like VAMANA / VAMAN don't fall below the gate entirely.
+            _rel_threshold = 35 if _relation_only_search else 60
+            if _name_score(relation, rr) >= _rel_threshold:
+                flags.append('relation')
         return flags
 
     _scored25 = []
@@ -3651,20 +3717,12 @@ def api_check_sir(request):
         cov25 = _token_coverage(_name_tokens_list, rn) if _name_tokens_list else 0
         total_toks25 = len(_name_tokens_list)
         coverage_bonus = 15.0 if (total_toks25 > 1 and cov25 == total_toks25) else 0.0
-
-        # ── Relation token coverage bonus ────────────────────────────────────
-        # "vaman kamath" should rank "VAMANA KAMATH" above "VAMANA" alone.
-        _rel_tokens25 = relation.split() if relation else []
-        _rel_cov25 = sum(1 for t in _rel_tokens25 if t.upper() in rr.upper()) if _rel_tokens25 else 0
-        _rel_full_cov25 = (len(_rel_tokens25) > 1 and _rel_cov25 == len(_rel_tokens25))
-        _rel_cov_bonus25 = (20.0 if _rel_full_cov25 else (8.0 * max(0, _rel_cov25 - 1))) if relation else 0.0
-
         if name and relation:
-            _c25 = 0.60*n_sc25 + 0.40*r_sc25 + coverage_bonus + _rel_cov_bonus25
+            _c25 = 0.60*n_sc25 + 0.40*r_sc25 + coverage_bonus
         elif name:
             _c25 = min(100.0, n_sc25 + coverage_bonus)
         elif relation:
-            _c25 = min(100.0, r_sc25 + _rel_cov_bonus25)
+            _c25 = r_sc25
         else:
             _c25 = 100.0
         # Downrank partial matches so clean matches surface first
@@ -3719,11 +3777,8 @@ def api_check_sir(request):
             'ward':     r25.get('ward',     ''),
         } if in_2025 else {},
     }
-    # Cache the result (evict oldest when > 500 entries)
-    _SIR_PREVIEW_CACHE[_sir_cache_key] = {'data': _response_data, 'ts': _time.time()}
-    if len(_SIR_PREVIEW_CACHE) > 500:
-        for k in sorted(_SIR_PREVIEW_CACHE, key=lambda k: _SIR_PREVIEW_CACHE[k]['ts'])[:100]:
-            _SIR_PREVIEW_CACHE.pop(k, None)
+    # Cache the result — persists to MongoDB so it survives server restarts/sleep
+    _sir_cache_set(_sir_cache_key, _response_data)
     return JsonResponse(_response_data)
 
 
