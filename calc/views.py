@@ -3210,24 +3210,13 @@ def api_check_sir(request):
     col_2025 = db['2025']
     col_2002 = get_survey_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
 
-    # Pre-compute prefix variants ONCE — reused by all 4 parallel phases
-    # FIX: generate prefixes for EVERY token in the name (first name, surname, middle),
-    #      not just the first word.  "Rajesh Shetty" now searches both "RAJ…" and "SHET…".
-    _name_tokens   = name.split() if name else []
-    _name_tok      = _name_tokens[0] if _name_tokens else ''
-    _name_prefixes = _gen_prefixes(_name_tok) if _name_tok else ()
-    # Additional per-token prefixes for each remaining word (surname, middle name, etc.)
-    _extra_token_prefixes = []
-    for _tok in _name_tokens[1:]:
-        if len(_tok) >= 3:
-            _extra_token_prefixes.extend(_gen_prefixes(_tok))
-    _extra_token_prefixes = list(dict.fromkeys(_extra_token_prefixes))  # deduplicate, preserve order
-    # Also build a "contains surname" regex for the last token if multi-word name
-    _surname_contains_rx = None
-    if len(_name_tokens) >= 2:
-        _last_tok = _name_tokens[-1]
-        if len(_last_tok) >= 3:
-            _surname_contains_rx = {'$regex': re.escape(_last_tok[:max(4, len(_last_tok))]), '$options': 'i'}
+    # ── Pre-compute name tokens and prefix variants ─────────────────────────────────────────
+    # Split name into individual tokens used by all 4 parallel phases.
+    # Filter out single-char initials (e.g. "A." or "K") from token list since
+    # they produce too many false positives in a contains search.
+    _name_tokens_list = [t for t in (name.split() if name else []) if len(t) >= 2]
+    _name_tok         = _name_tokens_list[0] if _name_tokens_list else ''
+    _name_prefixes    = _gen_prefixes(_name_tok) if _name_tok else ()
 
     _PROJ_25 = {'Name':1,'Relation Name':1,'Epic NO':1,'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1}
     _PROJ_02 = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
@@ -3239,7 +3228,7 @@ def api_check_sir(request):
     def _t25(): _res[0] = _find_voter_in_2025(col_2025, voterid, name, house, relation)
     def _t02(): _res[1] = _find_voter_in_2002(col_2002, voterid, name, house, relation)
 
-    # ── Phase 3: fetch ALL 2002 candidates in ONE batched $or query ───────────
+    # ── Phase 3: fetch ALL 2002 candidates – token-aware contains + intersection ────────
     _raw02 = []
     def _t_sugg02():
         try:
@@ -3259,31 +3248,32 @@ def api_check_sir(request):
                 h_pfx = {'$regex':f'^{re.escape(house)}','$options':'i'}
                 _add(col_2002.find({'$or':[{'House / Flat No':h_pfx},{'House No':h_pfx}]}, _PROJ_02).limit(60))
 
-            # c) ALL name prefix variants in ONE batched $or (was N separate queries)
-            if _name_prefixes:
-                clauses = []
-                for p in _name_prefixes:
-                    rx = {'$regex':f'^{re.escape(p)}','$options':'i'}
-                    clauses.append({'Voter Name':rx}); clauses.append({'Name':rx})
-                _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(300))
+            if _name_tokens_list:
+                # c) Single-token search: contains each token anywhere in name
+                #    This catches "AKSHAYA RAJESH", "B RAJESH BALIGA" etc.
+                for tok in _name_tokens_list:
+                    rx = {'$regex': re.escape(tok), '$options': 'i'}
+                    _add(col_2002.find({'$or':[{'Voter Name':rx},{'Name':rx}]}, _PROJ_02).limit(200))
 
-            # c2) Extra tokens (surname / middle name) — prefix search
-            if _extra_token_prefixes:
-                clauses = []
-                for p in _extra_token_prefixes:
-                    rx = {'$regex':f'^{re.escape(p)}','$options':'i'}
-                    clauses.append({'Voter Name':rx}); clauses.append({'Name':rx})
-                _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(300))
+                # d) Multi-token AND: all tokens must appear somewhere in the name
+                #    "RAJESH SHETTY" -> Name contains RAJESH AND Name contains SHETTY
+                #    Produces the most relevant results for multi-word queries
+                if len(_name_tokens_list) >= 2:
+                    and_clauses = []
+                    for tok in _name_tokens_list:
+                        rx = {'$regex': re.escape(tok), '$options': 'i'}
+                        and_clauses.append({'$or':[{'Voter Name':rx},{'Name':rx}]})
+                    _add(col_2002.find({'$and': and_clauses}, _PROJ_02).limit(300))
 
-            # c3) Surname "contains" fallback — catches "RAJESH SHETTY" even when
-            #     stored as "SHETTY RAJESH" or "RAJESH KUMAR SHETTY"
-            if _surname_contains_rx:
-                _add(col_2002.find({'$or':[
-                    {'Voter Name': _surname_contains_rx},
-                    {'Name':       _surname_contains_rx},
-                ]}, _PROJ_02).limit(200))
+                # e) Phonetic prefix variants (original fallback for transliteration)
+                if _name_tok:
+                    clauses = []
+                    for p in _name_prefixes:
+                        rx = {'$regex':f'^{re.escape(p)}','$options':'i'}
+                        clauses.append({'Voter Name':rx}); clauses.append({'Name':rx})
+                    _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(300))
 
-            # d) Relation prefix
+            # f) Relation prefix
             if relation and len(relation) >= 2:
                 frt = relation.split()[0]
                 rpfx = {'$regex':f'^{re.escape(frt[:min(5,len(frt))])}','$options':'i'}
@@ -3291,7 +3281,7 @@ def api_check_sir(request):
         except Exception:
             pass
 
-    # ── Phase 4: fetch ALL 2025 similar candidates in ONE batched $or query ───
+    # ── Phase 4: fetch ALL 2025 similar candidates – token-aware contains + intersection ────
     _raw25 = []
     def _t_sim25():
         try:
@@ -3309,19 +3299,21 @@ def api_check_sir(request):
                 h_pfx = {'$regex':f'^{re.escape(house)}','$options':'i'}
                 _add(col_2025.find({'House No':h_pfx}, _PROJ_25).limit(60))
 
-            # ALL name prefix variants in ONE batched $or
-            if _name_prefixes:
-                clauses = [{'Name':{'$regex':f'^{re.escape(p)}','$options':'i'}} for p in _name_prefixes]
-                _add(col_2025.find({'$or':clauses}, _PROJ_25).limit(300))
+            if _name_tokens_list:
+                # c) Contains search for each token — catches mid-name occurrences
+                for tok in _name_tokens_list:
+                    rx = {'$regex': re.escape(tok), '$options': 'i'}
+                    _add(col_2025.find({'Name': rx}, _PROJ_25).limit(200))
 
-            # Extra tokens (surname / middle name) — prefix search
-            if _extra_token_prefixes:
-                clauses = [{'Name':{'$regex':f'^{re.escape(p)}','$options':'i'}} for p in _extra_token_prefixes]
-                _add(col_2025.find({'$or':clauses}, _PROJ_25).limit(300))
+                # d) Multi-token AND intersection — highest precision for multi-word queries
+                if len(_name_tokens_list) >= 2:
+                    and_clauses = [{'Name':{'$regex':re.escape(tok),'$options':'i'}} for tok in _name_tokens_list]
+                    _add(col_2025.find({'$and': and_clauses}, _PROJ_25).limit(300))
 
-            # Surname "contains" fallback
-            if _surname_contains_rx:
-                _add(col_2025.find({'Name': _surname_contains_rx}, _PROJ_25).limit(200))
+                # e) Phonetic prefix variants fallback
+                if _name_tok:
+                    clauses = [{'Name':{'$regex':f'^{re.escape(p)}','$options':'i'}} for p in _name_prefixes]
+                    _add(col_2025.find({'$or':clauses}, _PROJ_25).limit(300))
 
             if relation and len(relation) >= 3:
                 frt = relation.split()[0]
@@ -3418,16 +3410,16 @@ def api_check_sir(request):
                 'value': net,
             })
 
-    # ── Score suggestions_2002 from pre-fetched _raw02 ────────────────────────
+    def _token_coverage(tokens, candidate_name):
+        """How many search tokens appear (as substring) in the candidate name."""
+        cn = candidate_name.upper()
+        return sum(1 for t in tokens if t.upper() in cn)
+
+    # ── Score suggestions_2002 from pre-fetched _raw02 ───────────────────────────
     has_name  = bool(name)
     has_house = bool(house)
     has_rel   = bool(relation)
     has_epic  = bool(voterid)
-
-    # Surname token shared by both scoring loops. Last word of multi-word name.
-    # e.g. "RAJESH SHETTY" -> _surname_tok = "SHETTY"
-    _name_toks_shared = name.split() if name else []
-    _surname_tok = _name_toks_shared[-1] if len(_name_toks_shared) >= 2 else ''
 
     suggestions_2002 = []
     _scored02 = []
@@ -3438,15 +3430,21 @@ def api_check_sir(request):
         h_ok = (flat['house'].upper() == house.upper()) if has_house else False
         e_ok = bool(has_epic and flat['voterid'] and flat['voterid'].upper() == voterid.upper())
 
+        # Token coverage: how many search tokens appear in the candidate name
+        cov02 = _token_coverage(_name_tokens_list, flat['name']) if (_name_tokens_list and has_name) else 0
+        total_toks02 = len(_name_tokens_list)
+        full_cov02 = (total_toks02 > 0 and cov02 == total_toks02)
+        coverage_bonus02 = 15.0 if (total_toks02 > 1 and full_cov02) else 0.0
+
         # Composite relevance score
         if has_name and has_house and has_rel:
-            comp = 0.55*n_sc + 0.25*r_sc + 0.20*(100.0 if h_ok else 0.0)
+            comp = 0.55*n_sc + 0.25*r_sc + 0.20*(100.0 if h_ok else 0.0) + coverage_bonus02
         elif has_name and has_house:
-            comp = 0.70*n_sc + 0.30*(100.0 if h_ok else 0.0)
+            comp = 0.70*n_sc + 0.30*(100.0 if h_ok else 0.0) + coverage_bonus02
         elif has_name and has_rel:
-            comp = 0.60*n_sc + 0.40*r_sc
+            comp = 0.60*n_sc + 0.40*r_sc + coverage_bonus02
         elif has_name:
-            comp = n_sc
+            comp = min(100.0, n_sc + coverage_bonus02)
         elif has_house:
             comp = 100.0
         elif has_rel:
@@ -3455,29 +3453,16 @@ def api_check_sir(request):
             comp = 100.0 if e_ok else 0.0
         if e_ok: comp = max(comp, 95.0)
 
-        # Surname-only match check for 2002 — lets records where only the surname
-        # matches pass the gate and get labelled 'surname' in matched_by.
-        _surname_sc02 = 0.0
-        if has_name and _surname_tok and len(_surname_tok) >= 3 and n_sc < 60:
-            if _surname_tok in flat['name']:
-                _surname_sc02 = 75.0
-            else:
-                for _tok02 in flat['name'].split():
-                    if len(_tok02) >= 3:
-                        _s = _name_score(_surname_tok, _tok02)
-                        if _s > _surname_sc02:
-                            _surname_sc02 = _s
-
-        # Gate: allow through if full-name score ≥20, OR surname matched, OR EPIC/house matched
-        if has_name and n_sc < 20 and _surname_sc02 < 70 and not e_ok and not h_ok: continue
+        # Gate: must have at least partial token coverage, EPIC match, or house match
+        if has_name and n_sc < 20 and cov02 == 0 and not e_ok and not h_ok: continue
         if has_rel and not has_name and r_sc < 30 and not e_ok: continue
 
         matched_by = []
-        if e_ok:                                                  matched_by.append('voterid')
-        if has_name and n_sc >= 60:                               matched_by.append('name')
-        elif has_name and _surname_sc02 >= 70 and n_sc < 60:     matched_by.append('surname')
-        if has_house and h_ok:                                    matched_by.append('house')
-        if has_rel   and r_sc >= 60:                              matched_by.append('relation')
+        if e_ok:                                          matched_by.append('voterid')
+        if has_name and (n_sc >= 60 or full_cov02):       matched_by.append('name')
+        elif has_name and cov02 > 0:                      matched_by.append('partial')
+        if has_house and h_ok:                            matched_by.append('house')
+        if has_rel   and r_sc >= 60:                      matched_by.append('relation')
 
         _scored02.append({
             'comp': comp, 'flat': flat, 'doc': doc,
@@ -3490,9 +3475,9 @@ def api_check_sir(request):
             'matched_by': matched_by,
         })
 
-    _scored02.sort(key=lambda x: (-len(x['matched_by']), -x['comp']))
+    _scored02.sort(key=lambda x: (-len([f for f in x['matched_by'] if f != 'partial']), -x['comp']))
     _seen_sigs02 = set()
-    for item in _scored02[:30]:
+    for item in _scored02[:31]:
         f   = item['flat']
         doc = item['doc']
         sig = (f['name'], f['house'])
@@ -3513,10 +3498,10 @@ def api_check_sir(request):
             'matched_by':   item['matched_by'],
         })
 
-    suggestions_2002.sort(key=lambda x: (-len(x.get('matched_by',[])), -x['score']))
-    suggestions_2002 = suggestions_2002[:30]
+    suggestions_2002.sort(key=lambda x: (-len([f for f in x.get('matched_by',[]) if f != 'partial']), -x['score']))
+    suggestions_2002 = suggestions_2002[:31]
 
-    # ── Score similar_2025 from pre-fetched _raw25 ────────────────────────────
+    # ── Score similar_2025 from pre-fetched _raw25 ────────────────────────────────────
     similar_2025 = []
     _seen25_epics = {r25.get('voterid','')} if in_2025 else set()
     _conf25_epic  = r25.get('voterid','') if in_2025 else ''
@@ -3527,16 +3512,15 @@ def api_check_sir(request):
             flags.append('voterid')
         if name and len(name) >= 2:
             full_sc = _name_score(name, rn)
-            if full_sc >= 60:
+            # Token coverage: every search token found in candidate name
+            cov = _token_coverage(_name_tokens_list, rn) if _name_tokens_list else 0
+            total_toks = len(_name_tokens_list)
+            if full_sc >= 60 or (total_toks > 0 and cov == total_toks):
+                # All tokens found OR fuzzy score good: mark as 'name' match
                 flags.append('name')
-            elif _surname_tok and len(_surname_tok) >= 3:
-                # Surname token appears verbatim in candidate name (case-insensitive)
-                if _surname_tok in rn:
-                    flags.append('surname')
-                # Or surname alone scores well against candidate name tokens
-                elif any(_name_score(_surname_tok, tok) >= 80
-                         for tok in rn.split() if len(tok) >= 3):
-                    flags.append('surname')
+            elif total_toks > 0 and cov > 0:
+                # Partial token coverage: at least one token matched
+                flags.append('partial')
         if house and rh and (rh.upper() == house.upper() or rh.upper().startswith(house.upper())):
             flags.append('house')
         if relation and len(relation) >= 2 and _name_score(relation, rr) >= 60:
@@ -3553,24 +3537,28 @@ def api_check_sir(request):
         if not flags: continue
         n_sc25 = _name_score(name, rn)     if name     else 0.0
         r_sc25 = _name_score(relation, rr) if relation else 0.0
+        # Boost score for full token coverage (all search words found in name)
+        cov25 = _token_coverage(_name_tokens_list, rn) if _name_tokens_list else 0
+        total_toks25 = len(_name_tokens_list)
+        coverage_bonus = 15.0 if (total_toks25 > 1 and cov25 == total_toks25) else 0.0
         if name and relation:
-            _c25 = 0.60*n_sc25 + 0.40*r_sc25
+            _c25 = 0.60*n_sc25 + 0.40*r_sc25 + coverage_bonus
         elif name:
-            _c25 = n_sc25
+            _c25 = min(100.0, n_sc25 + coverage_bonus)
         elif relation:
             _c25 = r_sc25
         else:
             _c25 = 100.0
-        # Boost score when surname matches explicitly, so surname-matched records sort above noise
-        if 'surname' in flags and 'name' not in flags:
-            _c25 = max(_c25, 55.0)
-        _scored25.append((len(flags), _c25, {
+        # Downrank partial matches so clean matches surface first
+        if 'name' not in flags and 'partial' in flags:
+            _c25 = min(_c25, 55.0)
+        _scored25.append((len([f for f in flags if f != 'partial']), _c25, {
             'name': rn, 'relation': rr, 'house': rh, 'voterid': re_,
             'gender': _norm(d.get('Gender','')),
             'age':    str(d.get('Age','')).strip(),
             'booth':  str(d.get('Booth No','')).strip(),
             'part':   str(d.get('Part No','')).strip(),
-            'score':  round(_c25),
+            'score':  round(min(100.0, _c25)),
             'matched_by': flags,
         }))
 
@@ -3581,7 +3569,7 @@ def api_check_sir(request):
         if _conf25_epic and epic == _conf25_epic: continue
         _seen25_epics.add(epic)
         similar_2025.append(rec)
-        if len(similar_2025) >= 30: break
+        if len(similar_2025) >= 31: break
 
     _response_data = {
         'success':    True,
