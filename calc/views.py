@@ -2720,63 +2720,105 @@ def _name_score(a: str, b: str) -> float:
 
 def _score_candidates(candidates, flat_fn, name, relation):
     """
-    Score a list of MongoDB docs against (name, relation).
-    Returns (best_doc, best_score). Stops early at score >= 97.
-    flat_fn is either _flat_2025 or _flat_2002.
+    Universal candidate scorer — works for any combination of inputs.
 
-    Scoring rules (v2 - strict relation enforcement)
-    -------------------------------------------------
-    1. name_score  - fuzzy similarity between search name and candidate name.
-    2. token_bonus - +10 per search-token found in candidate name, normalised.
-       Handles "RAJESH SHETTY": a candidate named just "RAJ" only gets partial
-       token coverage and therefore cannot reach the confirmation threshold.
-    3. Multi-token guard: if search has >= 2 tokens and fewer than half appear
-       in candidate name, cap name_score at 60 (never confirms without house/EPIC).
-    4. Relation enforcement: if user gave a relation AND candidate has one,
-       use 60/40 name/relation blend. If relation similarity < 40, apply -25
-       penalty (stops "SHEELA" search from confirming "HECH SHINA").
-       If candidate has NO relation field, apply -15 penalty.
+    Returns (best_doc, best_score).
+
+    Inputs guaranteed by caller:
+      name      — normalised UPPER string, may be empty
+      relation  — normalised UPPER string, may be empty
+      candidates— list of raw MongoDB docs
+
+    Scoring formula
+    ───────────────
+    name_score   : rapidfuzz / Levenshtein similarity 0-100
+    rel_score    : same, 0-100
+
+    token_coverage_pct : fraction of search-name tokens (≥2 chars) found in
+                         the candidate name as substrings.
+                         "RAJESH SHETTY" vs "RAJ"  → 1/2 = 50 %  (SHETTY missing)
+                         "RAJESH SHETTY" vs "RAJESH SHETTY K" → 2/2 = 100 %
+
+    composite formula (depending on what is available):
+
+      BOTH name + relation provided, candidate HAS relation:
+        comp = 0.55*name_score + 0.35*rel_score + 0.10*token_coverage_pct*100
+        penalty −30 when rel_score < 40  (hard mismatch)
+
+      BOTH name + relation provided, candidate has NO relation:
+        comp = 0.70*name_score + 0.10*token_coverage_pct*100  (−20 penalty for absence)
+
+      name only:
+        comp = 0.90*name_score + 0.10*token_coverage_pct*100
+
+      relation only (no name):
+        comp = rel_score
+
+      neither (should not happen in practice):
+        comp = 0
+
+    Multi-token guard: if the search name has ≥2 tokens and token_coverage_pct < 0.5
+    (fewer than half tokens found in the candidate), cap comp at 62.
+    This blocks "RAJ" from confirming for "RAJESH SHETTY".
+
+    EPIC / house are NOT considered here — callers already pre-filter candidates
+    by house or use EPIC directly (Tier 1).
     """
     name_tokens = [t for t in (name.split() if name else []) if len(t) >= 2]
+    n_toks = len(name_tokens)
 
     best_doc, best_score = None, 0.0
     for doc in candidates:
         flat      = flat_fn(doc)
-        cand_name = flat['name']
-        cand_rel  = flat['relation']
+        cand_name = flat.get('name', '')
+        cand_rel  = flat.get('relation', '')
 
-        n_score = _name_score(name, cand_name) if name else 0.0
+        # ── name score ────────────────────────────────────────────────────────
+        n_score = _name_score(name, cand_name) if (name and cand_name) else 0.0
 
-        # Token coverage bonus
-        if name_tokens and cand_name:
+        # ── token coverage ────────────────────────────────────────────────────
+        if n_toks and cand_name:
             cand_up      = cand_name.upper()
             matched_toks = sum(1 for t in name_tokens if t in cand_up)
-            token_bonus  = 10.0 * matched_toks / len(name_tokens)
+            tok_cov_pct  = matched_toks / n_toks
         else:
-            matched_toks = len(name_tokens)
-            token_bonus  = 0.0
+            matched_toks = n_toks
+            tok_cov_pct  = 1.0   # no tokens to check → no penalty
 
-        # Multi-token guard: fewer than half tokens found -> cap at 60
-        if len(name_tokens) >= 2 and matched_toks < len(name_tokens) / 2:
-            n_score    = min(n_score, 60.0)
-            token_bonus = 0.0
+        # ── relation score ────────────────────────────────────────────────────
+        r_score = _name_score(relation, cand_rel) if (relation and cand_rel) else 0.0
 
-        # Relation scoring with hard penalty for mismatch
-        if relation:
+        # ── composite ─────────────────────────────────────────────────────────
+        if name and relation:
             if cand_rel:
-                r_score     = _name_score(relation, cand_rel)
-                rel_penalty = -25.0 if r_score < 40 else 0.0
-                comp = 0.60 * n_score + 0.40 * r_score + token_bonus + rel_penalty
+                rel_penalty = -30.0 if r_score < 40 else 0.0
+                comp = (0.55 * n_score
+                        + 0.35 * r_score
+                        + 0.10 * tok_cov_pct * 100
+                        + rel_penalty)
             else:
-                comp = n_score + token_bonus - 15.0
+                # candidate has no relation — cannot verify, mild penalty
+                comp = 0.70 * n_score + 0.10 * tok_cov_pct * 100 - 20.0
+        elif name:
+            comp = 0.90 * n_score + 0.10 * tok_cov_pct * 100
+        elif relation:
+            comp = r_score
         else:
-            comp = n_score + token_bonus
+            comp = 0.0
+
+        # ── multi-token guard ─────────────────────────────────────────────────
+        # "RAJESH SHETTY" (2 tokens) vs "RAJ" (tok_cov_pct=0.5, SHETTY missing)
+        # → cap at 62 so it never crosses confirmation threshold without house/EPIC
+        if n_toks >= 2 and tok_cov_pct < 0.5:
+            comp = min(comp, 62.0)
 
         comp = max(comp, 0.0)
 
         if comp > best_score:
             best_score, best_doc = comp, doc
-        if best_score >= 97: break   # near-perfect - stop looking
+        if best_score >= 97:
+            break   # near-perfect — stop early
+
     return best_doc, best_score
 
 
@@ -2853,76 +2895,80 @@ threading.Thread(target=_get_xlsx, daemon=True).start()   # ← ADD THIS LINE
 
 def _find_voter_in_2025(col, voterid, name, house, relation=''):
     """
-    Look up a voter in the MongoDB 2025 collection.
+    Confirmed-match lookup in the 2025 MongoDB voter roll.
 
-    Tier 1 — EPIC No       (exact, indexed — O(1))
-    Tier 2 — Exact regex   (name + house — fast, catches clean data)
-    Tier 3 — Fuzzy match   (all voters in same house → score each → best ≥ 80)
-                           handles: Vishvanath/Vishwanath, Lakshmi/Laxmi, etc.
-    Tier 4 — Fuzzy name-only (no house available — top-3 candidates across DB)
+    Decision table — fields provided → tiers attempted:
+    ┌──────────────────────────────┬──────────────────────────────────────────┐
+    │ EPIC                         │ Tier 1: exact index lookup               │
+    │ name + house                 │ Tier 2: exact regex, then Tier 3 fuzzy   │
+    │ house only  (+ rel optional) │ Tier 3: fuzzy within house               │
+    │ name + relation (no house)   │ Tier 4: prefix scan, threshold 88        │
+    │ name only   (no house)       │ Tier 4: prefix scan, threshold 90        │
+    └──────────────────────────────┴──────────────────────────────────────────┘
+
+    Thresholds
+    ──────────
+    Tier 2 exact (name+house)  : always return, but validate relation ≥ 35 if given
+    Tier 3 fuzzy (house)       : 78  (house already narrows candidates well)
+    Tier 4 no-house + relation : 88  (must match BOTH name and relation well)
+    Tier 4 no-house, name only : 90  (very high bar without corroborating field)
     """
-    # Tier 1: EPIC No exact
+    _PROJ = {'Name':1,'Relation Name':1,'Epic NO':1,
+             'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1}
+
+    # ── Tier 1: EPIC exact ────────────────────────────────────────────────────
     if voterid:
-        doc = col.find_one({'Epic NO': voterid})
+        doc = col.find_one({'Epic NO': voterid}, _PROJ)
         if doc:
             return bson_clean(doc)
 
-    # Tier 2: exact regex name + house
-    # If relation is also given, verify it scores >= 35 before confirming.
-    # This prevents confirming a same-house namesake whose relative is different.
+    # ── Tier 2: exact name match at exact house ───────────────────────────────
     if name and house:
         doc = col.find_one({'$and': [
             {'Name':     {'$regex': re.escape(name), '$options': 'i'}},
             {'House No': house},
-        ]})
+        ]}, _PROJ)
         if doc:
             if relation:
-                flat_check = _flat_2025(doc)
-                rel_score  = _name_score(relation, flat_check['relation']) if flat_check['relation'] else 0
-                if rel_score >= 35 or not flat_check['relation']:
+                f = _flat_2025(doc)
+                # Only confirm when relation is absent OR similarity >= 35
+                if not f['relation'] or _name_score(relation, f['relation']) >= 35:
                     return bson_clean(doc)
-                # else fall through to fuzzy tiers which will score properly
+                # else: same house, same name, different relative — fall through
             else:
                 return bson_clean(doc)
 
-    _PROJ_25 = {'Name':1,'Relation Name':1,'Epic NO':1,'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1}
-
-    # Tier 3: fuzzy — all voters at same house (projection → less network transfer)
+    # ── Tier 3: fuzzy within house ────────────────────────────────────────────
     if house and (name or relation):
-        candidates = list(col.find({'House No': house}, _PROJ_25))
+        candidates = list(col.find({'House No': house}, _PROJ))
+        # Also try house-prefix to handle "2-14-1223" vs stored "2-14-1223/1"
+        if not candidates:
+            h_pfx = {'$regex': f'^{re.escape(house)}', '$options': 'i'}
+            candidates = list(col.find({'House No': h_pfx}, _PROJ).limit(50))
         if candidates:
             best_doc, best_score = _score_candidates(candidates, _flat_2025, name, relation)
             if best_doc and best_score >= _FUZZY_THRESHOLD:
                 return bson_clean(best_doc)
 
-    # Tier 3b: house prefix fuzzy — catches "2-14-1223" when record is "2-14-1223/1"
-    if house and (name or relation):
-        house_pfx_rx = {'$regex': f'^{re.escape(house)}', '$options': 'i'}
-        candidates = list(col.find({'House No': house_pfx_rx}, _PROJ_25).limit(30))
-        if candidates:
-            best_doc, best_score = _score_candidates(candidates, _flat_2025, name, relation)
-            if best_doc and best_score >= _FUZZY_THRESHOLD:
-                return bson_clean(best_doc)
-
-    # Tier 4: phonetic-aware prefix → fuzzy, tries all variant prefixes
-    if name:
-        _ft4 = name.split()[0]
-        _seen_tier4 = set()
-        all_candidates = []
-        for _pfx_v in _gen_prefixes(_ft4):
+    # ── Tier 4: name prefix scan (no house) ──────────────────────────────────
+    # Only runs when no house was given — house tiers already exhausted above.
+    # Threshold is intentionally high to avoid false positives across the whole DB.
+    if name and not house:
+        first_tok = name.split()[0]
+        seen, candidates = set(), []
+        for pfx in _gen_prefixes(first_tok):
             for doc in col.find(
-                {'Name': {'$regex': f'^{re.escape(_pfx_v)}', '$options': 'i'}}, _PROJ_25
-            ).limit(40):
-                oid = str(doc.get('_id',''))
-                if oid not in _seen_tier4:
-                    _seen_tier4.add(oid)
-                    all_candidates.append(doc)
-        if all_candidates:
-            best_doc, best_score = _score_candidates(all_candidates, _flat_2025, name, relation)
-            # Raise threshold when relation provided: penalty already applied in scorer,
-            # but also gate at 88 so name-only partial matches never confirm.
-            t4_threshold = 88 if relation else _FUZZY_THRESHOLD
-            if best_doc and best_score >= t4_threshold:
+                {'Name': {'$regex': f'^{re.escape(pfx)}', '$options': 'i'}}, _PROJ
+            ).limit(60):
+                oid = str(doc.get('_id', ''))
+                if oid not in seen:
+                    seen.add(oid)
+                    candidates.append(doc)
+        if candidates:
+            best_doc, best_score = _score_candidates(candidates, _flat_2025, name, relation)
+            # Higher bar when no house — need strong match on name+relation together
+            threshold = 88 if relation else 90
+            if best_doc and best_score >= threshold:
                 return bson_clean(best_doc)
 
     return None
@@ -2930,114 +2976,86 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
 
 def _find_voter_in_2002(col, voterid, name, house, relation=''):
     """
-    Look up a voter in MongoDB SurveyDataBase.2002.
+    Confirmed-match lookup in the 2002 MongoDB voter roll.
+    Schema-agnostic: handles both old (Name/House No/Epic NO/Relation Name)
+    and new (Voter Name/House / Flat No/Voter ID / EPIC No/Relative Name) field names.
 
-    Schema-agnostic: handles BOTH old field names (Name / House No / Epic NO /
-    Relation Name) and new field names (Voter Name / House / Flat No /
-    Voter ID / EPIC No / Relative Name).
-
-    Tier 1 — EPIC exact          (both field name variants)
-    Tier 2 — Exact regex         (name + house, schema-agnostic)
-    Tier 3 — Fuzzy house         (all docs at same house, threshold 60 — house
-                                   already narrows candidates enough)
-    Tier 4 — Relation + house    (when name is very different, match by relation)
-    Tier 5 — Fuzzy prefix        (name prefix scan, 60 docs, adaptive threshold)
-    Tier 6 — House-only fallback (best name match within same house, threshold 50)
+    Same decision table as _find_voter_in_2025.
+    Tier 3 threshold is 60 (2002 data is noisier, house narrows well).
+    Tier 5 (prefix scan, no house) threshold is 88 with relation, 90 without.
     """
-    _PROJ_02 = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
-                'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,'Gender':1,'Age':1}
+    _PROJ = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
+             'House / Flat No':1,'House No':1,
+             'Voter ID / EPIC No':1,'Epic NO':1,
+             'Gender':1,'Age':1,'Booth No':1,'Part No':1,'Serial No':1}
 
-    def _house_q(h):
+    def _hq(h):
         return {'$or': [{'House / Flat No': h}, {'House No': h}]}
 
-    # Tier 1: EPIC exact
+    # ── Tier 1: EPIC exact ────────────────────────────────────────────────────
     if voterid:
-        doc = col.find_one({'$or': [{'Voter ID / EPIC No': voterid}, {'Epic NO': voterid}]})
+        doc = col.find_one(
+            {'$or': [{'Voter ID / EPIC No': voterid}, {'Epic NO': voterid}]}, _PROJ)
         if doc:
             return bson_clean(doc)
 
-    # Tier 2: exact regex name + house
-    # If relation is also given, verify it scores >= 35 before confirming.
+    # ── Tier 2: exact name + house ────────────────────────────────────────────
     if name and house:
         name_rx = {'$regex': re.escape(name), '$options': 'i'}
         doc = col.find_one({'$and': [
             {'$or': [{'Voter Name': name_rx}, {'Name': name_rx}]},
-            _house_q(house),
-        ]})
+            _hq(house),
+        ]}, _PROJ)
         if doc:
             if relation:
-                flat_check = _flat_2002(doc)
-                rel_score  = _name_score(relation, flat_check['relation']) if flat_check['relation'] else 0
-                if rel_score >= 35 or not flat_check['relation']:
+                f = _flat_2002(doc)
+                if not f['relation'] or _name_score(relation, f['relation']) >= 35:
                     return bson_clean(doc)
-                # fall through — different relative at same house
             else:
                 return bson_clean(doc)
 
-    # Tier 3: fuzzy within same house — threshold 60 (house confirms locality)
+    # ── Tier 3: fuzzy within house ────────────────────────────────────────────
     if house and (name or relation):
-        candidates = list(col.find(_house_q(house), _PROJ_02))
+        candidates = list(col.find(_hq(house), _PROJ))
+        if not candidates:
+            h_pfx = {'$regex': f'^{re.escape(house)}', '$options': 'i'}
+            pfx_q = {'$or': [{'House / Flat No': h_pfx}, {'House No': h_pfx}]}
+            candidates = list(col.find(pfx_q, _PROJ).limit(50))
         if candidates:
             best_doc, best_score = _score_candidates(candidates, _flat_2002, name, relation)
             if best_doc and best_score >= 60:
                 return bson_clean(best_doc)
 
-    # Tier 3b: house prefix fuzzy — catches "2-14-1223" when record is stored as "2-14-1223/1"
-    if house and (name or relation):
-        house_pfx_rx = {'$regex': f'^{re.escape(house)}', '$options': 'i'}
-        pfx_q = {'$or': [{'House / Flat No': house_pfx_rx}, {'House No': house_pfx_rx}]}
-        candidates = list(col.find(pfx_q, _PROJ_02).limit(30))
-        if candidates:
-            best_doc, best_score = _score_candidates(candidates, _flat_2002, name, relation)
-            if best_doc and best_score >= 60:
-                return bson_clean(best_doc)
-
-    # Tier 4: relation prefix + same house (catches cases where name spelling is very different)
+    # ── Tier 4: relation-first scan when name is very different (house required) ──
+    # Catches cases where name spelling is completely different but relation matches.
     if relation and house and len(relation) >= 3:
         rpx = {'$regex': f'^{re.escape(relation[:4])}', '$options': 'i'}
         candidates = list(col.find({'$and': [
-            _house_q(house),
+            _hq(house),
             {'$or': [{'Relative Name': rpx}, {'Relation Name': rpx}]},
-        ]}, _PROJ_02).limit(20))
+        ]}, _PROJ).limit(20))
         if candidates:
             best_doc, best_score = _score_candidates(candidates, _flat_2002, name, relation)
-            if best_doc and best_score >= 55:
+            if best_doc and best_score >= 60:
                 return bson_clean(best_doc)
 
-    # Tier 5: phonetic-aware prefix scan — tries all variant prefixes
-    if name and len(name) >= 3:
-        _ft5 = name.split()[0]
-        _seen_tier5 = set()
-        all_candidates_02 = []
-        for _pfx_v in _gen_prefixes(_ft5):
-            px = {'$regex': f'^{re.escape(_pfx_v)}', '$options': 'i'}
+    # ── Tier 5: name prefix scan (no house) ──────────────────────────────────
+    if name and not house and len(name) >= 3:
+        first_tok = name.split()[0]
+        seen, candidates = set(), []
+        for pfx in _gen_prefixes(first_tok):
+            px = {'$regex': f'^{re.escape(pfx)}', '$options': 'i'}
             for doc in col.find(
-                {'$or': [{'Voter Name': px}, {'Name': px}]}, _PROJ_02
-            ).limit(40):
-                oid = str(doc.get('_id',''))
-                if oid not in _seen_tier5:
-                    _seen_tier5.add(oid)
-                    all_candidates_02.append(doc)
-        if all_candidates_02:
-            best_doc, best_score = _score_candidates(all_candidates_02, _flat_2002, name, relation)
-            # When house known: lower threshold (house already narrows candidates).
-            # When relation provided (no house): raise threshold to 88 — the scorer
-            # already penalises relation mismatches; this gate prevents borderline passes.
-            if house:
-                threshold = 68
-            elif relation:
-                threshold = 88
-            else:
-                threshold = _FUZZY_THRESHOLD
-            if best_doc and best_score >= threshold:
-                return bson_clean(best_doc)
-
-    # Tier 6: house-only fallback — any doc at same house with name score ≥ 50
-    if house and name:
-        candidates = list(col.find(_house_q(house), _PROJ_02).limit(30))
+                {'$or': [{'Voter Name': px}, {'Name': px}]}, _PROJ
+            ).limit(60):
+                oid = str(doc.get('_id', ''))
+                if oid not in seen:
+                    seen.add(oid)
+                    candidates.append(doc)
         if candidates:
             best_doc, best_score = _score_candidates(candidates, _flat_2002, name, relation)
-            if best_doc and best_score >= 50:
+            threshold = 88 if relation else 90
+            if best_doc and best_score >= threshold:
                 return bson_clean(best_doc)
 
     return None
