@@ -2721,18 +2721,62 @@ def _name_score(a: str, b: str) -> float:
 def _score_candidates(candidates, flat_fn, name, relation):
     """
     Score a list of MongoDB docs against (name, relation).
-    Returns (best_doc, best_score). Stops early at score ≥ 97.
+    Returns (best_doc, best_score). Stops early at score >= 97.
     flat_fn is either _flat_2025 or _flat_2002.
+
+    Scoring rules (v2 - strict relation enforcement)
+    -------------------------------------------------
+    1. name_score  - fuzzy similarity between search name and candidate name.
+    2. token_bonus - +10 per search-token found in candidate name, normalised.
+       Handles "RAJESH SHETTY": a candidate named just "RAJ" only gets partial
+       token coverage and therefore cannot reach the confirmation threshold.
+    3. Multi-token guard: if search has >= 2 tokens and fewer than half appear
+       in candidate name, cap name_score at 60 (never confirms without house/EPIC).
+    4. Relation enforcement: if user gave a relation AND candidate has one,
+       use 60/40 name/relation blend. If relation similarity < 40, apply -25
+       penalty (stops "SHEELA" search from confirming "HECH SHINA").
+       If candidate has NO relation field, apply -15 penalty.
     """
+    name_tokens = [t for t in (name.split() if name else []) if len(t) >= 2]
+
     best_doc, best_score = None, 0.0
     for doc in candidates:
-        flat    = flat_fn(doc)
-        n_score = _name_score(name, flat['name'])
-        r_score = _name_score(relation, flat['relation']) if (relation and flat['relation']) else 0.0
-        comp    = (0.65 * n_score + 0.35 * r_score) if (relation and flat['relation']) else n_score
+        flat      = flat_fn(doc)
+        cand_name = flat['name']
+        cand_rel  = flat['relation']
+
+        n_score = _name_score(name, cand_name) if name else 0.0
+
+        # Token coverage bonus
+        if name_tokens and cand_name:
+            cand_up      = cand_name.upper()
+            matched_toks = sum(1 for t in name_tokens if t in cand_up)
+            token_bonus  = 10.0 * matched_toks / len(name_tokens)
+        else:
+            matched_toks = len(name_tokens)
+            token_bonus  = 0.0
+
+        # Multi-token guard: fewer than half tokens found -> cap at 60
+        if len(name_tokens) >= 2 and matched_toks < len(name_tokens) / 2:
+            n_score    = min(n_score, 60.0)
+            token_bonus = 0.0
+
+        # Relation scoring with hard penalty for mismatch
+        if relation:
+            if cand_rel:
+                r_score     = _name_score(relation, cand_rel)
+                rel_penalty = -25.0 if r_score < 40 else 0.0
+                comp = 0.60 * n_score + 0.40 * r_score + token_bonus + rel_penalty
+            else:
+                comp = n_score + token_bonus - 15.0
+        else:
+            comp = n_score + token_bonus
+
+        comp = max(comp, 0.0)
+
         if comp > best_score:
             best_score, best_doc = comp, doc
-        if best_score >= 97: break   # near-perfect — stop looking
+        if best_score >= 97: break   # near-perfect - stop looking
     return best_doc, best_score
 
 
@@ -2824,13 +2868,22 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
             return bson_clean(doc)
 
     # Tier 2: exact regex name + house
+    # If relation is also given, verify it scores >= 35 before confirming.
+    # This prevents confirming a same-house namesake whose relative is different.
     if name and house:
         doc = col.find_one({'$and': [
             {'Name':     {'$regex': re.escape(name), '$options': 'i'}},
             {'House No': house},
         ]})
         if doc:
-            return bson_clean(doc)
+            if relation:
+                flat_check = _flat_2025(doc)
+                rel_score  = _name_score(relation, flat_check['relation']) if flat_check['relation'] else 0
+                if rel_score >= 35 or not flat_check['relation']:
+                    return bson_clean(doc)
+                # else fall through to fuzzy tiers which will score properly
+            else:
+                return bson_clean(doc)
 
     _PROJ_25 = {'Name':1,'Relation Name':1,'Epic NO':1,'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1}
 
@@ -2866,7 +2919,10 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
                     all_candidates.append(doc)
         if all_candidates:
             best_doc, best_score = _score_candidates(all_candidates, _flat_2025, name, relation)
-            if best_doc and best_score >= _FUZZY_THRESHOLD:
+            # Raise threshold when relation provided: penalty already applied in scorer,
+            # but also gate at 88 so name-only partial matches never confirm.
+            t4_threshold = 88 if relation else _FUZZY_THRESHOLD
+            if best_doc and best_score >= t4_threshold:
                 return bson_clean(best_doc)
 
     return None
@@ -2901,6 +2957,7 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
             return bson_clean(doc)
 
     # Tier 2: exact regex name + house
+    # If relation is also given, verify it scores >= 35 before confirming.
     if name and house:
         name_rx = {'$regex': re.escape(name), '$options': 'i'}
         doc = col.find_one({'$and': [
@@ -2908,7 +2965,14 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
             _house_q(house),
         ]})
         if doc:
-            return bson_clean(doc)
+            if relation:
+                flat_check = _flat_2002(doc)
+                rel_score  = _name_score(relation, flat_check['relation']) if flat_check['relation'] else 0
+                if rel_score >= 35 or not flat_check['relation']:
+                    return bson_clean(doc)
+                # fall through — different relative at same house
+            else:
+                return bson_clean(doc)
 
     # Tier 3: fuzzy within same house — threshold 60 (house confirms locality)
     if house and (name or relation):
@@ -2956,8 +3020,15 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
                     all_candidates_02.append(doc)
         if all_candidates_02:
             best_doc, best_score = _score_candidates(all_candidates_02, _flat_2002, name, relation)
-            # Lower threshold when house is also known (double-confirms the match)
-            threshold = 68 if house else _FUZZY_THRESHOLD
+            # When house known: lower threshold (house already narrows candidates).
+            # When relation provided (no house): raise threshold to 88 — the scorer
+            # already penalises relation mismatches; this gate prevents borderline passes.
+            if house:
+                threshold = 68
+            elif relation:
+                threshold = 88
+            else:
+                threshold = _FUZZY_THRESHOLD
             if best_doc and best_score >= threshold:
                 return bson_clean(best_doc)
 
