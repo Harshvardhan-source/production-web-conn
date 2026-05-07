@@ -2579,9 +2579,7 @@ from functools import lru_cache as _lru_cache
 def _phonetic_norm(s: str) -> str:
     for old, new in _PHONETIC_RULES:
         s = s.replace(old, new)
-    # FIX: strip trailing 'A' per token, not on the full multi-word string.
-    # Previously "SANTHA KUMARA" → "SANTHA KUM" (wrong), now → "SANTH KUMAR" (correct).
-    return ' '.join(tok.rstrip('A') for tok in s.split())
+    return s.rstrip('A')
 
 
 # ── _gen_prefixes: phonetic-aware prefix variants for candidate fetching ───────
@@ -2702,11 +2700,9 @@ def _name_score(a: str, b: str) -> float:
 
     if _RAPIDFUZZ_AVAILABLE:
         # rapidfuzz is 50-100× faster than pure-Python; skip Levenshtein entirely
-        # token_set_ratio added: handles "RAJESH SHETTY" vs "SHETTY RAJESH" (word-order variants)
         return max(
             _rfuzz.token_sort_ratio(a, b),
             _rfuzz.token_sort_ratio(pa, pb),
-            _rfuzz.token_set_ratio(a, b),
             _rfuzz.partial_ratio(a, b),
             _rfdist.JaroWinkler.normalized_similarity(a, b) * 100,
             _rfdist.JaroWinkler.normalized_similarity(pa, pb) * 100,
@@ -2855,9 +2851,7 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
             if best_doc and best_score >= _FUZZY_THRESHOLD:
                 return bson_clean(best_doc)
 
-    # Tier 4: phonetic-aware prefix → fuzzy, tries all variant prefixes.
-    # FIX: limit raised 40→200 so common first names like "RAJESH" (26+ records)
-    # are not silently truncated before the target record is reached.
+    # Tier 4: phonetic-aware prefix → fuzzy, tries all variant prefixes
     if name:
         _ft4 = name.split()[0]
         _seen_tier4 = set()
@@ -2865,50 +2859,13 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
         for _pfx_v in _gen_prefixes(_ft4):
             for doc in col.find(
                 {'Name': {'$regex': f'^{re.escape(_pfx_v)}', '$options': 'i'}}, _PROJ_25
-            ).limit(200):                                       # ← was 40
+            ).limit(40):
                 oid = str(doc.get('_id',''))
                 if oid not in _seen_tier4:
                     _seen_tier4.add(oid)
                     all_candidates.append(doc)
         if all_candidates:
             best_doc, best_score = _score_candidates(all_candidates, _flat_2025, name, relation)
-            if best_doc and best_score >= _FUZZY_THRESHOLD:
-                return bson_clean(best_doc)
-
-    # Tier 4b: surname / last-token contains search.
-    # Catches "RAJESH SHETTY" even when first-name prefix scan returned too many
-    # generic hits and the specific "SHETTY" token was not in the top-200.
-    # Only runs when name has ≥ 2 tokens and the surname is ≥ 4 chars.
-    _name_toks_t4b = name.split() if name else []
-    if len(_name_toks_t4b) >= 2:
-        _surname_t4b = _name_toks_t4b[-1]
-        if len(_surname_t4b) >= 4:
-            _seen_t4b = set()
-            _cands_t4b = []
-            for doc in col.find(
-                {'Name': {'$regex': re.escape(_surname_t4b), '$options': 'i'}}, _PROJ_25
-            ).limit(200):
-                oid = str(doc.get('_id', ''))
-                if oid not in _seen_t4b:
-                    _seen_t4b.add(oid)
-                    _cands_t4b.append(doc)
-            if _cands_t4b:
-                best_doc, best_score = _score_candidates(_cands_t4b, _flat_2025, name, relation)
-                if best_doc and best_score >= _FUZZY_THRESHOLD:
-                    return bson_clean(best_doc)
-
-    # Tier 4c: full-name contains — fetches any record containing ALL query tokens.
-    # Last safety net: "RAJESH SHETTY" → find docs where Name contains both
-    # "RAJESH" and "SHETTY" regardless of order (handles "SHETTY RAJESH" storage).
-    _name_toks_t4c = [t for t in (name.split() if name else []) if len(t) >= 4]
-    if len(_name_toks_t4c) >= 2:
-        _and_clauses = [
-            {'Name': {'$regex': re.escape(tok), '$options': 'i'}}
-            for tok in _name_toks_t4c
-        ]
-        _cands_t4c = list(col.find({'$and': _and_clauses}, _PROJ_25).limit(100))
-        if _cands_t4c:
-            best_doc, best_score = _score_candidates(_cands_t4c, _flat_2025, name, relation)
             if best_doc and best_score >= _FUZZY_THRESHOLD:
                 return bson_clean(best_doc)
 
@@ -2983,8 +2940,7 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
             if best_doc and best_score >= 55:
                 return bson_clean(best_doc)
 
-    # Tier 5: phonetic-aware prefix scan — tries all variant prefixes.
-    # FIX: limit raised 40→200 so common first names don't get truncated.
+    # Tier 5: phonetic-aware prefix scan — tries all variant prefixes
     if name and len(name) >= 3:
         _ft5 = name.split()[0]
         _seen_tier5 = set()
@@ -2993,7 +2949,7 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
             px = {'$regex': f'^{re.escape(_pfx_v)}', '$options': 'i'}
             for doc in col.find(
                 {'$or': [{'Voter Name': px}, {'Name': px}]}, _PROJ_02
-            ).limit(200):                                       # ← was 40
+            ).limit(40):
                 oid = str(doc.get('_id',''))
                 if oid not in _seen_tier5:
                     _seen_tier5.add(oid)
@@ -3001,44 +2957,6 @@ def _find_voter_in_2002(col, voterid, name, house, relation=''):
         if all_candidates_02:
             best_doc, best_score = _score_candidates(all_candidates_02, _flat_2002, name, relation)
             # Lower threshold when house is also known (double-confirms the match)
-            threshold = 68 if house else _FUZZY_THRESHOLD
-            if best_doc and best_score >= threshold:
-                return bson_clean(best_doc)
-
-    # Tier 5b: surname / last-token contains search (schema-agnostic).
-    # Catches "RAJESH SHETTY" when 2002 stores it as "SHETTY RAJESH" or
-    # the first-name prefix scan was exhausted by common names.
-    _name_toks_t5b = name.split() if name else []
-    if len(_name_toks_t5b) >= 2:
-        _surname_t5b = _name_toks_t5b[-1]
-        if len(_surname_t5b) >= 4:
-            _seen_t5b = set()
-            _cands_t5b = []
-            sn_rx = {'$regex': re.escape(_surname_t5b), '$options': 'i'}
-            for doc in col.find(
-                {'$or': [{'Voter Name': sn_rx}, {'Name': sn_rx}]}, _PROJ_02
-            ).limit(200):
-                oid = str(doc.get('_id', ''))
-                if oid not in _seen_t5b:
-                    _seen_t5b.add(oid)
-                    _cands_t5b.append(doc)
-            if _cands_t5b:
-                best_doc, best_score = _score_candidates(_cands_t5b, _flat_2002, name, relation)
-                threshold = 68 if house else _FUZZY_THRESHOLD
-                if best_doc and best_score >= threshold:
-                    return bson_clean(best_doc)
-
-    # Tier 5c: full-name AND-contains — all query tokens must appear in the name.
-    # Handles inverted storage order "SHETTY RAJESH" when query is "RAJESH SHETTY".
-    _name_toks_t5c = [t for t in (name.split() if name else []) if len(t) >= 4]
-    if len(_name_toks_t5c) >= 2:
-        _and_clauses_02 = []
-        for tok in _name_toks_t5c:
-            tok_rx = {'$regex': re.escape(tok), '$options': 'i'}
-            _and_clauses_02.append({'$or': [{'Voter Name': tok_rx}, {'Name': tok_rx}]})
-        _cands_t5c = list(col.find({'$and': _and_clauses_02}, _PROJ_02).limit(100))
-        if _cands_t5c:
-            best_doc, best_score = _score_candidates(_cands_t5c, _flat_2002, name, relation)
             threshold = 68 if house else _FUZZY_THRESHOLD
             if best_doc and best_score >= threshold:
                 return bson_clean(best_doc)
@@ -3365,18 +3283,6 @@ def api_check_sir(request):
                     {'Name':       _surname_contains_rx},
                 ]}, _PROJ_02).limit(200))
 
-            # c4) All-token contains: fetch records containing ANY query token (≥4 chars)
-            # anywhere in the name.  Catches inverted or middle-name storage order.
-            if _name_tokens:
-                _ct_clauses = []
-                for tok in _name_tokens:
-                    if len(tok) >= 4:
-                        rx = {'$regex': re.escape(tok), '$options': 'i'}
-                        _ct_clauses.append({'Voter Name': rx})
-                        _ct_clauses.append({'Name': rx})
-                if _ct_clauses:
-                    _add(col_2002.find({'$or': _ct_clauses}, _PROJ_02).limit(300))
-
             # d) Relation prefix
             if relation and len(relation) >= 2:
                 frt = relation.split()[0]
@@ -3416,16 +3322,6 @@ def api_check_sir(request):
             # Surname "contains" fallback
             if _surname_contains_rx:
                 _add(col_2025.find({'Name': _surname_contains_rx}, _PROJ_25).limit(200))
-
-            # All-token contains search: fetch records containing ANY query token (≥4 chars)
-            # anywhere in the Name field.  Catches "SHETTY RAJESH" when query is "RAJESH SHETTY".
-            if _name_tokens:
-                _contains_clauses = [
-                    {'Name': {'$regex': re.escape(tok), '$options': 'i'}}
-                    for tok in _name_tokens if len(tok) >= 4
-                ]
-                if _contains_clauses:
-                    _add(col_2025.find({'$or': _contains_clauses}, _PROJ_25).limit(300))
 
             if relation and len(relation) >= 3:
                 frt = relation.split()[0]
@@ -3528,6 +3424,11 @@ def api_check_sir(request):
     has_rel   = bool(relation)
     has_epic  = bool(voterid)
 
+    # Surname token shared by both scoring loops. Last word of multi-word name.
+    # e.g. "RAJESH SHETTY" -> _surname_tok = "SHETTY"
+    _name_toks_shared = name.split() if name else []
+    _surname_tok = _name_toks_shared[-1] if len(_name_toks_shared) >= 2 else ''
+
     suggestions_2002 = []
     _scored02 = []
     for doc in _raw02:
@@ -3554,21 +3455,29 @@ def api_check_sir(request):
             comp = 100.0 if e_ok else 0.0
         if e_ok: comp = max(comp, 95.0)
 
-        # Gate: drop candidates with no meaningful signal.
-        # Surname-contains bypass: if any query token (≥4 chars) appears verbatim in
-        # the stored name, never drop the candidate — it will be ranked low but visible.
-        _surname_hit = has_name and any(
-            len(tok) >= 4 and tok in flat['name']
-            for tok in name.split()
-        )
-        if has_name and n_sc < 15 and not e_ok and not h_ok and not _surname_hit: continue
+        # Surname-only match check for 2002 — lets records where only the surname
+        # matches pass the gate and get labelled 'surname' in matched_by.
+        _surname_sc02 = 0.0
+        if has_name and _surname_tok and len(_surname_tok) >= 3 and n_sc < 60:
+            if _surname_tok in flat['name']:
+                _surname_sc02 = 75.0
+            else:
+                for _tok02 in flat['name'].split():
+                    if len(_tok02) >= 3:
+                        _s = _name_score(_surname_tok, _tok02)
+                        if _s > _surname_sc02:
+                            _surname_sc02 = _s
+
+        # Gate: allow through if full-name score ≥20, OR surname matched, OR EPIC/house matched
+        if has_name and n_sc < 20 and _surname_sc02 < 70 and not e_ok and not h_ok: continue
         if has_rel and not has_name and r_sc < 30 and not e_ok: continue
 
         matched_by = []
-        if e_ok:                       matched_by.append('voterid')
-        if has_name  and n_sc >= 60:   matched_by.append('name')
-        if has_house and h_ok:         matched_by.append('house')
-        if has_rel   and r_sc >= 60:   matched_by.append('relation')
+        if e_ok:                                                  matched_by.append('voterid')
+        if has_name and n_sc >= 60:                               matched_by.append('name')
+        elif has_name and _surname_sc02 >= 70 and n_sc < 60:     matched_by.append('surname')
+        if has_house and h_ok:                                    matched_by.append('house')
+        if has_rel   and r_sc >= 60:                              matched_by.append('relation')
 
         _scored02.append({
             'comp': comp, 'flat': flat, 'doc': doc,
@@ -3614,20 +3523,24 @@ def api_check_sir(request):
 
     def _flags25(rn, rr, rh, re_):
         flags = []
-        if voterid and re_ and voterid.upper() == re_.upper():           flags.append('voterid')
-        # Lowered 60→45: two-word query like "RAJESH SHETTY" may score 50-58 against
-        # a stored single-word first-name token; we still want to surface the candidate.
-        if name and len(name) >= 2 and _name_score(name, rn) >= 45:     flags.append('name')
-        # Surname-contains fast-pass: if ANY token of the query appears inside the stored name,
-        # count it as a weak 'name' hit so the candidate is NOT silently dropped.
-        if name and 'name' not in flags:
-            for _qtok in name.split():
-                if len(_qtok) >= 4 and _qtok in rn:
-                    flags.append('name')
-                    break
+        if voterid and re_ and voterid.upper() == re_.upper():
+            flags.append('voterid')
+        if name and len(name) >= 2:
+            full_sc = _name_score(name, rn)
+            if full_sc >= 60:
+                flags.append('name')
+            elif _surname_tok and len(_surname_tok) >= 3:
+                # Surname token appears verbatim in candidate name (case-insensitive)
+                if _surname_tok in rn:
+                    flags.append('surname')
+                # Or surname alone scores well against candidate name tokens
+                elif any(_name_score(_surname_tok, tok) >= 80
+                         for tok in rn.split() if len(tok) >= 3):
+                    flags.append('surname')
         if house and rh and (rh.upper() == house.upper() or rh.upper().startswith(house.upper())):
-                                                                          flags.append('house')
-        if relation and len(relation) >= 2 and _name_score(relation, rr) >= 60: flags.append('relation')
+            flags.append('house')
+        if relation and len(relation) >= 2 and _name_score(relation, rr) >= 60:
+            flags.append('relation')
         return flags
 
     _scored25 = []
@@ -3648,12 +3561,16 @@ def api_check_sir(request):
             _c25 = r_sc25
         else:
             _c25 = 100.0
+        # Boost score when surname matches explicitly, so surname-matched records sort above noise
+        if 'surname' in flags and 'name' not in flags:
+            _c25 = max(_c25, 55.0)
         _scored25.append((len(flags), _c25, {
             'name': rn, 'relation': rr, 'house': rh, 'voterid': re_,
             'gender': _norm(d.get('Gender','')),
             'age':    str(d.get('Age','')).strip(),
             'booth':  str(d.get('Booth No','')).strip(),
             'part':   str(d.get('Part No','')).strip(),
+            'score':  round(_c25),
             'matched_by': flags,
         }))
 
