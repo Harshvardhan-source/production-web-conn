@@ -3578,7 +3578,7 @@ def api_check_sir(request):
 
     _scored02.sort(key=lambda x: (-len([f for f in x['matched_by'] if f != 'partial']), -x['comp']))
     _seen_sigs02 = set()
-    for item in _scored02[:100]:
+    for item in _scored02[:300]:
         f   = item['flat']
         doc = item['doc']
         sig = (f['name'], f['house'])
@@ -3600,7 +3600,7 @@ def api_check_sir(request):
         })
 
     suggestions_2002.sort(key=lambda x: (-len([f for f in x.get('matched_by',[]) if f != 'partial']), -x['score']))
-    suggestions_2002 = suggestions_2002[:100]
+    suggestions_2002 = suggestions_2002[:300]
 
     # ── Score similar_2025 from pre-fetched _raw25 ────────────────────────────────────
     similar_2025 = []
@@ -3670,7 +3670,7 @@ def api_check_sir(request):
         if _conf25_epic and epic == _conf25_epic: continue
         _seen25_epics.add(epic)
         similar_2025.append(rec)
-        if len(similar_2025) >= 100: break
+        if len(similar_2025) >= 300: break
 
     _response_data = {
         'success':    True,
