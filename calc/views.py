@@ -5093,34 +5093,37 @@ _DATA_DIR_CHAT = _os_ai.path.join(
 )
 
 _CHAT_DATA_CACHE: dict = {'text': None, 'loaded_at': None}
-_CHAT_CACHE_TTL  = 3600   # re-read files every 60 min (not 5 — files don't change often)
-_CHAT_CACHE_LOCK = threading.Lock()
-_CHAT_PRELOAD_DONE = False  # guards one-time startup preload
-
-# ── DB stats cache — avoids 7 heavy MongoDB aggregations on every request ───
-_DB_STATS_CACHE: dict = {'data': None, 'loaded_at': None}
-_DB_STATS_CACHE_TTL   = 120   # 2 minutes
-_DB_STATS_LOCK        = threading.Lock()
+_CHAT_CACHE_TTL = 300  # seconds
 
 
-def _load_chat_data_context_internal() -> str:
+def _load_chat_data_context() -> str:
     """
-    Blocking worker: reads CSV/Excel files from <project_root>/data/ and returns
-    a compact text summary.  Called only from the background thread — never
-    directly from a request handler.
-
+    Read all CSV/Excel files from the project-root /data/ folder and return
+    a compact text summary for injection into the Claude system prompt.
+    Results are cached for 5 minutes.
     Drop your files here:
         <project_root>/data/Mangaluru_Election_Strategy_Report.xlsx
         <project_root>/data/Caste_Voter_Turnout_Report.xlsx
         <project_root>/data/Mangaluru_FULLSCALE_Analysis_v2.xlsx
     """
+    from datetime import datetime as _dt
+    now = _dt.utcnow()
+    cached = _CHAT_DATA_CACHE
+    if (cached['text'] is not None and cached['loaded_at'] is not None
+            and (now - cached['loaded_at']).total_seconds() < _CHAT_CACHE_TTL):
+        return cached['text']
+
     if not _os_ai.path.isdir(_DATA_DIR_CHAT):
-        return 'No /data directory found in project root. Using live MongoDB stats only.'
+        result = 'No /data directory found in project root. Using live MongoDB stats only.'
+        _CHAT_DATA_CACHE.update({'text': result, 'loaded_at': now})
+        return result
 
     try:
         import pandas as _pd
     except ImportError:
-        return 'pandas not installed — file context unavailable.'
+        result = 'pandas not installed — file context unavailable.'
+        _CHAT_DATA_CACHE.update({'text': result, 'loaded_at': now})
+        return result
 
     summaries = []
     for fname in sorted(_os_ai.listdir(_DATA_DIR_CHAT)):
@@ -5129,75 +5132,19 @@ def _load_chat_data_context_internal() -> str:
             if fname.endswith('.csv'):
                 df = _pd.read_csv(fpath, nrows=200)
             elif fname.endswith(('.xlsx', '.xls')):
-                # engine='openpyxl' is explicit — avoids xlrd for .xlsx
-                df = _pd.read_excel(fpath, nrows=200, engine='openpyxl')
+                df = _pd.read_excel(fpath, nrows=200)
             else:
                 continue
             header  = f"\n=== FILE: {fname} | Rows: ~{len(df)} | Cols: {df.shape[1]} ===\n"
             col_str = "Columns: " + ", ".join(df.columns.tolist()) + "\n"
             preview = df.head(30).to_csv(index=False)
             summaries.append(header + col_str + preview)
-            _ai_logger.info(f'[ChatData] loaded {fname} ({len(df)} rows)')
         except Exception as e:
-            _ai_logger.warning(f'[ChatData] skipped {fname}: {e}')
             summaries.append(f"\n=== FILE: {fname} | READ ERROR: {e} ===\n")
 
-    return "\n".join(summaries) if summaries else "No readable data files found in /data/."
-
-
-def _preload_chat_data_bg() -> None:
-    """Background thread target: load files once at startup and populate cache."""
-    _ai_logger.info('[ChatData] background preload started')
-    try:
-        from datetime import datetime as _dt
-        result = _load_chat_data_context_internal()
-        with _CHAT_CACHE_LOCK:
-            _CHAT_DATA_CACHE['text']      = result
-            _CHAT_DATA_CACHE['loaded_at'] = _dt.utcnow()
-        _ai_logger.info('[ChatData] background preload complete')
-    except Exception:
-        _ai_logger.exception('[ChatData] background preload failed')
-
-
-def _load_chat_data_context() -> str:
-    """
-    Non-blocking accessor called from request handlers.
-
-    - On first call: kicks off a background thread to read the files and
-      immediately returns a placeholder so the request is not blocked.
-    - On subsequent calls: returns the cached result (or placeholder if
-      the background thread is still running).
-    - Cache TTL is 60 min; after expiry the next call triggers a fresh
-      background reload without blocking any request.
-    """
-    global _CHAT_PRELOAD_DONE
-    from datetime import datetime as _dt
-
-    with _CHAT_CACHE_LOCK:
-        cached    = _CHAT_DATA_CACHE
-        text      = cached.get('text')
-        loaded_at = cached.get('loaded_at')
-        cache_fresh = (
-            text is not None
-            and loaded_at is not None
-            and (_dt.utcnow() - loaded_at).total_seconds() < _CHAT_CACHE_TTL
-        )
-
-    if cache_fresh:
-        return text  # type: ignore[return-value]
-
-    # Cache missing or stale — trigger background reload (non-blocking)
-    t = threading.Thread(target=_preload_chat_data_bg, daemon=True)
-    t.start()
-
-    # Return whatever we have; first-ever call returns placeholder
-    if text:
-        return text
-    return 'Constituency data files are loading in the background. Using live MongoDB stats for now.'
-
-
-# ── Kick off preload as soon as this module is imported (Gunicorn worker start)
-threading.Thread(target=_preload_chat_data_bg, daemon=True).start()
+    result = "\n".join(summaries) if summaries else "No readable data files found in /data/."
+    _CHAT_DATA_CACHE.update({'text': result, 'loaded_at': now})
+    return result
 
 
 def _get_chat_db_stats() -> dict:
@@ -5259,22 +5206,6 @@ def _get_chat_db_stats() -> dict:
         return {'error': str(e)}
 
 
-def _get_chat_db_stats_cached() -> dict:
-    """Cached wrapper around _get_chat_db_stats — TTL 2 min, thread-safe."""
-    from datetime import datetime as _dt
-    with _DB_STATS_LOCK:
-        cached = _DB_STATS_CACHE
-        if (cached['data'] is not None and cached['loaded_at'] is not None
-                and (_dt.utcnow() - cached['loaded_at']).total_seconds() < _DB_STATS_CACHE_TTL):
-            return cached['data']
-    # Cache miss — fetch (outside lock so other threads aren't blocked)
-    result = _get_chat_db_stats()
-    with _DB_STATS_LOCK:
-        _DB_STATS_CACHE['data']      = result
-        _DB_STATS_CACHE['loaded_at'] = _dt.utcnow()
-    return result
-
-
 def _build_chat_system_prompt(user_profile: dict, db_stats: dict, file_ctx: str) -> str:
     uname = user_profile.get('username', 'MLA')
     urole = user_profile.get('role', 'mla')
@@ -5284,7 +5215,7 @@ You are assisting {uname} ({urole}) who manages Mangalore South (Constituency 17
 ════════════════════════════════════════
 LIVE MONGODB STATS (real-time)
 ════════════════════════════════════════
-{json.dumps(db_stats, separators=(',', ':'), default=str)}
+{json.dumps(db_stats, indent=2, default=str)}
 
 ════════════════════════════════════════
 CONSTITUENCY DATA FILES (CSV / Excel)
@@ -5318,34 +5249,13 @@ Return a single JSON object (all fields optional except "text"):
   "strategies": [
     "Specific actionable strategy 1.",
     "Specific actionable strategy 2."
-  ],
-  "download": {{
-    "filename": "ward_turnout_analysis",
-    "columns": ["Ward", "Voters", "Surveyed", "Coverage%"],
-    "data": [{{"Ward": "Padavu", "Voters": 4500, "Surveyed": 1200, "Coverage%": 26.7}}],
-    "formats": ["xlsx", "csv"]
-  }}
+  ]
 }}
 
 RULES:
 - metrics: 0-4 items; only when numbers enrich the answer.
-- chart: DEFAULT is null. Only include a chart when BOTH conditions are true:
-    1. The user explicitly asks ("plot", "chart", "graph", "visualise", "show me") OR
-       the data has 4+ comparable values where a visual is clearly superior to text.
-    2. You have actual tabular data to plot — never fabricate chart data.
-  Never chart for: single facts, strategy advice, coverage summaries, ward lists,
-  yes/no questions, or anything that reads naturally as prose or metric cards.
-  When in doubt → null.
-  chart.type must be one of: "bar", "line", "pie", "scatter", "radar".
-  • bar     — comparing categories (wards, castes, parties). Most common.
-  • line    — trends over time or sequential data.
-  • pie     — composition/share (religion split, vote share). Only when ≤6 slices.
-  • scatter — correlation between two numeric variables.
-  • radar   — multi-axis comparison across dimensions.
+- chart: null if not needed. ONE chart per response. type must be "bar", "line", or "pie".
 - strategies: 0-5 items; include when recommendations are warranted.
-- download: Include ONLY when user explicitly says "export", "download", "save as file",
-  "give me xlsx/csv/pdf/docx". Never include it otherwise.
-  "formats": ["xlsx","csv"] for tabular data, ["pdf","docx"] for narrative reports.
 - Colors: amber #f59e0b | green #10b981 | blue #3b82f6 | red #ef4444 | purple #6366f1
 - NEVER output markdown fences or any text outside the JSON object.
 - Never invent numbers — use real data from the stats above or say data is unavailable.
@@ -5353,7 +5263,7 @@ RULES:
 
 
 @csrf_exempt
-@require_http_methods(['POST', 'OPTIONS'])
+@require_http_methods(['POST'])
 def api_ai_query_insight(request):
     """
     POST /api/ai/query-insight/
@@ -5366,8 +5276,6 @@ def api_ai_query_insight(request):
       Mode A: { success, result: { text, metrics, chart, strategies } }
       Mode B: { success, insight: { headline, summary, keyFigures, barChart, ... } }
     """
-    if request.method == 'OPTIONS':
-        return JsonResponse({}, status=200)
     user = _user_from_request(request)
     if not user:
         return JsonResponse({'success': False, 'error': 'Authentication required.'}, status=401)
@@ -5455,7 +5363,7 @@ def api_ai_query_insight(request):
         return JsonResponse({'success': False, 'error': 'query is required'}, status=400)
 
     try:
-        db_stats = _get_chat_db_stats_cached()
+        db_stats = _get_chat_db_stats()
         file_ctx = _load_chat_data_context()
         system   = _build_chat_system_prompt(user, db_stats, file_ctx)
     except Exception as e:
@@ -5463,7 +5371,7 @@ def api_ai_query_insight(request):
         return JsonResponse({'success': False, 'error': f'Context build failed: {e}'}, status=500)
 
     messages = []
-    for turn in history[-4:]:
+    for turn in history[-8:]:
         role    = turn.get('role', 'user')
         content = turn.get('content', '')
         if isinstance(content, dict):
@@ -5474,7 +5382,7 @@ def api_ai_query_insight(request):
     try:
         response = client.messages.create(
             model='claude-sonnet-4-20250514',
-            max_tokens=800,
+            max_tokens=1500,
             system=system,
             messages=messages,
         )
@@ -5651,236 +5559,3 @@ def api_ai_birdseye_view(request):
         parsed = {'text': raw}
 
     return JsonResponse({'success': True, 'result': parsed})
-
-# ── File Export ────────────────────────────────────────────────────────────────
-@csrf_exempt
-@require_http_methods(['POST'])
-def api_ai_export(request):
-    """
-    POST /api/ai/export/
-
-    Body: { filename, columns, data: [...rows], format: "xlsx"|"csv"|"pdf"|"docx" }
-    Returns: binary file download with appropriate Content-Type.
-    """
-    from django.http import HttpResponse
-    import io
-
-    user = _user_from_request(request)
-    if not user:
-        return JsonResponse({'success': False, 'error': 'Authentication required.'}, status=401)
-    if not _is_approved(user):
-        return JsonResponse({'success': False, 'error': 'Account pending approval.'}, status=403)
-
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        return JsonResponse({'success': False, 'error': 'Invalid JSON body.'}, status=400)
-
-    filename = re.sub(r'[^\w\-]', '_', body.get('filename', 'analysis'))
-    columns  = body.get('columns', [])
-    rows     = body.get('data', [])
-    fmt      = body.get('format', 'xlsx').lower()
-
-    if not rows:
-        return JsonResponse({'success': False, 'error': 'No data to export.'}, status=400)
-
-    if pd is None:
-        return JsonResponse({'success': False, 'error': 'pandas not installed on server.'}, status=500)
-
-    df = pd.DataFrame(rows)
-    if columns:
-        for c in columns:
-            if c not in df.columns:
-                df[c] = ''
-        df = df[[c for c in columns if c in df.columns]]
-
-    # ── XLSX ─────────────────────────────────────────────────────────────────
-    if fmt == 'xlsx':
-        try:
-            import openpyxl
-            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-            from openpyxl.utils import get_column_letter
-        except ImportError:
-            return JsonResponse({'success': False, 'error': 'openpyxl not installed.'}, status=500)
-
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = filename[:31]
-
-        header_fill = PatternFill('solid', fgColor='1E2A45')
-        header_font = Font(bold=True, color='F1F5F9', size=11)
-        thin_border = Border(
-            bottom=Side(style='thin', color='334155'),
-            right=Side(style='thin',  color='334155'),
-        )
-
-        for ci, col in enumerate(df.columns, 1):
-            cell = ws.cell(row=1, column=ci, value=str(col))
-            cell.fill      = header_fill
-            cell.font      = header_font
-            cell.alignment = Alignment(horizontal='center', vertical='center')
-            cell.border    = thin_border
-            ws.column_dimensions[get_column_letter(ci)].width = max(14, len(str(col)) + 4)
-        ws.row_dimensions[1].height = 22
-
-        alt_fill  = PatternFill('solid', fgColor='0F1825')
-        data_font = Font(color='CBD5E1', size=10)
-        for ri, row_data in enumerate(df.itertuples(index=False), 2):
-            fill = alt_fill if ri % 2 == 0 else None
-            for ci, val in enumerate(row_data, 1):
-                cell = ws.cell(row=ri, column=ci, value=val)
-                cell.font      = data_font
-                cell.border    = thin_border
-                cell.alignment = Alignment(vertical='center')
-                if fill:
-                    cell.fill = fill
-
-        ws.freeze_panes = 'A2'
-        buf = io.BytesIO()
-        wb.save(buf)
-        buf.seek(0)
-        resp = HttpResponse(buf.read(),
-            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        resp['Content-Disposition'] = f'attachment; filename="{filename}.xlsx"'
-        return resp
-
-    # ── CSV ──────────────────────────────────────────────────────────────────
-    if fmt == 'csv':
-        buf = io.StringIO()
-        df.to_csv(buf, index=False)
-        resp = HttpResponse(buf.getvalue(), content_type='text/csv')
-        resp['Content-Disposition'] = f'attachment; filename="{filename}.csv"'
-        return resp
-
-    # ── PDF ──────────────────────────────────────────────────────────────────
-    if fmt == 'pdf':
-        try:
-            from reportlab.lib.pagesizes import A4, landscape
-            from reportlab.lib import colors
-            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
-            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-            from reportlab.lib.units import cm
-        except ImportError:
-            return JsonResponse({'success': False, 'error': 'reportlab not installed.'}, status=500)
-
-        buf       = io.BytesIO()
-        page_size = landscape(A4) if len(df.columns) > 6 else A4
-        doc       = SimpleDocTemplate(buf, pagesize=page_size,
-                        leftMargin=1.5*cm, rightMargin=1.5*cm,
-                        topMargin=2*cm,    bottomMargin=1.5*cm)
-
-        styles      = getSampleStyleSheet()
-        title_style = ParagraphStyle('T', parent=styles['Title'], fontSize=16,
-                        textColor=colors.HexColor('#6366f1'), spaceAfter=6)
-        sub_style   = ParagraphStyle('S', parent=styles['Normal'], fontSize=9,
-                        textColor=colors.HexColor('#94a3b8'), spaceAfter=14)
-
-        elems = [
-            Paragraph(filename.replace('_', ' ').title(), title_style),
-            Paragraph(
-                f'ShaastraAI Export - {len(df)} records - '
-                f'{datetime.now().strftime("%d %b %Y %H:%M")}', sub_style),
-        ]
-
-        col_list = list(df.columns)
-        tdata    = [col_list] + df.values.tolist()
-        col_w    = (page_size[0] - 3*cm) / max(len(col_list), 1)
-        tbl      = Table(tdata, colWidths=[col_w]*len(col_list), repeatRows=1)
-        tbl.setStyle(TableStyle([
-            ('BACKGROUND',     (0, 0), (-1,  0), colors.HexColor('#1e2a45')),
-            ('TEXTCOLOR',      (0, 0), (-1,  0), colors.HexColor('#f1f5f9')),
-            ('FONTNAME',       (0, 0), (-1,  0), 'Helvetica-Bold'),
-            ('FONTSIZE',       (0, 0), (-1, -1), 9),
-            ('ALIGN',          (0, 0), (-1, -1), 'CENTER'),
-            ('VALIGN',         (0, 0), (-1, -1), 'MIDDLE'),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1),
-                [colors.HexColor('#0f1825'), colors.HexColor('#0a0f1e')]),
-            ('TEXTCOLOR',      (0, 1), (-1, -1), colors.HexColor('#cbd5e1')),
-            ('GRID',           (0, 0), (-1, -1), 0.3, colors.HexColor('#334155')),
-            ('ROWHEIGHT',      (0, 0), (-1, -1), 18),
-            ('TOPPADDING',     (0, 0), (-1, -1), 4),
-            ('BOTTOMPADDING',  (0, 0), (-1, -1), 4),
-        ]))
-        elems.append(tbl)
-        doc.build(elems)
-
-        buf.seek(0)
-        resp = HttpResponse(buf.read(), content_type='application/pdf')
-        resp['Content-Disposition'] = f'attachment; filename="{filename}.pdf"'
-        return resp
-
-    # ── DOCX ─────────────────────────────────────────────────────────────────
-    if fmt == 'docx':
-        try:
-            import docx
-            from docx.shared import Pt, RGBColor, Inches
-            from docx.enum.text import WD_ALIGN_PARAGRAPH
-            from docx.oxml.ns import qn
-            from docx.oxml import OxmlElement
-        except ImportError:
-            return JsonResponse({'success': False, 'error': 'python-docx not installed.'}, status=500)
-
-        document = docx.Document()
-        for section in document.sections:
-            section.top_margin    = Inches(0.9)
-            section.bottom_margin = Inches(0.9)
-            section.left_margin   = Inches(1.0)
-            section.right_margin  = Inches(1.0)
-
-        title_para = document.add_heading(filename.replace('_', ' ').title(), level=1)
-        title_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        for run in title_para.runs:
-            run.font.color.rgb = RGBColor(0x63, 0x66, 0xf1)
-            run.font.size      = Pt(18)
-
-        sub = document.add_paragraph(
-            f'ShaastraAI Export  -  {len(df)} records  -  '
-            f'{datetime.now().strftime("%d %b %Y %H:%M")}')
-        sub.runs[0].font.size      = Pt(9)
-        sub.runs[0].font.color.rgb = RGBColor(0x94, 0xa3, 0xb8)
-        document.add_paragraph()
-
-        def _set_cell_bg(cell, hex_color):
-            tc   = cell._tc
-            tcPr = tc.get_or_add_tcPr()
-            shd  = OxmlElement('w:shd')
-            shd.set(qn('w:val'),   'clear')
-            shd.set(qn('w:color'), 'auto')
-            shd.set(qn('w:fill'),  hex_color)
-            tcPr.append(shd)
-
-        col_list  = list(df.columns)
-        tbl       = document.add_table(rows=1 + len(df), cols=len(col_list))
-        tbl.style = 'Table Grid'
-
-        for ci, col in enumerate(col_list):
-            cell = tbl.rows[0].cells[ci]
-            cell.text = str(col)
-            _set_cell_bg(cell, '1E2A45')
-            run = cell.paragraphs[0].runs[0]
-            run.bold            = True
-            run.font.color.rgb  = RGBColor(0xF1, 0xF5, 0xF9)
-            run.font.size       = Pt(9)
-            cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-        for ri, row_data in enumerate(df.itertuples(index=False), 1):
-            bg = '0F1825' if ri % 2 == 0 else '0A0F1E'
-            for ci, val in enumerate(row_data):
-                cell = tbl.rows[ri].cells[ci]
-                cell.text = str(val) if val is not None else ''
-                _set_cell_bg(cell, bg)
-                run = (cell.paragraphs[0].runs[0]
-                       if cell.paragraphs[0].runs
-                       else cell.paragraphs[0].add_run(cell.text))
-                run.font.color.rgb = RGBColor(0xCB, 0xD5, 0xE1)
-                run.font.size      = Pt(8)
-
-        buf = io.BytesIO()
-        document.save(buf)
-        buf.seek(0)
-        resp = HttpResponse(buf.read(),
-            content_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-        resp['Content-Disposition'] = f'attachment; filename="{filename}.docx"'
-        return resp
-
-    return JsonResponse({'success': False, 'error': f'Unsupported format: {fmt}'}, status=400)
