@@ -5097,6 +5097,11 @@ _CHAT_CACHE_TTL  = 3600   # re-read files every 60 min (not 5 — files don't ch
 _CHAT_CACHE_LOCK = threading.Lock()
 _CHAT_PRELOAD_DONE = False  # guards one-time startup preload
 
+# ── DB stats cache — avoids 7 heavy MongoDB aggregations on every request ───
+_DB_STATS_CACHE: dict = {'data': None, 'loaded_at': None}
+_DB_STATS_CACHE_TTL   = 120   # 2 minutes
+_DB_STATS_LOCK        = threading.Lock()
+
 
 def _load_chat_data_context_internal() -> str:
     """
@@ -5254,6 +5259,22 @@ def _get_chat_db_stats() -> dict:
         return {'error': str(e)}
 
 
+def _get_chat_db_stats_cached() -> dict:
+    """Cached wrapper around _get_chat_db_stats — TTL 2 min, thread-safe."""
+    from datetime import datetime as _dt
+    with _DB_STATS_LOCK:
+        cached = _DB_STATS_CACHE
+        if (cached['data'] is not None and cached['loaded_at'] is not None
+                and (_dt.utcnow() - cached['loaded_at']).total_seconds() < _DB_STATS_CACHE_TTL):
+            return cached['data']
+    # Cache miss — fetch (outside lock so other threads aren't blocked)
+    result = _get_chat_db_stats()
+    with _DB_STATS_LOCK:
+        _DB_STATS_CACHE['data']      = result
+        _DB_STATS_CACHE['loaded_at'] = _dt.utcnow()
+    return result
+
+
 def _build_chat_system_prompt(user_profile: dict, db_stats: dict, file_ctx: str) -> str:
     uname = user_profile.get('username', 'MLA')
     urole = user_profile.get('role', 'mla')
@@ -5263,7 +5284,7 @@ You are assisting {uname} ({urole}) who manages Mangalore South (Constituency 17
 ════════════════════════════════════════
 LIVE MONGODB STATS (real-time)
 ════════════════════════════════════════
-{json.dumps(db_stats, indent=2, default=str)}
+{json.dumps(db_stats, separators=(',', ':'), default=str)}
 
 ════════════════════════════════════════
 CONSTITUENCY DATA FILES (CSV / Excel)
@@ -5332,7 +5353,7 @@ RULES:
 
 
 @csrf_exempt
-@require_http_methods(['POST'])
+@require_http_methods(['POST', 'OPTIONS'])
 def api_ai_query_insight(request):
     """
     POST /api/ai/query-insight/
@@ -5345,6 +5366,8 @@ def api_ai_query_insight(request):
       Mode A: { success, result: { text, metrics, chart, strategies } }
       Mode B: { success, insight: { headline, summary, keyFigures, barChart, ... } }
     """
+    if request.method == 'OPTIONS':
+        return JsonResponse({}, status=200)
     user = _user_from_request(request)
     if not user:
         return JsonResponse({'success': False, 'error': 'Authentication required.'}, status=401)
@@ -5432,7 +5455,7 @@ def api_ai_query_insight(request):
         return JsonResponse({'success': False, 'error': 'query is required'}, status=400)
 
     try:
-        db_stats = _get_chat_db_stats()
+        db_stats = _get_chat_db_stats_cached()
         file_ctx = _load_chat_data_context()
         system   = _build_chat_system_prompt(user, db_stats, file_ctx)
     except Exception as e:
@@ -5440,7 +5463,7 @@ def api_ai_query_insight(request):
         return JsonResponse({'success': False, 'error': f'Context build failed: {e}'}, status=500)
 
     messages = []
-    for turn in history[-8:]:
+    for turn in history[-4:]:
         role    = turn.get('role', 'user')
         content = turn.get('content', '')
         if isinstance(content, dict):
@@ -5451,7 +5474,7 @@ def api_ai_query_insight(request):
     try:
         response = client.messages.create(
             model='claude-sonnet-4-20250514',
-            max_tokens=1500,
+            max_tokens=800,
             system=system,
             messages=messages,
         )
