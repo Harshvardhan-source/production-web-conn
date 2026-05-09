@@ -17,8 +17,8 @@ urlpatterns = [
     # Survey
     path('serial-number/',           views.api_serial_number,      name='api_serial_number'),
     path('save-survey/',             views.api_save_survey,        name='api_save_survey'),
-    path('save-future-voters/',      views.api_save_future_voters, name='api_save_future_voters'),
-    path('save-deceased/',           views.api_save_deceased,      name='api_save_deceased'),
+    path('save-future-voters/',      views.api_save_future_voters,   name='api_save_future_voters'),
+    path('save-deceased/',           views.api_save_deceased,        name='api_save_deceased'),
 
     # Schemes
     path('scheme-voter-list/',       views.api_scheme_voter_list,  name='api_scheme_voter_list'),
@@ -40,9 +40,9 @@ urlpatterns = [
     path('sir/records/',             views.api_sir_records,        name='api_sir_records'),
     path('sir/stats/',               views.api_sir_stats,          name='api_sir_stats'),
 
-    path('update-voter/',            views.api_update_voter,       name='api_update_voter'),
-    path('update-survey/',           views.api_update_survey,      name='api_update_survey'),
-    path('large-families/',          views.api_large_families,     name='api_large_families'),
+    path('update-voter/',  views.api_update_voter,  name='api_update_voter'),
+    path('update-survey/', views.api_update_survey, name='api_update_survey'),
+    path('large-families/', views.api_large_families, name='api_large_families'),
 
     # Wards
     path('wards/',                   views.api_wards,              name='api_wards'),
@@ -52,20 +52,20 @@ urlpatterns = [
     path('admin/approve/',           views.api_admin_approve,      name='api_admin_approve'),
     path('admin/reject/',            views.api_admin_reject,       name='api_admin_reject'),
     path('admin/update-role/',       views.api_admin_update_role,  name='api_admin_update_role'),
-    path('admin/disable/',           views.api_admin_disable,      name='admin_disable'),   # fixed: removed extra api/ prefix
-    path('admin/enable/',            views.api_admin_enable,       name='admin_enable'),    # fixed: removed extra api/ prefix
+    path('api/admin/disable/', views.api_admin_disable, name='admin_disable'),
+    path('api/admin/enable/',  views.api_admin_enable,  name='admin_enable'),
 
-    # Survey Progress & Location Tracking (Admin only)
-    path('admin/survey-progress/',   views.api_admin_survey_progress, name='api_admin_survey_progress'),
-    path('location/ping/',           views.api_location_ping,         name='api_location_ping'),
-    path('admin/locations/',         views.api_admin_locations,       name='api_admin_locations'),
-    path('admin/location-dates/',    views.api_admin_location_dates,  name='api_admin_location_dates'),
+    # ── NEW: Survey Progress & Location Tracking (Admin only) ─────────────────
+    path('admin/survey-progress/',   views.api_admin_survey_progress,  name='api_admin_survey_progress'),
+    path('location/ping/',           views.api_location_ping,          name='api_location_ping'),
+    path('admin/locations/',         views.api_admin_locations,        name='api_admin_locations'),
+    path('admin/location-dates/',    views.api_admin_location_dates,   name='api_admin_location_dates'),
 
-    # ML Intelligence
-    path('ml/constituency-swot/',    views.api_ml_constituency_swot, name='api_ml_constituency_swot'),
+    # ML Intelligence — ConstituencyQueryStack & WardWiseQueryStack
+    path('ml/constituency-swot/', views.api_ml_constituency_swot, name='api_ml_constituency_swot'),
 
-    # AI Insights — Anthropic-powered
-    path('ai/query-insight/',        views.api_ai_query_insight,   name='api_ai_query_insight'),
-    path('ai/birdseye-view/',        views.api_ai_birdseye_view,   name='api_ai_birdseye_view'),
+    # AI Insights — Anthropic-powered analysis (per-query and bird's eye)
+    path('ai/query-insight/',     views.api_ai_query_insight,     name='api_ai_query_insight'),
+    path('ai/birdseye-view/',     views.api_ai_birdseye_view,     name='api_ai_birdseye_view'),
 ]
 
