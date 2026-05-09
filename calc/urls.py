@@ -67,5 +67,5 @@ urlpatterns = [
     # AI Insights — Anthropic-powered
     path('ai/query-insight/',        views.api_ai_query_insight,   name='api_ai_query_insight'),
     path('ai/birdseye-view/',        views.api_ai_birdseye_view,   name='api_ai_birdseye_view'),
-    
 ]
+
