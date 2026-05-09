@@ -5354,3 +5354,317 @@ def api_admin_location_dates(request):
     ]
     dates = [doc['_id'] for doc in loc_col.aggregate(pipeline)]
     return JsonResponse({'success': True, 'dates': dates})
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI Insights — Anthropic-powered
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+# Path to a `data/` folder in your project root where you drop CSVs/Excels.
+# Create it: mkdir <project_root>/data
+# Then copy Mangaluru_Election_Strategy_Report.xlsx, Caste_Voter_Turnout_Report.xlsx,
+# Mangaluru_FULLSCALE_Analysis_v2.xlsx etc. into it.
+_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data'
+)
+ 
+_ANTHROPIC = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
+ 
+# Simple in-process cache so we don't re-read files on every request
+_DATA_CONTEXT_CACHE: dict = {'text': None, 'loaded_at': None}
+_CACHE_TTL_SECONDS = 300  # re-read files every 5 minutes
+ 
+ 
+def _load_data_context() -> str:
+    """
+    Reads all CSV and Excel files from _DATA_DIR and returns a compact
+    text representation suitable for injecting into the Anthropic system prompt.
+    Up to 200 rows per file are included to stay within context limits.
+    Results are cached for _CACHE_TTL_SECONDS seconds.
+    """
+    now = datetime.utcnow()
+    cached = _DATA_CONTEXT_CACHE
+    if (
+        cached['text'] is not None
+        and cached['loaded_at'] is not None
+        and (now - cached['loaded_at']).total_seconds() < _CACHE_TTL_SECONDS
+    ):
+        return cached['text']
+ 
+    summaries = []
+ 
+    if not os.path.isdir(_DATA_DIR):
+        result = "No local data directory found. Using live DB data only."
+        _DATA_CONTEXT_CACHE.update({'text': result, 'loaded_at': now})
+        return result
+ 
+    for fname in sorted(os.listdir(_DATA_DIR)):
+        fpath = os.path.join(_DATA_DIR, fname)
+        try:
+            if fname.endswith('.csv'):
+                df = pd.read_csv(fpath, nrows=200)
+            elif fname.endswith('.xlsx') or fname.endswith('.xls'):
+                df = pd.read_excel(fpath, nrows=200)
+            else:
+                continue
+ 
+            header  = f"\n=== FILE: {fname} | Rows: ~{len(df)} | Columns: {df.shape[1]} ===\n"
+            col_str = "Columns: " + ", ".join(df.columns.tolist()) + "\n"
+            preview = df.head(30).to_csv(index=False)
+            summaries.append(header + col_str + preview)
+        except Exception as e:
+            summaries.append(f"\n=== FILE: {fname} | READ ERROR: {e} ===\n")
+ 
+    result = "\n".join(summaries) if summaries else "No readable data files found in /data directory."
+    _DATA_CONTEXT_CACHE.update({'text': result, 'loaded_at': now})
+    return result
+ 
+ 
+def _get_live_db_stats(request) -> dict:
+    """Pull key stats from the DB to enrich the AI context."""
+    m = _models()
+    from django.db.models import Count
+ 
+    try:
+        reg = m.UserReg.objects.get(email=request.user.email)
+    except Exception:
+        reg = None
+ 
+    voters_qs  = m.Voter.objects.all()
+    surveys_qs = m.Survey.objects.all()
+ 
+    if reg and reg.role == 'ward_incharge' and reg.ward:
+        voters_qs  = voters_qs.filter(ward_no=reg.ward)
+        surveys_qs = surveys_qs.filter(ward_no=reg.ward)
+ 
+    total_voters  = voters_qs.count()
+    total_surveys = surveys_qs.count()
+    coverage_pct  = round(total_surveys / total_voters * 100, 2) if total_voters else 0
+ 
+    ward_coverage = list(
+        voters_qs.values('ward_no')
+        .annotate(total=Count('id'))
+        .order_by('ward_no')[:20]
+    )
+    surveyed_by_ward = {
+        r['ward_no']: r['cnt']
+        for r in surveys_qs.values('ward_no').annotate(cnt=Count('id'))
+    }
+    for w in ward_coverage:
+        w['surveyed'] = surveyed_by_ward.get(w['ward_no'], 0)
+        w['pct']      = round(w['surveyed'] / w['total'] * 100, 1) if w['total'] else 0
+ 
+    religion_dist = list(
+        voters_qs.values('religion')
+        .annotate(count=Count('id'))
+        .order_by('-count')[:10]
+    )
+    caste_dist = list(
+        voters_qs.values('caste')
+        .annotate(count=Count('id'))
+        .order_by('-count')[:15]
+    )
+ 
+    sir_count = 0
+    try:
+        sir_count = m.SIRRecord.objects.count()
+    except Exception:
+        pass
+ 
+    return {
+        'total_voters':       total_voters,
+        'total_surveys':      total_surveys,
+        'coverage_pct':       coverage_pct,
+        'sir_risk_records':   sir_count,
+        'ward_coverage':      ward_coverage,
+        'religion_distribution': religion_dist,
+        'caste_distribution': caste_dist,
+    }
+ 
+ 
+def _build_ai_system_prompt(request, db_stats: dict, file_ctx: str) -> str:
+    m = _models()
+    try:
+        reg    = m.UserReg.objects.get(email=request.user.email)
+        uname  = reg.name
+        urole  = reg.role
+    except Exception:
+        uname = request.user.username
+        urole = 'unknown'
+ 
+    return f"""You are the AI Political Intelligence Assistant embedded inside Constituency Connect,
+a platform used by {uname} ({urole}) to manage their constituency in Mangaluru, Karnataka, India.
+ 
+════════════════════════════════════════
+LIVE DATABASE STATS (as of this request)
+════════════════════════════════════════
+{json.dumps(db_stats, indent=2, default=str)}
+ 
+════════════════════════════════════════
+CONSTITUENCY DATA FILES (CSV / Excel)
+════════════════════════════════════════
+{file_ctx}
+ 
+════════════════════════════════════════
+YOUR ROLE
+════════════════════════════════════════
+- Analyse voter demographics, caste distributions, ward/booth performance, survey gaps
+- Provide specific, actionable election strategies for the Karnataka / Mangaluru context
+- When asked about numbers, use the REAL values from the live stats and data files above
+- Reference specific ward numbers, booth numbers, caste groups, religion distributions
+ 
+════════════════════════════════════════
+RESPONSE FORMAT — RETURN ONLY VALID JSON
+════════════════════════════════════════
+Return a single JSON object with exactly this shape (all fields optional except "text"):
+{{
+  "text": "Main analysis in 2-5 sentences. Plain text. No markdown.",
+  "metrics": [
+    {{ "label": "Short Label", "value": "123", "sub": "optional context", "color": "#f59e0b" }}
+  ],
+  "chart": {{
+    "type": "bar",
+    "title": "Chart title",
+    "data": [{{"name": "Ward 1", "Voters": 4500, "Surveyed": 1200}}],
+    "xKey": "name",
+    "yKeys": ["Voters", "Surveyed"]
+  }},
+  "strategies": [
+    "Actionable strategy sentence 1.",
+    "Actionable strategy sentence 2."
+  ]
+}}
+ 
+RULES:
+- "metrics": 0 to 4 cards. Only include when numbers meaningfully enrich the answer.
+- "chart": null when not needed. ONE chart per response. type must be "bar", "line", or "pie".
+  For pie charts: data items must have two fields — the xKey (category name) and a single yKey (numeric).
+- "strategies": 0 to 5 items. Include when the question calls for recommendations.
+- Colours for metrics: amber #f59e0b | green #10b981 | blue #3b82f6 | red #ef4444 | purple #6366f1
+- NEVER output markdown, fences, or any text outside the JSON object.
+- If you cannot find specific data, say so clearly in the "text" field rather than making up numbers.
+"""
+ 
+ 
+@csrf_exempt
+@require_http_methods(['POST'])
+def api_ai_query_insight(request):
+    """
+    POST /api/ai/query-insight/
+    Body: { "query": "...", "history": [{role, content}, ...] }
+    Returns: { success, result: { text, metrics, chart, strategies } }
+    """
+    err = _require_auth(request)
+    if err:
+        return err
+ 
+    body  = _json_body(request)
+    query = body.get('query', '').strip()
+    history = body.get('history', [])
+ 
+    if not query:
+        return JsonResponse({'success': False, 'error': 'query is required'}, status=400)
+ 
+    api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+    if not api_key:
+        return JsonResponse({'success': False, 'error': 'ANTHROPIC_API_KEY not configured on server'}, status=500)
+ 
+    try:
+        db_stats = _get_live_db_stats(request)
+        file_ctx = _load_data_context()
+        system   = _build_ai_system_prompt(request, db_stats, file_ctx)
+    except Exception as e:
+        logger.exception("Error building AI context")
+        return JsonResponse({'success': False, 'error': f'Context build failed: {e}'}, status=500)
+ 
+    # Build messages — last 8 turns for multi-turn context
+    messages = []
+    for turn in history[-8:]:
+        role    = turn.get('role', 'user')
+        content = turn.get('content', '')
+        if isinstance(content, dict):
+            content = json.dumps(content)
+        messages.append({'role': role, 'content': str(content)})
+    messages.append({'role': 'user', 'content': query})
+ 
+    try:
+        response = _ANTHROPIC.messages.create(
+            model='claude-sonnet-4-20250514',
+            max_tokens=1500,
+            system=system,
+            messages=messages,
+        )
+        raw = response.content[0].text
+    except anthropic.APIStatusError as e:
+        logger.error("Anthropic API error: %s", e)
+        return JsonResponse({'success': False, 'error': f'Anthropic error: {e.message}'}, status=502)
+    except Exception as e:
+        logger.exception("Unexpected error calling Anthropic")
+        return JsonResponse({'success': False, 'error': str(e)}, status=500)
+ 
+    try:
+        clean  = raw.replace('```json', '').replace('```', '').strip()
+        parsed = json.loads(clean)
+    except json.JSONDecodeError:
+        parsed = {'text': raw}
+ 
+    return JsonResponse({'success': True, 'result': parsed})
+ 
+ 
+@csrf_exempt
+@require_http_methods(['POST'])
+def api_ai_birdseye_view(request):
+    """
+    POST /api/ai/birdseye-view/
+    Body: {} (no input needed — generates a full constituency overview)
+    Returns: { success, result: { text, metrics, chart, strategies } }
+    """
+    err = _require_auth(request)
+    if err:
+        return err
+ 
+    api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+    if not api_key:
+        return JsonResponse({'success': False, 'error': 'ANTHROPIC_API_KEY not configured'}, status=500)
+ 
+    try:
+        db_stats = _get_live_db_stats(request)
+        file_ctx = _load_data_context()
+        system   = _build_ai_system_prompt(request, db_stats, file_ctx)
+    except Exception as e:
+        logger.exception("Error building AI context for birdseye")
+        return JsonResponse({'success': False, 'error': f'Context build failed: {e}'}, status=500)
+ 
+    prompt = (
+        "Give me a complete bird's-eye overview of this constituency. "
+        "Cover: (1) overall survey coverage with a progress metric, "
+        "(2) the 3 wards with lowest coverage that need immediate attention, "
+        "(3) top caste and religion distribution as a pie chart, "
+        "(4) 4 concrete action strategies I should execute this week to improve survey numbers and voter outreach. "
+        "Use real numbers from the data."
+    )
+ 
+    try:
+        response = _ANTHROPIC.messages.create(
+            model='claude-sonnet-4-20250514',
+            max_tokens=2000,
+            system=system,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        raw = response.content[0].text
+    except anthropic.APIStatusError as e:
+        logger.error("Anthropic API error (birdseye): %s", e)
+        return JsonResponse({'success': False, 'error': f'Anthropic error: {e.message}'}, status=502)
+    except Exception as e:
+        logger.exception("Unexpected error in birdseye")
+        return JsonResponse({'success': False, 'error': str(e)}, status=500)
+ 
+    try:
+        clean  = raw.replace('```json', '').replace('```', '').strip()
+        parsed = json.loads(clean)
+    except json.JSONDecodeError:
+        parsed = {'text': raw}
+ 
+    return JsonResponse({'success': True, 'result': parsed})
+ 
