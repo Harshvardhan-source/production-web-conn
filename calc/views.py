@@ -11,10 +11,7 @@ from django.conf import settings
 
 from pymongo import MongoClient
 import certifi
-try:
-    import pandas as pd
-except ImportError:
-    pd = None  # pandas absent — scheme/upload endpoints will error gracefully
+import pandas as pd
 import json
 import re
 import traceback
@@ -4815,6 +4812,289 @@ def _get_anthropic():
     return _ANTHROPIC_CLIENT
 
 
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_ai_query_insight(request):
+    """
+    POST /api/ai/query-insight/
+    Body: {
+        "query": {...},          # filter dict  e.g. {"economicStatus":"APL"}
+        "columns": [...],        # dimension names
+        "count": 3950,           # voter count
+        "percentage": 51.0,
+        "label": "Dominant",
+        "routeKey": "...",
+        "predictedContext": {...}
+    }
+
+    Returns a structured JSON insight from Claude claude-sonnet-4-20250514.
+    Response schema:
+    {
+        "headline": str,
+        "summary": str,
+        "keyFigures": [...],
+        "barChart": {...},
+        "swotBreakdown": {...},
+        "recommendation": str,
+        "riskLevel": str,
+        "riskColor": str
+    }
+    """
+    user = _user_from_request(request)
+    if not user:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+    query_obj    = body.get("query", {})
+    columns      = body.get("columns", [])
+    count        = body.get("count", 0)
+    percentage   = body.get("percentage", 0)
+    label        = body.get("label", "")
+    route_key    = body.get("routeKey", "")
+    pred_ctx     = body.get("predictedContext", {})
+
+    filter_tags = ", ".join(f"{k}: {v}" for k, v in query_obj.items() if v and v != "Unknown")
+
+    user_prompt = (
+        f"Voter segment analysis for Mangalore South (Constituency 175, Karnataka):\n"
+        f"- Demographic filters: {filter_tags or 'All voters'}\n"
+        f"- Segment size: {count:,} voters ({percentage:.1f}% of constituency)\n"
+        f"- SWOT classification: {label}\n"
+        f"- Column dimensions: {', '.join(columns) or route_key}\n"
+        f"- All predicted political contexts: {json.dumps(pred_ctx)}"
+    )
+
+    system_prompt = (
+        "You are a senior political analyst for Mangalore South constituency (Karnataka, India). "
+        "Analyse the given voter segment and return a JSON object ONLY (no markdown, no extra text) with this exact structure:\n"
+        '{"headline":"One punchy 8-12 word insight title",'
+        '"summary":"2-3 sentence plain-language explanation",'
+        '"keyFigures":['
+        '{"label":"Segment Size","value":"<X voters>","note":"short context"},'
+        '{"label":"Share of Constituency","value":"<X%>","note":"short context"},'
+        '{"label":"Political Lean","value":"BJP/INC/Swing","note":"brief reason"},'
+        '{"label":"Impact Level","value":"<label>","note":"Dominant/Major/Moderate/Minor"}],'
+        '"barChart":{"title":"Estimated Vote Split",'
+        '"bars":['
+        '{"party":"BJP","pct":<0-100>,"color":"#fb923c"},'
+        '{"party":"INC","pct":<0-100>,"color":"#f87171"},'
+        '{"party":"Others","pct":<0-100>,"color":"#6b7280"}]},'
+        '"swotBreakdown":{"title":"Context-wise SWOT Signal",'
+        '"items":['
+        '{"ctx":"Economic","signal":"S/W/O/T/N","color":"#10b981","note":"1 line"},'
+        '{"ctx":"Health","signal":"S/W/O/T/N","color":"#22d3ee","note":"1 line"},'
+        '{"ctx":"Political","signal":"S/W/O/T/N","color":"#f59e0b","note":"1 line"}]},'
+        '"recommendation":"One specific actionable recommendation for 2028",'
+        '"riskLevel":"Low/Medium/High/Critical",'
+        '"riskColor":"#10b981 or #f59e0b or #fb923c or #f87171"}'
+    )
+
+    try:
+        client = _get_anthropic()
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1200,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        raw = "".join(b.text for b in message.content if hasattr(b, "text")).strip()
+        # Strip markdown fences if present
+        raw = raw.lstrip("```json").lstrip("```").rstrip("```").strip()
+        try:
+            insight = json.loads(raw)
+        except json.JSONDecodeError:
+            insight = {"_raw": raw}
+        return JsonResponse({"success": True, "insight": insight})
+    except Exception as exc:
+        return JsonResponse({"error": str(exc)}, status=500)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_ai_birdseye_view(request):
+    """
+    POST /api/ai/birdseye-view/
+    Body: {
+        "contextKey": "economic",
+        "queries": [... list of sanitised query objects ...],  # from api_ml_constituency_swot
+        "totalVoters": 246952   # optional, for context
+    }
+
+    Synthesises ALL queries for the selected context into a high-level
+    constituency-wide strategic overview with win probability estimate.
+
+    Response schema:
+    {
+        "headline": str,
+        "executiveSummary": str,
+        "swotRadar": [...],
+        "keyMetrics": [...],
+        "trendBars": {...},
+        "strategicPillars": [...],
+        "winProbability": int,
+        "confidenceNote": str
+    }
+    """
+    user = _user_from_request(request)
+    if not user:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+    ctx_key      = body.get("contextKey", "economic")
+    queries      = body.get("queries", [])
+    total_voters = body.get("totalVoters", 246952)
+
+    if not queries:
+        return JsonResponse({"error": "queries list is required."}, status=400)
+
+    # ── Aggregate stats ─────────────────────────────────────────────────────
+    swot_count   = {"Strength": 0, "Weakness": 0, "Opportunity": 0, "Threat": 0, "None": 0}
+    label_count  = {}
+    filter_freq  = {}
+
+    # Simple label-to-SWOT mapping (mirrors JS ctxToSwot logic)
+    _SWOT_MAP = {
+        "S": "Strength", "W": "Weakness", "O": "Opportunity", "T": "Threat",
+        "Strength": "Strength", "Weakness": "Weakness",
+        "Opportunity": "Opportunity", "Threat": "Threat",
+    }
+
+    for q in queries:
+        raw_ctx = (q.get("predictedContext") or {}).get(ctx_key, "")
+        # Extract S/W/O/T tokens from the label string
+        found = False
+        for token, swot in _SWOT_MAP.items():
+            if token in str(raw_ctx):
+                swot_count[swot] += 1
+                found = True
+                break
+        if not found:
+            swot_count["None"] += 1
+
+        lb = q.get("label", "None")
+        label_count[lb] = label_count.get(lb, 0) + 1
+
+        for k, v in (q.get("query") or {}).items():
+            if v and v != "Unknown":
+                key = f"{k}:{v}"
+                filter_freq[key] = filter_freq.get(key, 0) + 1
+
+    top_filters = ", ".join(
+        f"{k} ({c}x)" for k, c in
+        sorted(filter_freq.items(), key=lambda x: -x[1])[:10]
+    )
+    total_query_voter_refs = sum(q.get("count", 0) for q in queries)
+
+    user_prompt = (
+        f"Mangalore South Constituency (175) — Bird's Eye SWOT Overview\n"
+        f"Context analysed: {ctx_key}\n"
+        f"Total query groups: {len(queries)}\n"
+        f"Total voter-mentions: {total_query_voter_refs:,}\n"
+        f"SWOT distribution: Strength={swot_count['Strength']}, "
+        f"Weakness={swot_count['Weakness']}, "
+        f"Opportunity={swot_count['Opportunity']}, "
+        f"Threat={swot_count['Threat']}, "
+        f"Unclassified={swot_count['None']}\n"
+        f"Impact label distribution: {json.dumps(label_count)}\n"
+        f"Most frequent demographic filters: {top_filters}"
+    )
+
+    system_prompt = (
+        "You are a senior political strategist for Mangalore South constituency. "
+        "Provide a comprehensive bird's eye strategic view. "
+        "Return ONLY a JSON object (no markdown, no extra text):\n"
+        '{"headline":"Strategic overview title (10-15 words)",'
+        '"executiveSummary":"3-4 sentence overall picture",'
+        '"swotRadar":['
+        '{"axis":"Strength","score":<0-100>,"color":"#10b981","note":"1-line reason"},'
+        '{"axis":"Weakness","score":<0-100>,"color":"#f87171","note":"1-line reason"},'
+        '{"axis":"Opportunity","score":<0-100>,"color":"#22d3ee","note":"1-line reason"},'
+        '{"axis":"Threat","score":<0-100>,"color":"#fb923c","note":"1-line reason"}],'
+        '"keyMetrics":['
+        '{"label":"Dominant Quadrant","value":"...","color":"#10b981"},'
+        '{"label":"Query Groups","value":"<N>","color":"#a78bfa"},'
+        '{"label":"Voter Reach","value":"<N>","color":"#22d3ee"},'
+        '{"label":"Top Risk Factor","value":"short phrase","color":"#f87171"}],'
+        '"trendBars":{"title":"SWOT Distribution (% of groups)",'
+        '"bars":['
+        '{"label":"Strength","pct":<0-100>,"color":"#10b981"},'
+        '{"label":"Weakness","pct":<0-100>,"color":"#f87171"},'
+        '{"label":"Opportunity","pct":<0-100>,"color":"#22d3ee"},'
+        '{"label":"Threat","pct":<0-100>,"color":"#fb923c"}]},'
+        '"strategicPillars":['
+        '{"title":"Consolidate","body":"What to protect/double down on","color":"#10b981"},'
+        '{"title":"Fix","body":"Top weakness to address before 2028","color":"#f87171"},'
+        '{"title":"Capitalise","body":"Best opportunity to act on now","color":"#22d3ee"},'
+        '{"title":"Neutralise","body":"Most urgent threat to defuse","color":"#fb923c"}],'
+        '"winProbability":<0-100>,'
+        '"confidenceNote":"1 sentence on data confidence"}'
+    )
+
+    try:
+        client = _get_anthropic()
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1800,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        raw = "".join(b.text for b in message.content if hasattr(b, "text")).strip()
+        raw = raw.lstrip("```json").lstrip("```").rstrip("```").strip()
+        try:
+            insight = json.loads(raw)
+        except json.JSONDecodeError:
+            insight = {"_raw": raw}
+        return JsonResponse({"success": True, "insight": insight})
+    except Exception as exc:
+        return JsonResponse({"error": str(exc)}, status=500)
+
+    """
+    GET /api/ml/ward-swot/?ward=<wardNumber>
+    Returns predicted queries for a specific ward from NewQueryStack1.
+    Ward-wise is in progress on the frontend; endpoint kept for future use.
+    """
+    user = _user_from_request(request)
+    if not user:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    ward_param = request.GET.get("ward", "").strip()
+    if not ward_param:
+        return JsonResponse({"error": "ward parameter required"}, status=400)
+
+    try:
+        ward_no = int(ward_param)
+    except ValueError:
+        return JsonResponse({"error": "ward must be an integer"}, status=400)
+
+    try:
+        db        = _get_ml_db()
+        col       = db["NewQueryStack1"]
+        queries   = _reassemble_chunks(col, {"wardNumber": ward_no})
+        ward_name = WARD_NUM_TO_NAME.get(ward_no, f"Ward {ward_no}")
+        return JsonResponse({
+            "scope":        "ward",
+            "wardNumber":   ward_no,
+            "wardName":     ward_name,
+            "totalQueries": len(queries),
+            "queries":      _sanitise_queries(queries),
+        })
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SURVEY PROGRESS  — booth-worker progress visible in Admin Panel
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@_require_superuser
+@require_http_methods(['GET'])
 def api_admin_survey_progress(request):
     """
     GET /api/admin/survey-progress/
@@ -5074,488 +5354,3 @@ def api_admin_location_dates(request):
     ]
     dates = [doc['_id'] for doc in loc_col.aggregate(pipeline)]
     return JsonResponse({'success': True, 'dates': dates})
-
-
-
-# AI CHAT — Constituency Intelligence Chat  (query-insight & birdseye-view)
-# These are the endpoints called by the AiChat.jsx page.
-# They use _get_anthropic() (lazy import, no startup crash) and read live
-# MongoDB stats from the same get_db()/get_survey_db() clients used everywhere.
-# ─────────────────────────────────────────────────────────────────────────────
-
-import os as _os_ai
-import logging as _logging_ai
-
-_ai_logger = _logging_ai.getLogger(__name__)
-
-_DATA_DIR_CHAT = _os_ai.path.join(
-    _os_ai.path.dirname(_os_ai.path.dirname(_os_ai.path.abspath(__file__))), 'data'
-)
-
-_CHAT_DATA_CACHE: dict = {'text': None, 'loaded_at': None}
-_CHAT_CACHE_TTL = 300  # seconds
-
-
-def _load_chat_data_context() -> str:
-    """
-    Read all CSV/Excel files from the project-root /data/ folder and return
-    a compact text summary for injection into the Claude system prompt.
-    Results are cached for 5 minutes.
-    Drop your files here:
-        <project_root>/data/Mangaluru_Election_Strategy_Report.xlsx
-        <project_root>/data/Caste_Voter_Turnout_Report.xlsx
-        <project_root>/data/Mangaluru_FULLSCALE_Analysis_v2.xlsx
-    """
-    from datetime import datetime as _dt
-    now = _dt.utcnow()
-    cached = _CHAT_DATA_CACHE
-    if (cached['text'] is not None and cached['loaded_at'] is not None
-            and (now - cached['loaded_at']).total_seconds() < _CHAT_CACHE_TTL):
-        return cached['text']
-
-    if not _os_ai.path.isdir(_DATA_DIR_CHAT):
-        result = 'No /data directory found in project root. Using live MongoDB stats only.'
-        _CHAT_DATA_CACHE.update({'text': result, 'loaded_at': now})
-        return result
-
-    try:
-        import pandas as _pd
-    except ImportError:
-        result = 'pandas not installed — file context unavailable.'
-        _CHAT_DATA_CACHE.update({'text': result, 'loaded_at': now})
-        return result
-
-    summaries = []
-    for fname in sorted(_os_ai.listdir(_DATA_DIR_CHAT)):
-        fpath = _os_ai.path.join(_DATA_DIR_CHAT, fname)
-        try:
-            if fname.endswith('.csv'):
-                df = _pd.read_csv(fpath, nrows=200)
-            elif fname.endswith(('.xlsx', '.xls')):
-                df = _pd.read_excel(fpath, nrows=200)
-            else:
-                continue
-            header  = f"\n=== FILE: {fname} | Rows: ~{len(df)} | Cols: {df.shape[1]} ===\n"
-            col_str = "Columns: " + ", ".join(df.columns.tolist()) + "\n"
-            preview = df.head(30).to_csv(index=False)
-            summaries.append(header + col_str + preview)
-        except Exception as e:
-            summaries.append(f"\n=== FILE: {fname} | READ ERROR: {e} ===\n")
-
-    result = "\n".join(summaries) if summaries else "No readable data files found in /data/."
-    _CHAT_DATA_CACHE.update({'text': result, 'loaded_at': now})
-    return result
-
-
-def _get_chat_db_stats() -> dict:
-    """Pull live stats from MongoDB for AI context — mirrors _registration_analytics."""
-    try:
-        db        = get_db()
-        survey_db = get_survey_db()
-        total_voters  = db['2025'].count_documents({})
-        total_surveys = survey_db['SurveyRecords'].count_documents({})
-        coverage_pct  = round(total_surveys / total_voters * 100, 2) if total_voters else 0
-
-        # Ward-wise survey counts
-        ward_counts = {
-            r['_id']: r['n']
-            for r in survey_db['SurveyRecords'].aggregate([
-                {'$group': {'_id': {'$toString': '$wardNumber'}, 'n': {'$sum': 1}}}
-            ])
-        }
-        ward_voter_counts = {
-            r['_id']: r['n']
-            for r in db['2025'].aggregate([
-                {'$group': {'_id': {'$toString': '$Part No'}, 'n': {'$sum': 1}}}
-            ])
-        }
-
-        ward_coverage = []
-        for wnum, wdata in WARD_FULL_DATA.items():
-            wname    = wdata['name']
-            surveyed = ward_counts.get(str(wnum), 0)
-            total    = ward_voter_counts.get(str(wnum), 0)
-            pct      = round(surveyed / total * 100, 1) if total else 0
-            ward_coverage.append({'ward': wnum, 'name': wname, 'surveyed': surveyed, 'total': total, 'pct': pct})
-        ward_coverage.sort(key=lambda x: x['pct'])  # ascending — worst first
-
-        # Religion distribution
-        religion_dist = list(db['2025'].aggregate([
-            {'$group': {'_id': '$Religion', 'count': {'$sum': 1}}},
-            {'$sort': {'count': -1}}, {'$limit': 10}
-        ]))
-
-        sir_counts = {
-            'new_additions': survey_db['SIR_NewAdditions'].count_documents({}),
-            'deletions':     survey_db['SIR_Deleted'].count_documents({}),
-            'modifications': survey_db['SIR_Modified'].count_documents({}),
-            'suspicious':    survey_db['SIR_Suspicious'].count_documents({}),
-        }
-
-        return {
-            'total_voters':          total_voters,
-            'total_surveys':         total_surveys,
-            'coverage_pct':          coverage_pct,
-            'ward_coverage':         ward_coverage[:40],
-            'religion_distribution': [{'religion': r['_id'], 'count': r['count']} for r in religion_dist],
-            'sir_counts':            sir_counts,
-            'constituency':          'Mangalore South (175)',
-        }
-    except Exception as e:
-        _ai_logger.exception('Error building chat DB stats')
-        return {'error': str(e)}
-
-
-def _build_chat_system_prompt(user_profile: dict, db_stats: dict, file_ctx: str) -> str:
-    uname = user_profile.get('username', 'MLA')
-    urole = user_profile.get('role', 'mla')
-    return f"""You are the AI Political Intelligence Assistant inside Constituency Connect.
-You are assisting {uname} ({urole}) who manages Mangalore South (Constituency 175), Karnataka, India.
-
-════════════════════════════════════════
-LIVE MONGODB STATS (real-time)
-════════════════════════════════════════
-{json.dumps(db_stats, indent=2, default=str)}
-
-════════════════════════════════════════
-CONSTITUENCY DATA FILES (CSV / Excel)
-════════════════════════════════════════
-{file_ctx}
-
-════════════════════════════════════════
-YOUR ROLE
-════════════════════════════════════════
-- Analyse voter demographics, caste/religion distributions, ward/booth survey performance
-- Provide specific, actionable election strategies for Karnataka / Mangaluru context
-- Use REAL numbers from the live stats and data files above
-- Reference specific ward numbers, booth numbers, caste groups, religion splits
-
-════════════════════════════════════════
-RESPONSE FORMAT — RETURN ONLY VALID JSON
-════════════════════════════════════════
-Return a single JSON object (all fields optional except "text"):
-{{
-  "text": "Main analysis in 2-5 sentences. Plain text. No markdown.",
-  "metrics": [
-    {{ "label": "Short Label", "value": "123", "sub": "context", "color": "#f59e0b" }}
-  ],
-  "chart": {{
-    "type": "bar",
-    "title": "Chart title",
-    "data": [{{"name": "Ward 21", "Voters": 4500, "Surveyed": 1200}}],
-    "xKey": "name",
-    "yKeys": ["Voters", "Surveyed"]
-  }},
-  "strategies": [
-    "Specific actionable strategy 1.",
-    "Specific actionable strategy 2."
-  ]
-}}
-
-RULES:
-- metrics: 0-4 items; only when numbers enrich the answer.
-- chart: null if not needed. ONE chart per response. type must be "bar", "line", or "pie".
-- strategies: 0-5 items; include when recommendations are warranted.
-- Colors: amber #f59e0b | green #10b981 | blue #3b82f6 | red #ef4444 | purple #6366f1
-- NEVER output markdown fences or any text outside the JSON object.
-- Never invent numbers — use real data from the stats above or say data is unavailable.
-"""
-
-
-@csrf_exempt
-@require_http_methods(['POST'])
-def api_ai_query_insight(request):
-    """
-    POST /api/ai/query-insight/
-
-    Dual-mode endpoint:
-      Mode A — AiChat page: body = { "query": "plain text question", "history": [...] }
-      Mode B — SWOT page:   body = { "query": {...filter}, "columns": [...], "count": N, ... }
-
-    Returns:
-      Mode A: { success, result: { text, metrics, chart, strategies } }
-      Mode B: { success, insight: { headline, summary, keyFigures, barChart, ... } }
-    """
-    user = _user_from_request(request)
-    if not user:
-        return JsonResponse({'success': False, 'error': 'Authentication required.'}, status=401)
-    if not _is_approved(user):
-        return JsonResponse({'success': False, 'error': 'Account pending approval.'}, status=403)
-
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        return JsonResponse({'success': False, 'error': 'Invalid JSON body.'}, status=400)
-
-    try:
-        client = _get_anthropic()
-    except (ImportError, RuntimeError) as e:
-        return JsonResponse({'success': False, 'error': str(e)}, status=500)
-
-    query_field = body.get('query', '')
-
-    # ── Mode B: SWOT structured query (query is a dict) ──────────────────────
-    if isinstance(query_field, dict):
-        query_obj  = query_field
-        columns    = body.get('columns', [])
-        count      = body.get('count', 0)
-        percentage = body.get('percentage', 0)
-        label      = body.get('label', '')
-        route_key  = body.get('routeKey', '')
-        pred_ctx   = body.get('predictedContext', {})
-
-        filter_tags = ', '.join(f'{k}: {v}' for k, v in query_obj.items() if v and v != 'Unknown')
-
-        user_prompt = (
-            f'Voter segment analysis for Mangalore South (Constituency 175, Karnataka):\n'
-            f'- Demographic filters: {filter_tags or "All voters"}\n'
-            f'- Segment size: {count:,} voters ({percentage:.1f}% of constituency)\n'
-            f'- SWOT classification: {label}\n'
-            f'- Column dimensions: {", ".join(columns) or route_key}\n'
-            f'- All predicted political contexts: {json.dumps(pred_ctx)}'
-        )
-        system_prompt = (
-            'You are a senior political analyst for Mangalore South constituency (Karnataka, India). '
-            'Analyse the given voter segment and return a JSON object ONLY (no markdown, no extra text) with this exact structure:\n'
-            '{"headline":"One punchy 8-12 word insight title",'
-            '"summary":"2-3 sentence plain-language explanation",'
-            '"keyFigures":['
-            '{"label":"Segment Size","value":"<X voters>","note":"short context"},'
-            '{"label":"Share of Constituency","value":"<X%>","note":"short context"},'
-            '{"label":"Political Lean","value":"BJP/INC/Swing","note":"brief reason"},'
-            '{"label":"Impact Level","value":"<label>","note":"Dominant/Major/Moderate/Minor"}],'
-            '"barChart":{"title":"Estimated Vote Split",'
-            '"bars":['
-            '{"party":"BJP","pct":<0-100>,"color":"#fb923c"},'
-            '{"party":"INC","pct":<0-100>,"color":"#f87171"},'
-            '{"party":"Others","pct":<0-100>,"color":"#6b7280"}]},'
-            '"swotBreakdown":{"title":"Context-wise SWOT Signal",'
-            '"items":['
-            '{"ctx":"Economic","signal":"S/W/O/T/N","color":"#10b981","note":"1 line"},'
-            '{"ctx":"Health","signal":"S/W/O/T/N","color":"#22d3ee","note":"1 line"},'
-            '{"ctx":"Political","signal":"S/W/O/T/N","color":"#f59e0b","note":"1 line"}]},'
-            '"recommendation":"One specific actionable recommendation for 2028",'
-            '"riskLevel":"Low/Medium/High/Critical",'
-            '"riskColor":"#10b981 or #f59e0b or #fb923c or #f87171"}'
-        )
-        try:
-            message = client.messages.create(
-                model='claude-sonnet-4-20250514',
-                max_tokens=1200,
-                system=system_prompt,
-                messages=[{'role': 'user', 'content': user_prompt}],
-            )
-            raw = ''.join(b.text for b in message.content if hasattr(b, 'text')).strip()
-            raw = raw.lstrip('```json').lstrip('```').rstrip('```').strip()
-            try:
-                insight = json.loads(raw)
-            except json.JSONDecodeError:
-                insight = {'_raw': raw}
-            return JsonResponse({'success': True, 'insight': insight})
-        except Exception as exc:
-            return JsonResponse({'error': str(exc)}, status=500)
-
-    # ── Mode A: AiChat plain-text conversation ────────────────────────────────
-    query   = str(query_field).strip()
-    history = body.get('history', [])
-
-    if not query:
-        return JsonResponse({'success': False, 'error': 'query is required'}, status=400)
-
-    try:
-        db_stats = _get_chat_db_stats()
-        file_ctx = _load_chat_data_context()
-        system   = _build_chat_system_prompt(user, db_stats, file_ctx)
-    except Exception as e:
-        _ai_logger.exception('Error building AI chat context')
-        return JsonResponse({'success': False, 'error': f'Context build failed: {e}'}, status=500)
-
-    messages = []
-    for turn in history[-8:]:
-        role    = turn.get('role', 'user')
-        content = turn.get('content', '')
-        if isinstance(content, dict):
-            content = json.dumps(content)
-        messages.append({'role': role, 'content': str(content)})
-    messages.append({'role': 'user', 'content': query})
-
-    try:
-        response = client.messages.create(
-            model='claude-sonnet-4-20250514',
-            max_tokens=1500,
-            system=system,
-            messages=messages,
-        )
-        raw = response.content[0].text
-    except Exception as e:
-        _ai_logger.exception('Anthropic API error')
-        return JsonResponse({'success': False, 'error': str(e)}, status=502)
-
-    try:
-        clean  = raw.replace('```json', '').replace('```', '').strip()
-        parsed = json.loads(clean)
-    except json.JSONDecodeError:
-        parsed = {'text': raw}
-
-    return JsonResponse({'success': True, 'result': parsed})
-
-
-@csrf_exempt
-@require_http_methods(['POST'])
-def api_ai_birdseye_view(request):
-    """
-    POST /api/ai/birdseye-view/
-
-    Dual-mode endpoint:
-      Mode A — AiChat page: body = {} → full constituency overview in chat format
-      Mode B — SWOT page:   body = { contextKey, queries, totalVoters } → strategic radar
-    """
-    user = _user_from_request(request)
-    if not user:
-        return JsonResponse({'success': False, 'error': 'Authentication required.'}, status=401)
-    if not _is_approved(user):
-        return JsonResponse({'success': False, 'error': 'Account pending approval.'}, status=403)
-
-    try:
-        body = json.loads(request.body) if request.body else {}
-    except Exception:
-        return JsonResponse({'success': False, 'error': 'Invalid JSON body.'}, status=400)
-
-    try:
-        client = _get_anthropic()
-    except (ImportError, RuntimeError) as e:
-        return JsonResponse({'success': False, 'error': str(e)}, status=500)
-
-    # ── Mode B: SWOT bird's-eye (has "queries" key) ───────────────────────────
-    if body.get('queries'):
-        ctx_key      = body.get('contextKey', 'economic')
-        queries      = body.get('queries', [])
-        total_voters = body.get('totalVoters', 246952)
-
-        swot_count   = {'Strength': 0, 'Weakness': 0, 'Opportunity': 0, 'Threat': 0, 'None': 0}
-        label_count  = {}
-        filter_freq  = {}
-        _SWOT_MAP = {
-            'S': 'Strength', 'W': 'Weakness', 'O': 'Opportunity', 'T': 'Threat',
-            'Strength': 'Strength', 'Weakness': 'Weakness',
-            'Opportunity': 'Opportunity', 'Threat': 'Threat',
-        }
-
-        for q in queries:
-            raw_ctx = (q.get('predictedContext') or {}).get(ctx_key, '')
-            found = False
-            for token, swot in _SWOT_MAP.items():
-                if token in str(raw_ctx):
-                    swot_count[swot] += 1
-                    found = True
-                    break
-            if not found:
-                swot_count['None'] += 1
-            lb = q.get('label', 'None')
-            label_count[lb] = label_count.get(lb, 0) + 1
-            for k, v in (q.get('query') or {}).items():
-                if v and v != 'Unknown':
-                    key = f'{k}:{v}'
-                    filter_freq[key] = filter_freq.get(key, 0) + 1
-
-        top_filters = ', '.join(
-            f'{k} ({c}x)' for k, c in sorted(filter_freq.items(), key=lambda x: -x[1])[:10]
-        )
-        total_query_voter_refs = sum(q.get('count', 0) for q in queries)
-
-        user_prompt = (
-            f"Mangalore South Constituency (175) — Bird's Eye SWOT Overview\n"
-            f'Context analysed: {ctx_key}\n'
-            f'Total query groups: {len(queries)}\n'
-            f'Total voter-mentions: {total_query_voter_refs:,}\n'
-            f'SWOT distribution: Strength={swot_count["Strength"]}, '
-            f'Weakness={swot_count["Weakness"]}, '
-            f'Opportunity={swot_count["Opportunity"]}, '
-            f'Threat={swot_count["Threat"]}, '
-            f'Unclassified={swot_count["None"]}\n'
-            f'Impact label distribution: {json.dumps(label_count)}\n'
-            f'Most frequent demographic filters: {top_filters}'
-        )
-        system_prompt = (
-            "You are a senior political strategist for Mangalore South constituency. "
-            "Provide a comprehensive bird's eye strategic view. "
-            'Return ONLY a JSON object (no markdown, no extra text):\n'
-            '{"headline":"Strategic overview title (10-15 words)",'
-            '"executiveSummary":"3-4 sentence overall picture",'
-            '"swotRadar":['
-            '{"axis":"Strength","score":<0-100>,"color":"#10b981","note":"1-line reason"},'
-            '{"axis":"Weakness","score":<0-100>,"color":"#f87171","note":"1-line reason"},'
-            '{"axis":"Opportunity","score":<0-100>,"color":"#22d3ee","note":"1-line reason"},'
-            '{"axis":"Threat","score":<0-100>,"color":"#fb923c","note":"1-line reason"}],'
-            '"keyMetrics":['
-            '{"label":"Dominant Quadrant","value":"...","color":"#10b981"},'
-            '{"label":"Query Groups","value":"<N>","color":"#a78bfa"},'
-            '{"label":"Voter Reach","value":"<N>","color":"#22d3ee"},'
-            '{"label":"Top Risk Factor","value":"short phrase","color":"#f87171"}],'
-            '"trendBars":{"title":"SWOT Distribution (% of groups)",'
-            '"bars":['
-            '{"label":"Strength","pct":<0-100>,"color":"#10b981"},'
-            '{"label":"Weakness","pct":<0-100>,"color":"#f87171"},'
-            '{"label":"Opportunity","pct":<0-100>,"color":"#22d3ee"},'
-            '{"label":"Threat","pct":<0-100>,"color":"#fb923c"}]},'
-            '"strategicPillars":['
-            '{"title":"Consolidate","body":"What to protect/double down on","color":"#10b981"},'
-            '{"title":"Fix","body":"Top weakness to address before 2028","color":"#f87171"},'
-            '{"title":"Capitalise","body":"Best opportunity to act on now","color":"#22d3ee"},'
-            '{"title":"Neutralise","body":"Most urgent threat to defuse","color":"#fb923c"}],'
-            '"winProbability":<0-100>,'
-            '"confidenceNote":"1 sentence on data confidence"}'
-        )
-        try:
-            message = client.messages.create(
-                model='claude-sonnet-4-20250514',
-                max_tokens=1800,
-                system=system_prompt,
-                messages=[{'role': 'user', 'content': user_prompt}],
-            )
-            raw = ''.join(b.text for b in message.content if hasattr(b, 'text')).strip()
-            raw = raw.lstrip('```json').lstrip('```').rstrip('```').strip()
-            try:
-                insight = json.loads(raw)
-            except json.JSONDecodeError:
-                insight = {'_raw': raw}
-            return JsonResponse({'success': True, 'insight': insight})
-        except Exception as exc:
-            return JsonResponse({'error': str(exc)}, status=500)
-
-    # ── Mode A: AiChat constituency overview ──────────────────────────────────
-    try:
-        db_stats = _get_chat_db_stats()
-        file_ctx = _load_chat_data_context()
-        system   = _build_chat_system_prompt(user, db_stats, file_ctx)
-    except Exception as e:
-        _ai_logger.exception('Error building birdseye chat context')
-        return JsonResponse({'success': False, 'error': f'Context build failed: {e}'}, status=500)
-
-    prompt = (
-        "Give me a complete bird's-eye overview of this constituency. "
-        "Cover: (1) overall survey coverage with a progress metric, "
-        "(2) the 3 wards with lowest survey coverage that need immediate attention, "
-        "(3) top religion distribution as a pie chart, "
-        "(4) 4 concrete action strategies I should execute this week to improve survey numbers and voter outreach. "
-        "Use real numbers from the live MongoDB stats."
-    )
-    try:
-        response = client.messages.create(
-            model='claude-sonnet-4-20250514',
-            max_tokens=2000,
-            system=system,
-            messages=[{'role': 'user', 'content': prompt}],
-        )
-        raw = response.content[0].text
-    except Exception as e:
-        _ai_logger.exception('Anthropic birdseye error')
-        return JsonResponse({'success': False, 'error': str(e)}, status=502)
-
-    try:
-        clean  = raw.replace('```json', '').replace('```', '').strip()
-        parsed = json.loads(clean)
-    except json.JSONDecodeError:
-        parsed = {'text': raw}
-
-    return JsonResponse({'success': True, 'result': parsed})
