@@ -5093,37 +5093,29 @@ _DATA_DIR_CHAT = _os_ai.path.join(
 )
 
 _CHAT_DATA_CACHE: dict = {'text': None, 'loaded_at': None}
-_CHAT_CACHE_TTL = 300  # seconds
+_CHAT_CACHE_TTL  = 3600   # re-read files every 60 min (not 5 — files don't change often)
+_CHAT_CACHE_LOCK = threading.Lock()
+_CHAT_PRELOAD_DONE = False  # guards one-time startup preload
 
 
-def _load_chat_data_context() -> str:
+def _load_chat_data_context_internal() -> str:
     """
-    Read all CSV/Excel files from the project-root /data/ folder and return
-    a compact text summary for injection into the Claude system prompt.
-    Results are cached for 5 minutes.
+    Blocking worker: reads CSV/Excel files from <project_root>/data/ and returns
+    a compact text summary.  Called only from the background thread — never
+    directly from a request handler.
+
     Drop your files here:
         <project_root>/data/Mangaluru_Election_Strategy_Report.xlsx
         <project_root>/data/Caste_Voter_Turnout_Report.xlsx
         <project_root>/data/Mangaluru_FULLSCALE_Analysis_v2.xlsx
     """
-    from datetime import datetime as _dt
-    now = _dt.utcnow()
-    cached = _CHAT_DATA_CACHE
-    if (cached['text'] is not None and cached['loaded_at'] is not None
-            and (now - cached['loaded_at']).total_seconds() < _CHAT_CACHE_TTL):
-        return cached['text']
-
     if not _os_ai.path.isdir(_DATA_DIR_CHAT):
-        result = 'No /data directory found in project root. Using live MongoDB stats only.'
-        _CHAT_DATA_CACHE.update({'text': result, 'loaded_at': now})
-        return result
+        return 'No /data directory found in project root. Using live MongoDB stats only.'
 
     try:
         import pandas as _pd
     except ImportError:
-        result = 'pandas not installed — file context unavailable.'
-        _CHAT_DATA_CACHE.update({'text': result, 'loaded_at': now})
-        return result
+        return 'pandas not installed — file context unavailable.'
 
     summaries = []
     for fname in sorted(_os_ai.listdir(_DATA_DIR_CHAT)):
@@ -5132,19 +5124,75 @@ def _load_chat_data_context() -> str:
             if fname.endswith('.csv'):
                 df = _pd.read_csv(fpath, nrows=200)
             elif fname.endswith(('.xlsx', '.xls')):
-                df = _pd.read_excel(fpath, nrows=200)
+                # engine='openpyxl' is explicit — avoids xlrd for .xlsx
+                df = _pd.read_excel(fpath, nrows=200, engine='openpyxl')
             else:
                 continue
             header  = f"\n=== FILE: {fname} | Rows: ~{len(df)} | Cols: {df.shape[1]} ===\n"
             col_str = "Columns: " + ", ".join(df.columns.tolist()) + "\n"
             preview = df.head(30).to_csv(index=False)
             summaries.append(header + col_str + preview)
+            _ai_logger.info(f'[ChatData] loaded {fname} ({len(df)} rows)')
         except Exception as e:
+            _ai_logger.warning(f'[ChatData] skipped {fname}: {e}')
             summaries.append(f"\n=== FILE: {fname} | READ ERROR: {e} ===\n")
 
-    result = "\n".join(summaries) if summaries else "No readable data files found in /data/."
-    _CHAT_DATA_CACHE.update({'text': result, 'loaded_at': now})
-    return result
+    return "\n".join(summaries) if summaries else "No readable data files found in /data/."
+
+
+def _preload_chat_data_bg() -> None:
+    """Background thread target: load files once at startup and populate cache."""
+    _ai_logger.info('[ChatData] background preload started')
+    try:
+        from datetime import datetime as _dt
+        result = _load_chat_data_context_internal()
+        with _CHAT_CACHE_LOCK:
+            _CHAT_DATA_CACHE['text']      = result
+            _CHAT_DATA_CACHE['loaded_at'] = _dt.utcnow()
+        _ai_logger.info('[ChatData] background preload complete')
+    except Exception:
+        _ai_logger.exception('[ChatData] background preload failed')
+
+
+def _load_chat_data_context() -> str:
+    """
+    Non-blocking accessor called from request handlers.
+
+    - On first call: kicks off a background thread to read the files and
+      immediately returns a placeholder so the request is not blocked.
+    - On subsequent calls: returns the cached result (or placeholder if
+      the background thread is still running).
+    - Cache TTL is 60 min; after expiry the next call triggers a fresh
+      background reload without blocking any request.
+    """
+    global _CHAT_PRELOAD_DONE
+    from datetime import datetime as _dt
+
+    with _CHAT_CACHE_LOCK:
+        cached    = _CHAT_DATA_CACHE
+        text      = cached.get('text')
+        loaded_at = cached.get('loaded_at')
+        cache_fresh = (
+            text is not None
+            and loaded_at is not None
+            and (_dt.utcnow() - loaded_at).total_seconds() < _CHAT_CACHE_TTL
+        )
+
+    if cache_fresh:
+        return text  # type: ignore[return-value]
+
+    # Cache missing or stale — trigger background reload (non-blocking)
+    t = threading.Thread(target=_preload_chat_data_bg, daemon=True)
+    t.start()
+
+    # Return whatever we have; first-ever call returns placeholder
+    if text:
+        return text
+    return 'Constituency data files are loading in the background. Using live MongoDB stats for now.'
+
+
+# ── Kick off preload as soon as this module is imported (Gunicorn worker start)
+threading.Thread(target=_preload_chat_data_bg, daemon=True).start()
 
 
 def _get_chat_db_stats() -> dict:
