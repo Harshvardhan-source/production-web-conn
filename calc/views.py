@@ -5731,16 +5731,344 @@ def _ai_load_mongo_context():
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# FILE CONTEXT — reads ALL files in backend/data/, no file-size limit.
-# Uses streaming strategies to avoid RAM spikes on large files.
-# Total extracted text capped at _AI_TOTAL_CHARS_FILES.
+# ANTHROPIC FILES API — Upload-once, reuse-by-ID
+#
+# How it works:
+#   1. On first request (or when a file changes), each file in backend/data/ is
+#      uploaded to Anthropic's Files API via client.beta.files.upload().
+#      Anthropic stores it server-side and returns a file_id (e.g. "file-abc123").
+#   2. The file_id is cached in _AI_FILE_ID_CACHE (in-process dict) keyed by
+#      (filename, mtime, size).  On Render, the worker process is long-lived so
+#      the cache survives many requests — files are uploaded at most once per
+#      deploy or content change.
+#   3. On each chat request the file_ids are passed to messages.create() as
+#      document blocks.  Anthropic reads the file directly from its storage —
+#      no text is injected into the system prompt, so context window is not wasted.
+#
+# Supported formats via Files API:
+#   PDF, TXT, CSV, DOCX — uploaded as-is (binary).
+#   XLSX / XLS           — converted to CSV first (Anthropic doesn't accept xlsx).
+#
+# Files that fail to upload fall back to inline text extraction (existing code).
 # ════════════════════════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════════════════════════
+# WARD LOCAL PLACES  — GET / POST / DELETE  /api/ward-places/
+#
+# Stores local clubs, temples, churches, mosques in the 'WardData' collection
+# of the main SurveyDataBase.  Each document:
+#   { record_type, ward, wardName, type, name, address, createdAt, createdBy }
+#
+# GET  ?ward=<int>  → list all places for that ward
+# POST              → add a place  (body: ward, wardName, type, name, address)
+# DELETE            → remove a place (body: id)
+# ════════════════════════════════════════════════════════════════════════════════
+
+_PLACE_ALLOWED_TYPES = {'club', 'temple', 'church', 'mosque'}
+
+
+def _places_cors(request, response):
+    origin = request.META.get('HTTP_ORIGIN', '')
+    if origin:
+        response['Access-Control-Allow-Origin']      = origin
+        response['Access-Control-Allow-Credentials'] = 'true'
+        response['Access-Control-Allow-Methods']     = 'GET, POST, DELETE, OPTIONS'
+        response['Access-Control-Allow-Headers']     = (
+            'Content-Type, Authorization, X-CSRFToken'
+        )
+    return response
+
+
+@csrf_exempt
+@require_http_methods(['GET', 'POST', 'DELETE', 'OPTIONS'])
+def api_ward_places(request):
+    """GET/POST/DELETE /api/ward-places/"""
+
+    if request.method == 'OPTIONS':
+        return _places_cors(request, JsonResponse({}))
+
+    # ── Auth ─────────────────────────────────────────────────────────────────
+    try:
+        user = _user_from_request(request)
+    except Exception as e:
+        return _places_cors(request, JsonResponse({'success': False, 'message': f'Auth error: {e}'}, status=500))
+    if not user:
+        return _places_cors(request, JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401))
+    if not _is_approved(user):
+        return _places_cors(request, JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403))
+
+    coll = get_db()['WardData']
+
+    # ── GET — list all places for a ward ──────────────────────────────────────
+    if request.method == 'GET':
+        ward = request.GET.get('ward', '').strip()
+        if not ward:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'ward param required.'}, status=400))
+        try:
+            ward_int = int(ward)
+        except ValueError:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'ward must be a number.'}, status=400))
+
+        docs = list(coll.find(
+            {'ward': ward_int, 'record_type': 'local_place'},
+            {'_id': 1, 'type': 1, 'name': 1, 'address': 1, 'createdAt': 1, 'createdBy': 1}
+        ).sort('createdAt', 1))
+
+        for d in docs:
+            d['_id'] = str(d['_id'])
+            if isinstance(d.get('createdAt'), datetime):
+                d['createdAt'] = d['createdAt'].isoformat()
+
+        return _places_cors(request, JsonResponse({'success': True, 'places': docs}))
+
+    # ── POST — add a new place ────────────────────────────────────────────────
+    if request.method == 'POST':
+        try:
+            body = json.loads(request.body)
+        except Exception:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'Invalid JSON.'}, status=400))
+
+        ward      = body.get('ward')
+        ward_name = (body.get('wardName') or '').strip()
+        ptype     = (body.get('type') or '').strip().lower()
+        name      = (body.get('name') or '').strip()
+        address   = (body.get('address') or '').strip()
+
+        if not ward:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'ward is required.'}, status=400))
+        if ptype not in _PLACE_ALLOWED_TYPES:
+            return _places_cors(request, JsonResponse({'success': False, 'message': f'type must be one of {_PLACE_ALLOWED_TYPES}.'}, status=400))
+        if not name:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'name is required.'}, status=400))
+
+        try:
+            ward_int = int(ward)
+        except (ValueError, TypeError):
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'ward must be a number.'}, status=400))
+
+        doc = {
+            'record_type': 'local_place',
+            'ward':        ward_int,
+            'wardName':    ward_name,
+            'type':        ptype,
+            'name':        name,
+            'address':     address,
+            'createdAt':   datetime.now(timezone.utc),
+            'createdBy':   user.get('username') or user.get('email') or 'unknown',
+        }
+
+        try:
+            result = coll.insert_one(doc)
+        except Exception as e:
+            return _places_cors(request, JsonResponse({'success': False, 'message': f'DB error: {e}'}, status=500))
+
+        return _places_cors(request, JsonResponse({
+            'success': True,
+            'place': {
+                '_id':      str(result.inserted_id),
+                'type':     ptype,
+                'name':     name,
+                'address':  address,
+                'createdAt': doc['createdAt'].isoformat(),
+            },
+        }))
+
+    # ── DELETE — remove a place by _id ────────────────────────────────────────
+    if request.method == 'DELETE':
+        try:
+            body     = json.loads(request.body)
+            place_id = body.get('id', '').strip()
+        except Exception:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'Invalid JSON.'}, status=400))
+
+        if not place_id:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'id is required.'}, status=400))
+
+        try:
+            result = coll.delete_one({'_id': ObjectId(place_id), 'record_type': 'local_place'})
+        except Exception as e:
+            return _places_cors(request, JsonResponse({'success': False, 'message': f'DB error: {e}'}, status=500))
+
+        if result.deleted_count == 0:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'Place not found.'}, status=404))
+
+        return _places_cors(request, JsonResponse({'success': True}))
+
+    return _places_cors(request, JsonResponse({'success': False, 'message': 'Method not allowed.'}, status=405))
+
+
+import threading as _threading
+
+# Cache: (fname, mtime, size) → file_id string
+_AI_FILE_ID_CACHE: dict = {}
+_AI_FILE_CACHE_LOCK = _threading.Lock()
+
+# MIME types accepted directly by Files API
+_FILES_API_MIME = {
+    '.pdf':  'application/pdf',
+    '.txt':  'text/plain',
+    '.csv':  'text/plain',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.doc':  'application/msword',
+    '.md':   'text/plain',
+}
+
+# Extensions that need conversion before upload
+_FILES_API_CONVERT = {'.xlsx', '.xls'}
+
+
+def _xlsx_to_csv_bytes(path: str) -> bytes:
+    """Convert xlsx/xls to CSV bytes for Files API upload."""
+    try:
+        from openpyxl import load_workbook as _lw
+        import io as _io2
+        wb  = _lw(path, read_only=True, data_only=True)
+        buf = _io2.StringIO()
+        for sname in wb.sheetnames:
+            ws = wb[sname]
+            buf.write(f'# Sheet: {sname}\n')
+            for row in ws.iter_rows(values_only=True):
+                buf.write(','.join('' if c is None else str(c).replace(',','') for c in row) + '\n')
+            buf.write('\n')
+        wb.close()
+        return buf.getvalue().encode('utf-8')
+    except Exception as e:
+        return f'[Excel conversion error: {e}]'.encode()
+
+
+def _get_or_upload_file(client, fname: str, path: str) -> tuple:
+    """
+    Return (file_id, display_name, mime_type) for a given data file.
+    Uploads to Files API if not cached or if file has changed.
+    Returns (None, fname, None) on failure — caller falls back to inline text.
+    """
+    try:
+        stat     = _os2.stat(path)
+        cache_key = (fname, int(stat.st_mtime), stat.st_size)
+    except Exception:
+        return None, fname, None
+
+    with _AI_FILE_CACHE_LOCK:
+        if cache_key in _AI_FILE_ID_CACHE:
+            fid = _AI_FILE_ID_CACHE[cache_key]
+            print(f'[Files API] Cache hit: {fname} → {fid}')
+            return fid, fname, None
+
+    # Not cached — upload now
+    ext = _os2.path.splitext(fname)[1].lower()
+
+    try:
+        if ext in _FILES_API_CONVERT:
+            # xlsx → csv bytes
+            file_bytes  = _xlsx_to_csv_bytes(path)
+            upload_name = fname.rsplit('.',1)[0] + '.csv'
+            mime        = 'text/plain'
+        elif ext in _FILES_API_MIME:
+            with open(path, 'rb') as f:
+                file_bytes = f.read()
+            upload_name = fname
+            mime        = _FILES_API_MIME[ext]
+        else:
+            # Try as plain text
+            with open(path, 'rb') as f:
+                file_bytes = f.read()
+            upload_name = fname
+            mime        = 'text/plain'
+
+        size_mb = len(file_bytes) / (1024 * 1024)
+        print(f'[Files API] Uploading: {fname} → {upload_name} ({size_mb:.1f} MB)')
+
+        # Anthropic Files API upload
+        import io as _io3
+        response = client.beta.files.upload(
+            file=(upload_name, _io3.BytesIO(file_bytes), mime),
+        )
+        fid = response.id
+        print(f'[Files API] Uploaded: {fname} → {fid}')
+
+        with _AI_FILE_CACHE_LOCK:
+            _AI_FILE_ID_CACHE[cache_key] = fid
+
+        return fid, fname, mime
+
+    except Exception as e:
+        print(f'[Files API] Upload failed for {fname}: {e}')
+        return None, fname, None
+
+
+def _ai_load_files_api(client) -> tuple:
+    """
+    Upload all files in backend/data/ to Anthropic Files API.
+    Returns:
+      document_blocks — list of content blocks to include in messages
+      files_used      — list of filenames successfully uploaded
+      fallback_text   — inline text for files that failed upload
+    """
+    document_blocks = []
+    files_used      = []
+    fallback_parts  = []
+
+    if not _os2.path.isdir(_AI_DATA_DIR):
+        return [], [], ''
+
+    all_files = sorted(_os2.listdir(_AI_DATA_DIR))
+    loaded    = 0
+
+    for fname in all_files:
+        if loaded >= _AI_MAX_FILES:
+            break
+
+        ext = _os2.path.splitext(fname)[1].lower()
+        if ext not in (_AI_SUPPORTED_EXTS | set(_FILES_API_MIME.keys()) | _FILES_API_CONVERT):
+            continue
+
+        path = _os2.path.join(_AI_DATA_DIR, fname)
+        fid, display, mime = _get_or_upload_file(client, fname, path)
+
+        if fid:
+            # Success — add as a Files API document block
+            document_blocks.append({
+                'type': 'document',
+                'source': {
+                    'type':    'file',
+                    'file_id': fid,
+                },
+                'title':   fname,
+                'context': f'Political/socio-economic data file: {fname}',
+            })
+            files_used.append(fname)
+            loaded += 1
+        else:
+            # Fallback — read as inline text (existing streaming logic)
+            print(f'[Files API] Falling back to inline text for: {fname}')
+            try:
+                if ext in ('.xlsx', '.xls'):
+                    raw = _ai_read_excel_stream(path)
+                elif ext == '.csv':
+                    raw = _ai_read_csv_stream(path)
+                elif ext == '.pdf':
+                    raw = _ai_read_pdf_stream(path)
+                elif ext in ('.docx', '.doc'):
+                    raw = _ai_read_docx_stream(path)
+                else:
+                    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                        raw = f.read()
+                excerpt = raw[:_AI_CHARS_PER_FILE]
+                fallback_parts.append(f'===== FILE: {fname} =====\n{excerpt}')
+                files_used.append(fname + ' (inline)')
+                loaded += 1
+            except Exception as e:
+                print(f'[Files API] Inline fallback also failed for {fname}: {e}')
+
+    fallback_text = '\n\n'.join(fallback_parts)
+    print(f'[Files API] Ready: {len(document_blocks)} via Files API, '
+          f'{len(fallback_parts)} inline fallbacks')
+    return document_blocks, files_used, fallback_text
+
+
+# ── Legacy inline readers (kept as fallback for files that can't be uploaded) ──
+
 def _ai_read_excel_stream(path):
-    """
-    Stream xlsx with openpyxl read_only — safe for ANY file size.
-    No full workbook loaded into memory; rows are yielded one at a time.
-    """
     try:
         from openpyxl import load_workbook as _lw
         wb  = _lw(path, read_only=True, data_only=True)
@@ -5753,126 +6081,42 @@ def _ai_read_excel_stream(path):
                     rows.append(f'... (showing first {_AI_EXCEL_MAX_ROWS} of more rows)')
                     break
                 rows.append('\t'.join('' if c is None else str(c) for c in row))
-            out.append(f'[Sheet: {sname} — {i+1} rows shown]\n' + '\n'.join(rows))
+            out.append(f'[Sheet: {sname}]\n' + '\n'.join(rows))
         wb.close()
         return '\n\n'.join(out)
     except Exception as e:
         return f'[Excel read error: {e}]'
 
-
 def _ai_read_csv_stream(path):
-    """Chunked CSV read — safe for large files."""
     try:
-        chunks = []
-        total_rows = 0
-        for chunk in pd.read_csv(
-            path, chunksize=1000, encoding='utf-8',
-            on_bad_lines='skip', low_memory=False
-        ):
-            chunks.append(chunk.fillna(''))
-            total_rows += len(chunk)
-            if total_rows >= _AI_CSV_MAX_ROWS:
-                break
-        if not chunks:
-            return '[Empty CSV]'
+        chunks, total_rows = [], 0
+        for chunk in pd.read_csv(path, chunksize=1000, encoding='utf-8',
+                                  on_bad_lines='skip', low_memory=False):
+            chunks.append(chunk.fillna('')); total_rows += len(chunk)
+            if total_rows >= _AI_CSV_MAX_ROWS: break
+        if not chunks: return '[Empty CSV]'
         df = pd.concat(chunks).head(_AI_CSV_MAX_ROWS)
-        note = f'(showing {len(df):,} of {total_rows:,}+ rows)' if total_rows >= _AI_CSV_MAX_ROWS else f'({len(df):,} rows total)'
-        return f'{note}\n{df.to_string(index=False)}'
+        return f'({len(df):,} rows)\n{df.to_string(index=False)}'
     except Exception as e:
         return f'[CSV read error: {e}]'
 
-
 def _ai_read_pdf_stream(path):
-    if not _PYMUPDF_OK:
-        return '[PyMuPDF not installed — pip install pymupdf]'
+    if not _PYMUPDF_OK: return '[PyMuPDF not installed]'
     try:
-        doc   = _fitz.open(path)
-        total = len(doc)
-        pages = []
-        for i in range(min(_AI_PDF_MAX_PAGES, total)):
+        doc = _fitz.open(path); pages = []
+        for i in range(min(_AI_PDF_MAX_PAGES, len(doc))):
             pages.append(f'[Page {i+1}]\n{doc[i].get_text()}')
-        doc.close()
-        note = f'(showing {min(_AI_PDF_MAX_PAGES, total)} of {total} pages)' if total > _AI_PDF_MAX_PAGES else ''
-        return (note + '\n' if note else '') + '\n'.join(pages)
+        doc.close(); return '\n'.join(pages)
     except Exception as e:
         return f'[PDF read error: {e}]'
 
-
 def _ai_read_docx_stream(path):
-    if not _DOCX_LIB_OK:
-        return '[python-docx not installed — pip install python-docx]'
+    if not _DOCX_LIB_OK: return '[python-docx not installed]'
     try:
-        doc  = _docx_lib.Document(path)
-        text = [p.text for p in doc.paragraphs if p.text.strip()]
-        return '\n'.join(text)
+        doc = _docx_lib.Document(path)
+        return '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
     except Exception as e:
         return f'[Docx read error: {e}]'
-
-
-def _ai_load_file_context():
-    """
-    Load all files from backend/data/.
-    No file-size filter — streaming handles large files safely.
-    Total chars capped at _AI_TOTAL_CHARS_FILES.
-    """
-    sections     = []
-    files_used   = []
-    total_chars  = 0
-
-    try:
-        if not _os2.path.isdir(_AI_DATA_DIR):
-            return '', []
-
-        all_files = sorted(_os2.listdir(_AI_DATA_DIR))
-        for fname in all_files:
-            if len(sections) >= _AI_MAX_FILES:
-                break
-            if total_chars >= _AI_TOTAL_CHARS_FILES:
-                print(f'[AI Chat] File context budget full ({total_chars:,} chars). '
-                      f'Skipping remaining files.')
-                break
-
-            ext  = _os2.path.splitext(fname)[1].lower()
-            if ext not in _AI_SUPPORTED_EXTS:
-                continue
-
-            path    = _os2.path.join(_AI_DATA_DIR, fname)
-            size_mb = _os2.path.getsize(path) / (1024 * 1024)
-            print(f'[AI Chat] Reading file: {fname} ({size_mb:.1f} MB)')
-
-            if ext in ('.xlsx', '.xls'):
-                raw = _ai_read_excel_stream(path)
-            elif ext == '.csv':
-                raw = _ai_read_csv_stream(path)
-            elif ext == '.pdf':
-                raw = _ai_read_pdf_stream(path)
-            elif ext in ('.docx', '.doc'):
-                raw = _ai_read_docx_stream(path)
-            else:
-                try:
-                    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                        raw = f.read()
-                except Exception as e:
-                    raw = f'[Could not read: {e}]'
-
-            # Cap this file at _AI_CHARS_PER_FILE
-            budget_left = _AI_TOTAL_CHARS_FILES - total_chars
-            excerpt     = raw[:min(_AI_CHARS_PER_FILE, budget_left)]
-            was_trimmed = len(raw) > len(excerpt)
-
-            header = f'===== FILE: {fname} ({size_mb:.1f} MB) ====='
-            if was_trimmed:
-                header += f' [trimmed to {len(excerpt):,} chars of {len(raw):,}]'
-
-            sections.append(f'{header}\n{excerpt}')
-            files_used.append(fname)
-            total_chars += len(excerpt)
-
-    except Exception as e:
-        print(f'[AI Chat] File context error: {e}')
-
-    print(f'[AI Chat] File context: {len(files_used)} files, {total_chars:,} chars total')
-    return '\n\n'.join(sections), files_used
 
 
 # ── Simple-intent detection — skip DB loading for greetings/conversational msgs ─
@@ -5908,15 +6152,15 @@ _AI_CHAT_SYSTEM = """You are an expert political data analyst and constituency i
 
 **Important behavioural rule**: If the user sends a simple greeting (e.g. "hi", "hello", "thanks", "bye") or a purely conversational message, reply warmly and naturally — do NOT reference data sources, tables, charts, or MongoDB context. Reserve data analysis only for questions that actually require it.
 
-You have access to LIVE data from MongoDB (aggregated summaries) plus full content of data files. All data is real and current.
+You have access to LIVE data from MongoDB (aggregated summaries) PLUS the full content of data files supplied as document attachments (via Anthropic Files API). All data is real and current.
 
-## Data sources loaded:
+## Data sources:
 - 2025 voter roll: ward-wise and booth-wise totals, gender, religion (H/M/C)
 - Survey Records: field survey data — religion, community, economic status, employment, health, education, schemes used, outstation voters, BJP party members
 - 2023 election polling: polled vs not-polled by ward and religion with percentages
 - SIR analysis: comparison between 2002 and 2025 voter rolls (new additions, deletions, modifications, suspicious)
 - Future voters (eligible by 2028) and deceased records
-- Supplementary files from the data folder
+- Supplementary political/socio-economic files attached as documents below
 
 ## Output formats:
 
@@ -5948,9 +6192,6 @@ Religion: H=Hindu, M=Muslim, C=Christian.
 
 ## LIVE MONGODB DATA:
 {MONGO_CONTEXT}
-
-## DATA FOLDER FILES:
-{FILE_CONTEXT}
 """
 
 
@@ -6001,7 +6242,13 @@ def _ai_make_export(spec, fmt):
 @csrf_exempt
 @require_http_methods(['POST', 'GET', 'OPTIONS'])
 def api_ai_chat(request):
-    """POST /api/ai/chat/"""
+    """
+    POST /api/ai/chat/
+
+    Data files in backend/data/ are uploaded to Anthropic Files API once
+    and referenced by file_id on every subsequent request — no text injection,
+    no context-window waste, full file content always available to the model.
+    """
     if request.method == 'OPTIONS':
         return _ai_cors(request, JsonResponse({}))
 
@@ -6025,35 +6272,28 @@ def api_ai_chat(request):
     if not message:
         return _ai_err(request, 'message field is required.', 400)
 
-    # Build message history (shared by both paths below)
-    messages = []
-    try:
-        for h in history[-20:]:
-            r, c = h.get('role','user'), h.get('content','')
-            if r in ('user','assistant') and c:
-                messages.append({'role': r, 'content': c})
-    except Exception:
-        pass
-    messages.append({'role': 'user', 'content': message})
-
-    # Call Anthropic
+    # Get Anthropic client
     client, err = _ai_get_client()
     if not client:
         return _ai_err(request, err, 500)
 
-    # ── Simple/conversational message — skip all DB & file loading ──────────
-    # Use a lightweight system prompt so the model replies naturally and fast,
-    # without waiting for MongoDB aggregations or file reads.
+    # ── Simple/conversational message — skip all data loading ───────────────
     if _is_simple_message(message):
         _simple_system = (
             "You are a friendly assistant for Mangaluru South Constituency Connect. "
             "Reply naturally and conversationally. Keep it short and warm. "
             "Do not mention data, voter records, or analytics unless the user asks."
         )
+        msgs = []
+        for h in history[-10:]:
+            r, c = h.get('role','user'), h.get('content','')
+            if r in ('user','assistant') and c:
+                msgs.append({'role': r, 'content': c})
+        msgs.append({'role': 'user', 'content': message})
         try:
             response   = client.messages.create(
                 model='claude-haiku-4-5', max_tokens=256,
-                system=_simple_system, messages=messages,
+                system=_simple_system, messages=msgs,
             )
             reply_text = ''.join(b.text for b in response.content if hasattr(b,'text'))
         except Exception as e:
@@ -6064,39 +6304,71 @@ def api_ai_chat(request):
             'chartSpec': None, 'exportSpec': None, 'filesUsed': [],
         }))
 
-    # ── Data question — load full MongoDB + file context ─────────────────────
+    # ── Data question — load MongoDB context + Files API documents ───────────
+    mongo_ctx    = 'Disabled.'
+    all_sources  = []
+    doc_blocks   = []          # Files API document content blocks
+    fallback_txt = ''          # inline text for any files that failed upload
+
     if include_data:
+        # MongoDB aggregated context (fast — already materialised)
         try:
             mongo_ctx, mongo_sources = _ai_load_mongo_context()
+            all_sources.extend(mongo_sources)
         except Exception as e:
-            mongo_ctx, mongo_sources = f'MongoDB error: {e}', []
+            mongo_ctx = f'MongoDB error: {e}'
+
+        # Files API — upload-once, reference-by-id
         try:
-            file_ctx, file_sources = _ai_load_file_context()
+            doc_blocks, file_sources, fallback_txt = _ai_load_files_api(client)
+            all_sources.extend(file_sources)
         except Exception as e:
-            file_ctx, file_sources = f'File error: {e}', []
-        all_sources = mongo_sources + file_sources
+            print(f'[Files API] Error in _ai_load_files_api: {e}')
+            fallback_txt = f'[Files API error: {e}]'
+
+    # Build system prompt (no FILE_CONTEXT placeholder — files go as doc blocks)
+    system_prompt = _AI_CHAT_SYSTEM.replace('{MONGO_CONTEXT}', mongo_ctx)
+
+    # Append inline fallback text to system prompt if any files couldn't be uploaded
+    if fallback_txt:
+        system_prompt += f'\n\n## INLINE FILE CONTEXT (Files API fallback):\n{fallback_txt}'
+
+    # ── Build messages — history + document blocks + current question ────────
+    messages = []
+
+    # Conversation history (plain text only, no doc blocks in history)
+    for h in history[-20:]:
+        r, c = h.get('role','user'), h.get('content','')
+        if r in ('user','assistant') and c:
+            messages.append({'role': r, 'content': c})
+
+    # Current user turn: prepend file document blocks before the question
+    if doc_blocks:
+        user_content = doc_blocks + [{'type': 'text', 'text': message}]
     else:
-        mongo_ctx   = 'Disabled.'
-        file_ctx    = 'Disabled.'
-        all_sources = []
+        user_content = message
 
-    system_prompt = (
-        _AI_CHAT_SYSTEM
-        .replace('{MONGO_CONTEXT}', mongo_ctx)
-        .replace('{FILE_CONTEXT}',  file_ctx or 'No files in backend/data/.')
-    )
+    messages.append({'role': 'user', 'content': user_content})
 
+    # ── Call Anthropic (claude-sonnet — Files API requires betas header) ─────
     try:
-        response   = client.messages.create(
-            model='claude-sonnet-4-20250514', max_tokens=4096,
-            system=system_prompt, messages=messages,
+        kwargs = dict(
+            model      = 'claude-sonnet-4-20250514',
+            max_tokens = 4096,
+            system     = system_prompt,
+            messages   = messages,
         )
+        # Files API requires the files-api beta header
+        if doc_blocks:
+            kwargs['betas'] = ['files-api-2025-04-14']
+
+        response   = client.messages.create(**kwargs)
         reply_text = ''.join(b.text for b in response.content if hasattr(b,'text'))
     except Exception as e:
         traceback.print_exc()
         return _ai_err(request, f'Anthropic API error: {e}', 500)
 
-    # Parse specs
+    # Parse embedded chart / export specs
     chart_spec = export_spec = None
     try:
         m = re.search(r'```chartspec\s*(\{.*?\})\s*```', reply_text, re.DOTALL)
@@ -6177,7 +6449,7 @@ def api_ai_data_files(request):
     except Exception as e:
         mongo_sources = [{'name':f'MongoDB error: {e}','ext':'error','size':0,'type':'error'}]
 
-    # Local files — show ALL files with size info, no filtering
+    # Local files — show size + Files API upload status
     local_files = []
     try:
         if _os2.path.isdir(_AI_DATA_DIR):
@@ -6185,29 +6457,37 @@ def api_ai_data_files(request):
                 ext = _os2.path.splitext(fname)[1].lower()
                 if ext not in _AI_SUPPORTED_EXTS: continue
                 path    = _os2.path.join(_AI_DATA_DIR, fname)
-                size_mb = _os2.path.getsize(path)/(1024*1024)
+                size_b  = _os2.path.getsize(path)
+                size_mb = size_b / (1024 * 1024)
+                # Check Files API cache
+                try:
+                    stat      = _os2.stat(path)
+                    cache_key = (fname, int(stat.st_mtime), stat.st_size)
+                    file_id   = _AI_FILE_ID_CACHE.get(cache_key)
+                except Exception:
+                    file_id = None
+
                 local_files.append({
-                    'name':    fname,
-                    'ext':     ext.lstrip('.'),
-                    'size':    _os2.path.getsize(path),
-                    'size_mb': round(size_mb,1),
-                    'skipped': False,   # no files skipped — streaming handles all sizes
-                    'type':    'file',
+                    'name':       fname,
+                    'ext':        ext.lstrip('.'),
+                    'size':       size_b,
+                    'size_mb':    round(size_mb, 1),
+                    'type':       'file',
+                    'file_id':    file_id,          # None = not yet uploaded
+                    'via_files_api': bool(file_id), # True = cached & ready
                 })
     except Exception as e:
         local_files = [{'name':f'File error: {e}','ext':'error','size':0,'type':'error'}]
 
+    cached_count = sum(1 for f in local_files if f.get('via_files_api'))
+
     return _ai_cors(request, JsonResponse({
-        'success':     True,
-        'files':       mongo_sources + local_files,
-        'mongo_count': len(mongo_sources),
-        'file_count':  len(local_files),
+        'success':          True,
+        'files':            mongo_sources + local_files,
+        'mongo_count':      len(mongo_sources),
+        'file_count':       len(local_files),
+        'files_api_cached': cached_count,
         'limits': {
-            'excel_max_rows'     : _AI_EXCEL_MAX_ROWS,
-            'csv_max_rows'       : _AI_CSV_MAX_ROWS,
-            'pdf_max_pages'      : _AI_PDF_MAX_PAGES,
-            'chars_per_file'     : _AI_CHARS_PER_FILE,
-            'total_chars_budget' : _AI_TOTAL_CHARS_FILES,
-            'max_files'          : _AI_MAX_FILES,
+            'max_files': _AI_MAX_FILES,
         },
     }))

@@ -85,4 +85,5 @@ urlpatterns = [
     path('ai/chat/',                 views.api_ai_chat,               name='api_ai_chat'),
     path('ai/chat/export/',          views.api_ai_chat_export,        name='api_ai_chat_export'),
     path('ai/data-files/',           views.api_ai_data_files,         name='api_ai_data_files'),
+    path('ward-places/',             views.api_ward_places,           name='api_ward_places'),
 ]
