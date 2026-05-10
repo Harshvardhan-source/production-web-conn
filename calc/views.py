@@ -5797,7 +5797,7 @@ def api_ward_places(request):
     if not _is_approved(user):
         return _places_cors(request, JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403))
 
-    coll = get_db()['WardData']
+    coll = get_survey_db()['WardData']
 
     # ── GET — list all places for a ward ──────────────────────────────────────
     if request.method == 'GET':
