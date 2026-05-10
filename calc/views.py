@@ -6052,7 +6052,7 @@ def api_ai_chat(request):
         )
         try:
             response   = client.messages.create(
-                model='claude-haiku-4-5-20251001', max_tokens=256,
+                model='claude-haiku-4-5', max_tokens=256,
                 system=_simple_system, messages=messages,
             )
             reply_text = ''.join(b.text for b in response.content if hasattr(b,'text'))
