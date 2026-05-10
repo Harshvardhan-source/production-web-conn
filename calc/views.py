@@ -6268,7 +6268,6 @@ def api_ai_chat(request):
 
     message      = (body.get('message') or '').strip()
     history      = body.get('history', [])
-    include_data = body.get('includeData', True)
     if not message:
         return _ai_err(request, 'message field is required.', 400)
 
@@ -6305,26 +6304,24 @@ def api_ai_chat(request):
         }))
 
     # ── Data question — load MongoDB context + Files API documents ───────────
-    mongo_ctx    = 'Disabled.'
+    mongo_ctx    = ''
     all_sources  = []
-    doc_blocks   = []          # Files API document content blocks
-    fallback_txt = ''          # inline text for any files that failed upload
+    doc_blocks   = []
+    fallback_txt = ''
 
-    if include_data:
-        # MongoDB aggregated context (fast — already materialised)
-        try:
-            mongo_ctx, mongo_sources = _ai_load_mongo_context()
-            all_sources.extend(mongo_sources)
-        except Exception as e:
-            mongo_ctx = f'MongoDB error: {e}'
+    # Always load MongoDB context + Files API documents
+    try:
+        mongo_ctx, mongo_sources = _ai_load_mongo_context()
+        all_sources.extend(mongo_sources)
+    except Exception as e:
+        mongo_ctx = f'MongoDB error: {e}'
 
-        # Files API — upload-once, reference-by-id
-        try:
-            doc_blocks, file_sources, fallback_txt = _ai_load_files_api(client)
-            all_sources.extend(file_sources)
-        except Exception as e:
-            print(f'[Files API] Error in _ai_load_files_api: {e}')
-            fallback_txt = f'[Files API error: {e}]'
+    try:
+        doc_blocks, file_sources, fallback_txt = _ai_load_files_api(client)
+        all_sources.extend(file_sources)
+    except Exception as e:
+        print(f'[Files API] Error in _ai_load_files_api: {e}')
+        fallback_txt = f'[Files API error: {e}]'
 
     # Build system prompt (no FILE_CONTEXT placeholder — files go as doc blocks)
     system_prompt = _AI_CHAT_SYSTEM.replace('{MONGO_CONTEXT}', mongo_ctx)
