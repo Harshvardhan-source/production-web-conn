@@ -5357,10 +5357,34 @@ def api_admin_location_dates(request):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AI CHAT — Anthropic-powered chat with constituency data files
+# AI CHAT — Anthropic-powered chat backed by live MongoDB + data folder files
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Context budget (claude-opus-4-5 has 200k token window):
+#   MongoDB summaries   : ~10,000 tokens  (always included)
+#   Data folder files   : up to ~80,000 tokens total across all files
+#   Conversation history: up to 20 turns
+#   System prompt text  : ~2,000 tokens
+#   AI response         : 4,096 tokens (max_tokens)
+#
+# File reading strategy per format:
+#   .xlsx / .xls  — openpyxl read_only streaming (no RAM spike regardless of size)
+#                   reads ALL rows up to _AI_EXCEL_MAX_ROWS per sheet
+#   .csv          — pandas chunked read, up to _AI_CSV_MAX_ROWS rows
+#   .pdf          — PyMuPDF page-by-page, up to _AI_PDF_MAX_PAGES
+#   .docx         — python-docx paragraph extraction, full document
+#   .txt          — direct read
+#
+# Each file's extracted text is capped at _AI_CHARS_PER_FILE characters
+# before being added to the prompt. Total across all files capped at
+# _AI_TOTAL_CHARS_FILES characters (~60k tokens).
+#
+# There is NO file size limit — even a 1 GB xlsx is safe because openpyxl
+# read_only mode streams one row at a time and we stop after _AI_EXCEL_MAX_ROWS.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import io as _io
+import os as _os2
 
 try:
     import fitz as _fitz
@@ -5374,364 +5398,751 @@ try:
 except ImportError:
     _DOCX_LIB_OK = False
 
-_AI_DATA_DIR   = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'data')
-_AI_EXPORT_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'exports')
-_os.makedirs(_AI_DATA_DIR,   exist_ok=True)
-_os.makedirs(_AI_EXPORT_DIR, exist_ok=True)
+try:
+    _AI_BASE_DIR = _os2.path.dirname(_os2.path.dirname(_os2.path.abspath(__file__)))
+    _AI_DATA_DIR = _os2.path.join(_AI_BASE_DIR, 'data')
+    _os2.makedirs(_AI_DATA_DIR, exist_ok=True)
+except Exception:
+    _AI_DATA_DIR = '/tmp/ai_data'
+    _os2.makedirs(_AI_DATA_DIR, exist_ok=True)
 
 _AI_SUPPORTED_EXTS = {'.xlsx', '.xls', '.csv', '.pdf', '.docx', '.doc', '.txt'}
 
+# ── Context budget controls ───────────────────────────────────────────────────
+# Tune these to balance coverage vs token cost.
+# 1 token ≈ 4 characters of English text.
 
-# ── CORS helper ───────────────────────────────────────────────────────────────
+_AI_EXCEL_MAX_ROWS    = 2000      # rows per sheet streamed from xlsx (no RAM risk)
+_AI_CSV_MAX_ROWS      = 3000      # rows read from csv
+_AI_PDF_MAX_PAGES     = 30        # pages from pdf
+_AI_CHARS_PER_FILE    = 80_000    # ~20k tokens — max chars extracted per file
+_AI_TOTAL_CHARS_FILES = 320_000   # ~80k tokens — total chars across ALL files
+_AI_MAX_FILES         = 30        # max number of files loaded per request
+
+
+# ── CORS + error helpers ──────────────────────────────────────────────────────
 
 def _ai_cors(request, response):
-    """Add CORS headers so the browser preflight (OPTIONS) and real request both pass."""
     origin = request.META.get('HTTP_ORIGIN', '')
     if origin:
         response['Access-Control-Allow-Origin']      = origin
         response['Access-Control-Allow-Credentials'] = 'true'
         response['Access-Control-Allow-Methods']     = 'POST, GET, OPTIONS'
-        response['Access-Control-Allow-Headers']     = 'Content-Type, Authorization, X-CSRFToken'
+        response['Access-Control-Allow-Headers']     = (
+            'Content-Type, Authorization, X-CSRFToken, X-Requested-With'
+        )
     return response
 
 
-# ── File readers ──────────────────────────────────────────────────────────────
+def _ai_err(request, msg, status=500):
+    print(f'[AI Chat] ERROR {status}: {msg}')
+    return _ai_cors(request, JsonResponse({'success': False, 'message': msg}, status=status))
 
-def _ai_read_excel(path, max_rows=300):
+
+# ── Anthropic client ──────────────────────────────────────────────────────────
+
+def _ai_get_client():
     try:
-        xf  = pd.ExcelFile(path)
+        import anthropic as _ant
+        api_key = (
+            getattr(settings, 'ANTHROPIC_API_KEY', None)
+            or _os2.environ.get('ANTHROPIC_API_KEY', '')
+        )
+        if not api_key:
+            return None, 'ANTHROPIC_API_KEY not set in Render environment variables.'
+        return _ant.Anthropic(api_key=api_key), None
+    except ImportError:
+        return None, 'anthropic package not installed. Add "anthropic" to requirements.txt.'
+    except Exception as e:
+        return None, f'Anthropic client error: {e}'
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# MONGODB CONTEXT BUILDERS — lightweight aggregations, no raw row dumps
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _ai_ctx_voter_roll_summary():
+    try:
+        db = get_db()
+        ward_refs = list(db['WardReference'].find(
+            {},
+            {'number': 1, 'name': 1, 'totalCount': 1,
+             'totalMale': 1, 'totalFemale': 1,
+             'totalHindu': 1, 'totalMuslim': 1, 'totalChristian': 1}
+        ).sort('number', 1))
+
+        lines = ['=== 2025 Voter Roll — Ward-wise Summary ===',
+                 f'Total wards: {len(ward_refs)}',
+                 '',
+                 f"{'Ward':>4}  {'Name':<22}  {'Total':>7}  {'Male':>6}  "
+                 f"{'Female':>7}  {'Hindu':>6}  {'Muslim':>7}  {'Christian':>9}"]
+
+        grand = {'total':0,'male':0,'female':0,'hindu':0,'muslim':0,'christian':0}
+        for w in ward_refs:
+            t  = w.get('totalCount',     0) or 0
+            m  = w.get('totalMale',      0) or 0
+            f  = w.get('totalFemale',    0) or 0
+            h  = w.get('totalHindu',     0) or 0
+            mu = w.get('totalMuslim',    0) or 0
+            c  = w.get('totalChristian', 0) or 0
+            lines.append(
+                f"{w.get('number',''):>4}  {w.get('name',''):.<22}  "
+                f"{t:>7,}  {m:>6,}  {f:>7,}  {h:>6,}  {mu:>7,}  {c:>9,}"
+            )
+            grand['total']    += t; grand['male']  += m; grand['female']    += f
+            grand['hindu']    += h; grand['muslim']+= mu;grand['christian'] += c
+
+        lines.append(
+            f"{'TOTAL':>4}  {'':.<22}  "
+            f"{grand['total']:>7,}  {grand['male']:>6,}  {grand['female']:>7,}  "
+            f"{grand['hindu']:>6,}  {grand['muslim']:>7,}  {grand['christian']:>9,}"
+        )
+
+        hmc = {r['_id']: r['n'] for r in db['2025'].aggregate([
+            {'$match': {'Predicted_Religion_Label': {'$in': ['H','M','C']}}},
+            {'$group': {'_id': '$Predicted_Religion_Label', 'n': {'$sum': 1}}},
+        ])}
+        lines += ['', 'Predicted Religion Labels (2025 roll):',
+                  f"  Hindu (H)    : {hmc.get('H',0):,}",
+                  f"  Muslim (M)   : {hmc.get('M',0):,}",
+                  f"  Christian (C): {hmc.get('C',0):,}"]
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[2025 voter roll summary error: {e}]'
+
+
+def _ai_ctx_survey_summary():
+    try:
+        db  = get_survey_db()
+        res = list(db['SurveyRecords'].aggregate([{'$facet': {
+            'total'      : [{'$count': 'n'}],
+            'by_ward'    : [
+                {'$match': {'wardNumber': {'$exists': True, '$ne': None, '$ne': ''}}},
+                {'$group': {'_id': {'$toString': '$wardNumber'}, 'count': {'$sum': 1}}},
+                {'$sort':  {'count': -1}}, {'$limit': 40},
+            ],
+            'by_religion': [{'$group': {'_id': '$religion',     'n': {'$sum': 1}}}, {'$sort': {'n': -1}}],
+            'by_gender'  : [{'$group': {'_id': '$gender',       'n': {'$sum': 1}}}],
+            'by_economic': [{'$group': {'_id': '$economicStatus','n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 8}],
+            'by_community': [{'$group': {'_id': '$community',   'n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 8}],
+            'by_employment':[{'$group': {'_id': '$employmentStatus','n': {'$sum': 1}}}, {'$sort': {'n': -1}}],
+            'by_health'  : [{'$group': {'_id': '$healthStatus', 'n': {'$sum': 1}}}, {'$sort': {'n': -1}}],
+            'by_education': [{'$group': {'_id': '$education',   'n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 10}],
+            'outstation' : [{'$match': {'outstationResident': 'Yes'}}, {'$count': 'n'}],
+            'party_members':[{'$match': {'partyMember': 'Yes'}}, {'$count': 'n'}],
+            'diff_abled' : [{'$match': {'differentlyAbled': 'Yes'}}, {'$count': 'n'}],
+            'schemes'    : [
+                {'$unwind': '$schemesUsed'},
+                {'$group': {'_id': '$schemesUsed', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}}, {'$limit': 15},
+            ],
+        }}]))[0]
+
+        total = res['total'][0]['n'] if res['total'] else 0
+        wmap  = {str(k): v['name'] for k, v in WARD_FULL_DATA.items()}
+        lines = ['=== Survey Records Summary ===', f'Total surveyed: {total:,}']
+
+        lines.append('\nWard-wise Survey Count:')
+        for w in res['by_ward']:
+            lines.append(f"  Ward {w['_id']:>3} ({wmap.get(w['_id'],''):.<22}): {w['count']:,}")
+
+        def _section(title, items, key='_id', val='n'):
+            lines.append(f'\n{title}:')
+            for r in items:
+                if r.get(key):
+                    pct = f" ({round(r[val]/total*100,1)}%)" if total else ''
+                    lines.append(f"  {str(r[key]):<20}: {r[val]:,}{pct}")
+
+        _section('Religion',          res['by_religion'])
+        _section('Gender',            res['by_gender'])
+        _section('Economic Status',   res['by_economic'])
+        _section('Community',         res['by_community'])
+        _section('Employment',        res['by_employment'])
+        _section('Health Status',     res['by_health'])
+        _section('Education',         res['by_education'])
+
+        out_n = res['outstation'][0]['n']    if res['outstation']    else 0
+        pm_n  = res['party_members'][0]['n'] if res['party_members'] else 0
+        da_n  = res['diff_abled'][0]['n']    if res['diff_abled']    else 0
+        lines += [f'\nOutstation residents  : {out_n:,}',
+                  f'Party members (BJP)   : {pm_n:,}',
+                  f'Differently abled     : {da_n:,}']
+
+        if res.get('schemes'):
+            lines.append('\nTop Schemes used by surveyed voters:')
+            for s in res['schemes']:
+                if s['_id']:
+                    lines.append(f"  {str(s['_id']):<35}: {s['n']:,}")
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[SurveyRecords summary error: {e}]'
+
+
+def _ai_ctx_polling_summary():
+    try:
+        db    = get_survey_db()
+        rows  = list(db['2023_polled_notpolled'].aggregate([
+            {'$group': {
+                '_id': {'ward': '$Ward', 'rel': '$Religion', 'status': '$Polling status'},
+                'n': {'$sum': 1},
+            }},
+            {'$sort': {'_id.ward': 1}},
+        ]))
+        total = db['2023_polled_notpolled'].count_documents({})
+        if not rows:
+            return '[2023 polling data: empty]'
+
+        rel_map  = {'Hindu': 'H', 'Muslim': 'M', 'Christian': 'C'}
+        ward_data = {}
+        for r in rows:
+            ward = r['_id'].get('ward', 'Unknown')
+            rk   = rel_map.get(r['_id'].get('rel', ''))
+            if not rk:
+                continue
+            ward_data.setdefault(ward, {'H':{}, 'M':{}, 'C':{}})
+            k = 'polled' if r['_id'].get('status') == 'Polled' else 'notPolled'
+            ward_data[ward][rk][k] = ward_data[ward][rk].get(k, 0) + r['n']
+
+        lines = [f'=== 2023 Election Polling Data ({total:,} voters) ===',
+                 f"{'Ward':<26}  {'H-Poll':>7}  {'H-No':>6}  "
+                 f"{'M-Poll':>7}  {'M-No':>6}  {'C-Poll':>7}  {'C-No':>6}  {'H%':>5}  {'M%':>5}  {'C%':>5}"]
+
+        for ward in sorted(ward_data):
+            d  = ward_data[ward]
+            hp = d['H'].get('polled',0); hn = d['H'].get('notPolled',0)
+            mp = d['M'].get('polled',0); mn = d['M'].get('notPolled',0)
+            cp = d['C'].get('polled',0); cn = d['C'].get('notPolled',0)
+            hpct = round(hp/(hp+hn)*100,1) if (hp+hn) else 0
+            mpct = round(mp/(mp+mn)*100,1) if (mp+mn) else 0
+            cpct = round(cp/(cp+cn)*100,1) if (cp+cn) else 0
+            lines.append(
+                f"{ward:<26}  {hp:>7,}  {hn:>6,}  {mp:>7,}  {mn:>6,}  "
+                f"{cp:>7,}  {cn:>6,}  {hpct:>5}  {mpct:>5}  {cpct:>5}"
+            )
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[2023 polling summary error: {e}]'
+
+
+def _ai_ctx_sir_summary():
+    try:
+        db = get_survey_db()
+        counts = {
+            'New Additions' : db['SIR_NewAdditions'].count_documents({}),
+            'Deletions'     : db['SIR_Deleted'].count_documents({}),
+            'Modifications' : db['SIR_Modified'].count_documents({}),
+            'Suspicious'    : db['SIR_Suspicious'].count_documents({}),
+            'Retained'      : db['SIR_Retained'].count_documents({}),
+            'Not Found'     : db['SIR_NotFound'].count_documents({}),
+        }
+        db2   = get_db()
+        v2002 = db['2002'].estimated_document_count()
+        v2025 = db2['2025'].estimated_document_count()
+        lines = ['=== SIR (Summary Intensive Revision) — 2002 vs 2025 ===',
+                 f'2002 voter roll size : {v2002:,}',
+                 f'2025 voter roll size : {v2025:,}',
+                 f'Net change          : {v2025-v2002:+,}', '']
+        for k, v in counts.items():
+            lines.append(f'  {k:<18}: {v:,}')
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[SIR summary error: {e}]'
+
+
+def _ai_ctx_booth_summary():
+    try:
+        db     = get_db()
+        booths = list(db['2025'].aggregate([
+            {'$group': {
+                '_id'   : {'$toString': '$Part No'},
+                'total' : {'$sum': 1},
+                'male'  : {'$sum': {'$cond': [{'$eq': ['$Gender', 'Male']},  1, 0]}},
+                'female': {'$sum': {'$cond': [{'$eq': ['$Gender', 'Female']},1, 0]}},
+                'H'     : {'$sum': {'$cond': [{'$eq': ['$Predicted_Religion_Label','H']},1,0]}},
+                'M'     : {'$sum': {'$cond': [{'$eq': ['$Predicted_Religion_Label','M']},1,0]}},
+                'C'     : {'$sum': {'$cond': [{'$eq': ['$Predicted_Religion_Label','C']},1,0]}},
+            }},
+            {'$sort': {'_id': 1}},
+        ]))
+        if not booths:
+            return '[Booth summary: no data]'
+
+        tot = sum(b['total'] for b in booths)
+        lines = [f'=== Booth-wise Voter Counts (2025) — {len(booths)} booths, {tot:,} total ===',
+                 f"{'Booth':>5}  {'Ward':>4}  {'Total':>6}  "
+                 f"{'Male':>6}  {'Female':>7}  {'H':>6}  {'M':>6}  {'C':>6}"]
+        for b in booths:
+            bn   = b['_id'] or ''
+            ward = BOOTH_TO_WARD.get(bn, BOOTH_TO_WARD.get(
+                int(bn) if bn.isdigit() else -1, '?'))
+            lines.append(
+                f"{bn:>5}  {ward:>4}  {b['total']:>6,}  "
+                f"{b['male']:>6,}  {b['female']:>7,}  "
+                f"{b['H']:>6,}  {b['M']:>6,}  {b['C']:>6,}"
+            )
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[Booth summary error: {e}]'
+
+
+def _ai_ctx_future_deceased():
+    """Future voters (eligible by 2028) and deceased records count."""
+    try:
+        db     = get_survey_db()
+        future = db['FutureVoters'].count_documents({})
+        dec    = db['Deceased'].count_documents({})
+
+        # Gender split of future voters
+        fv_gen = {r['_id']: r['n'] for r in db['FutureVoters'].aggregate([
+            {'$group': {'_id': '$gender', 'n': {'$sum': 1}}}
+        ])}
+
+        lines = ['=== Future Voters & Deceased ===',
+                 f'Future voters (eligible by 2028): {future:,}',
+                 f"  Male  : {fv_gen.get('Male',  fv_gen.get('M', 0)):,}",
+                 f"  Female: {fv_gen.get('Female', fv_gen.get('F', 0)):,}",
+                 f'Deceased records captured       : {dec:,}']
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[Future/Deceased summary error: {e}]'
+
+
+def _ai_load_mongo_context():
+    """Run all MongoDB context builders and return combined text + source list."""
+    builders = [
+        ('2025 Voter Roll (Ward Summary)',  _ai_ctx_voter_roll_summary),
+        ('Survey Records',                  _ai_ctx_survey_summary),
+        ('2023 Polling Data',               _ai_ctx_polling_summary),
+        ('SIR Analysis (2002 vs 2025)',      _ai_ctx_sir_summary),
+        ('Booth-wise Counts',               _ai_ctx_booth_summary),
+        ('Future Voters & Deceased',        _ai_ctx_future_deceased),
+    ]
+    sources  = []
+    sections = []
+    for label, fn in builders:
+        try:
+            print(f'[AI Chat] MongoDB context: {label}')
+            sections.append(fn())
+            sources.append(label)
+        except Exception as e:
+            sections.append(f'[{label} — error: {e}]')
+    return '\n\n'.join(sections), sources
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# FILE CONTEXT — reads ALL files in backend/data/, no file-size limit.
+# Uses streaming strategies to avoid RAM spikes on large files.
+# Total extracted text capped at _AI_TOTAL_CHARS_FILES.
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _ai_read_excel_stream(path):
+    """
+    Stream xlsx with openpyxl read_only — safe for ANY file size.
+    No full workbook loaded into memory; rows are yielded one at a time.
+    """
+    try:
+        from openpyxl import load_workbook as _lw
+        wb  = _lw(path, read_only=True, data_only=True)
         out = []
-        for sheet in xf.sheet_names:
-            df = xf.parse(sheet, nrows=max_rows).dropna(how='all').fillna('')
-            out.append(f'[Sheet: {sheet}]')
-            out.append(df.to_string(index=False, max_rows=max_rows))
-        return '\n'.join(out)
+        for sname in wb.sheetnames:
+            ws   = wb[sname]
+            rows = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= _AI_EXCEL_MAX_ROWS:
+                    rows.append(f'... (showing first {_AI_EXCEL_MAX_ROWS} of more rows)')
+                    break
+                rows.append('\t'.join('' if c is None else str(c) for c in row))
+            out.append(f'[Sheet: {sname} — {i+1} rows shown]\n' + '\n'.join(rows))
+        wb.close()
+        return '\n\n'.join(out)
     except Exception as e:
-        return f'[Could not read {_os.path.basename(path)}: {e}]'
+        return f'[Excel read error: {e}]'
 
 
-def _ai_read_csv(path, max_rows=400):
+def _ai_read_csv_stream(path):
+    """Chunked CSV read — safe for large files."""
     try:
-        df = pd.read_csv(path, nrows=max_rows, encoding='utf-8', on_bad_lines='skip').fillna('')
-        return df.to_string(index=False, max_rows=max_rows)
+        chunks = []
+        total_rows = 0
+        for chunk in pd.read_csv(
+            path, chunksize=1000, encoding='utf-8',
+            on_bad_lines='skip', low_memory=False
+        ):
+            chunks.append(chunk.fillna(''))
+            total_rows += len(chunk)
+            if total_rows >= _AI_CSV_MAX_ROWS:
+                break
+        if not chunks:
+            return '[Empty CSV]'
+        df = pd.concat(chunks).head(_AI_CSV_MAX_ROWS)
+        note = f'(showing {len(df):,} of {total_rows:,}+ rows)' if total_rows >= _AI_CSV_MAX_ROWS else f'({len(df):,} rows total)'
+        return f'{note}\n{df.to_string(index=False)}'
     except Exception as e:
-        return f'[Could not read {_os.path.basename(path)}: {e}]'
+        return f'[CSV read error: {e}]'
 
 
-def _ai_read_pdf(path, max_pages=15):
+def _ai_read_pdf_stream(path):
     if not _PYMUPDF_OK:
-        return f'[PyMuPDF not installed — cannot read {_os.path.basename(path)}]'
+        return '[PyMuPDF not installed — pip install pymupdf]'
     try:
         doc   = _fitz.open(path)
+        total = len(doc)
         pages = []
-        for i, page in enumerate(doc):
-            if i >= max_pages:
-                break
-            pages.append(page.get_text())
+        for i in range(min(_AI_PDF_MAX_PAGES, total)):
+            pages.append(f'[Page {i+1}]\n{doc[i].get_text()}')
         doc.close()
-        return '\n'.join(pages)[:12000]
+        note = f'(showing {min(_AI_PDF_MAX_PAGES, total)} of {total} pages)' if total > _AI_PDF_MAX_PAGES else ''
+        return (note + '\n' if note else '') + '\n'.join(pages)
     except Exception as e:
-        return f'[Could not read {_os.path.basename(path)}: {e}]'
+        return f'[PDF read error: {e}]'
 
 
-def _ai_read_docx(path):
+def _ai_read_docx_stream(path):
     if not _DOCX_LIB_OK:
-        return f'[python-docx not installed — cannot read {_os.path.basename(path)}]'
+        return '[python-docx not installed — pip install python-docx]'
     try:
         doc  = _docx_lib.Document(path)
         text = [p.text for p in doc.paragraphs if p.text.strip()]
-        return '\n'.join(text)[:12000]
+        return '\n'.join(text)
     except Exception as e:
-        return f'[Could not read {_os.path.basename(path)}: {e}]'
+        return f'[Docx read error: {e}]'
 
 
-def _ai_read_txt(path):
+def _ai_load_file_context():
+    """
+    Load all files from backend/data/.
+    No file-size filter — streaming handles large files safely.
+    Total chars capped at _AI_TOTAL_CHARS_FILES.
+    """
+    sections     = []
+    files_used   = []
+    total_chars  = 0
+
     try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            return f.read()[:12000]
+        if not _os2.path.isdir(_AI_DATA_DIR):
+            return '', []
+
+        all_files = sorted(_os2.listdir(_AI_DATA_DIR))
+        for fname in all_files:
+            if len(sections) >= _AI_MAX_FILES:
+                break
+            if total_chars >= _AI_TOTAL_CHARS_FILES:
+                print(f'[AI Chat] File context budget full ({total_chars:,} chars). '
+                      f'Skipping remaining files.')
+                break
+
+            ext  = _os2.path.splitext(fname)[1].lower()
+            if ext not in _AI_SUPPORTED_EXTS:
+                continue
+
+            path    = _os2.path.join(_AI_DATA_DIR, fname)
+            size_mb = _os2.path.getsize(path) / (1024 * 1024)
+            print(f'[AI Chat] Reading file: {fname} ({size_mb:.1f} MB)')
+
+            if ext in ('.xlsx', '.xls'):
+                raw = _ai_read_excel_stream(path)
+            elif ext == '.csv':
+                raw = _ai_read_csv_stream(path)
+            elif ext == '.pdf':
+                raw = _ai_read_pdf_stream(path)
+            elif ext in ('.docx', '.doc'):
+                raw = _ai_read_docx_stream(path)
+            else:
+                try:
+                    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                        raw = f.read()
+                except Exception as e:
+                    raw = f'[Could not read: {e}]'
+
+            # Cap this file at _AI_CHARS_PER_FILE
+            budget_left = _AI_TOTAL_CHARS_FILES - total_chars
+            excerpt     = raw[:min(_AI_CHARS_PER_FILE, budget_left)]
+            was_trimmed = len(raw) > len(excerpt)
+
+            header = f'===== FILE: {fname} ({size_mb:.1f} MB) ====='
+            if was_trimmed:
+                header += f' [trimmed to {len(excerpt):,} chars of {len(raw):,}]'
+
+            sections.append(f'{header}\n{excerpt}')
+            files_used.append(fname)
+            total_chars += len(excerpt)
+
     except Exception as e:
-        return f'[Could not read {_os.path.basename(path)}: {e}]'
+        print(f'[AI Chat] File context error: {e}')
 
-
-def _ai_load_data_context(max_files=12, max_chars_per_file=6000):
-    """Walk backend/data/ and build a text context from all supported files."""
-    files_found = []
-    sections    = []
-
-    if not _os.path.isdir(_AI_DATA_DIR):
-        return 'No data directory found at backend/data/.', []
-
-    for fname in sorted(_os.listdir(_AI_DATA_DIR)):
-        ext = _os.path.splitext(fname)[1].lower()
-        if ext not in _AI_SUPPORTED_EXTS:
-            continue
-        path = _os.path.join(_AI_DATA_DIR, fname)
-        files_found.append(fname)
-        if len(sections) >= max_files:
-            break
-
-        if ext in ('.xlsx', '.xls'):
-            raw = _ai_read_excel(path)
-        elif ext == '.csv':
-            raw = _ai_read_csv(path)
-        elif ext == '.pdf':
-            raw = _ai_read_pdf(path)
-        elif ext in ('.docx', '.doc'):
-            raw = _ai_read_docx(path)
-        else:
-            raw = _ai_read_txt(path)
-
-        sections.append(f'===== FILE: {fname} =====\n{raw[:max_chars_per_file]}\n')
-
-    ctx = '\n'.join(sections) if sections else 'No data files found in backend/data/.'
-    return ctx, files_found
+    print(f'[AI Chat] File context: {len(files_used)} files, {total_chars:,} chars total')
+    return '\n\n'.join(sections), files_used
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
-_AI_CHAT_SYSTEM = """You are an expert political data analyst and constituency intelligence assistant for the Mangaluru South Assembly Constituency, Karnataka, India. You have deep knowledge of election strategy, voter behaviour, demographics, and local governance.
+_AI_CHAT_SYSTEM = """You are an expert political data analyst and constituency intelligence assistant for the Mangaluru South Assembly Constituency (Constituency 175), Karnataka, India.
 
-You have access to real constituency data files (voter lists, survey data, scheme beneficiary lists, historical election results, ward-wise demographics, etc.) provided below.
+You have access to LIVE data from MongoDB (aggregated summaries) plus full content of data files. All data is real and current.
 
-## Your capabilities:
-1. Answer questions about voters, wards, booths, demographics, religion-wise breakdown, survey progress, scheme reach, etc.
-2. Provide strategic political insights with actionable recommendations.
-3. Generate structured analysis with numbers, percentages, and comparisons.
-4. When data supports it, output chart specifications in JSON so the frontend can render interactive charts.
-5. When asked to export data, generate a structured export payload.
+## Data sources loaded:
+- 2025 voter roll: ward-wise and booth-wise totals, gender, religion (H/M/C)
+- Survey Records: field survey data — religion, community, economic status, employment, health, education, schemes used, outstation voters, BJP party members
+- 2023 election polling: polled vs not-polled by ward and religion with percentages
+- SIR analysis: comparison between 2002 and 2025 voter rolls (new additions, deletions, modifications, suspicious)
+- Future voters (eligible by 2028) and deceased records
+- Supplementary files from the data folder
 
-## Ward reference (wards 21-60, total 40 wards):
-Wards: 21=PADAVU, 24=DEREBAIL SOUTH, 25=DEREBAIL WEST, 26=DEREBAIL SOUTH WEST, 27=BOLOOR, 28=MANNAGUDDA, 29=KAMBLA, 30=KODIALBAIL, 31=BEJAI, 32=KADRI NORTH, 33=KADRI SOUTH, 34=SHIVBHAG, 35=PADAVU CENTRAL, 36=PADAVU POORVA, 37=MAROLI, 38=BENDUR, 39=FALNIR, 40=COURT, 41=CENTRAL, 42=DONGERKERY, 43=KUDROLI, 44=NAVAYATH, 45=PORT, 46=CANTONMENT, 47=MILAGRIS, 48=VALENCIA, 49=KANKANADY, 50=ALAPE DAKSHINA, 51=ALAPE UTTARA, 52=KANNUR, 53=BAJAL, 54=JEPPINAMUGER, 55=ATTAVARA, 56=MANGALADEVI, 57=HOIGE BAZAR, 58=BOLAR, 59=JEPPU, 60=BENGRE. Religion keys: H=Hindu, M=Muslim, C=Christian.
+## Output formats:
+When a chart helps, include:
+```chartspec
+{"type":"bar","title":"...","labels":[...],"datasets":[{"label":"...","data":[...]}]}
+```
+Supported types: bar, line, pie, doughnut, radar, stackedBar
 
-## Response format rules:
-- Always ground answers in the provided data. Cite file names when relevant.
-- For numerical analysis, show calculations and reasoning.
-- When a chart would help understanding, include a JSON block like:
-  ```chartspec
-  {"type":"bar","title":"...","labels":[...],"datasets":[{"label":"...","data":[...]}]}
-  ```
-  Supported chart types: bar, line, pie, doughnut, radar, stackedBar
-- If the user asks for an Excel/CSV/PDF output, respond with an export block:
-  ```exportspec
-  {"format":"csv","filename":"ward_analysis.csv","columns":["Ward","Total Voters","Surveyed"],"rows":[...]}
-  ```
-- Be specific, strategic, and data-driven.
+When user asks for a downloadable file, include:
+```exportspec
+{"format":"csv","filename":"analysis.csv","columns":["Col1","Col2"],"rows":[{"Col1":"v1","Col2":"v2"}]}
+```
+Formats: csv, xlsx, pdf
 
-## Constituency data files loaded:
-{DATA_CONTEXT}
+## Ward reference (21–60):
+21=PADAVU, 24=DEREBAIL SOUTH, 25=DEREBAIL WEST, 26=DEREBAIL SOUTH WEST, 27=BOLOOR, 28=MANNAGUDDA, 29=KAMBLA, 30=KODIALBAIL, 31=BEJAI, 32=KADRI NORTH, 33=KADRI SOUTH, 34=SHIVBHAG, 35=PADAVU CENTRAL, 36=PADAVU POORVA, 37=MAROLI, 38=BENDUR, 39=FALNIR, 40=COURT, 41=CENTRAL, 42=DONGERKERY, 43=KUDROLI, 44=NAVAYATH, 45=PORT, 46=CANTONMENT, 47=MILAGRIS, 48=VALENCIA, 49=KANKANADY, 50=ALAPE DAKSHINA, 51=ALAPE UTTARA, 52=KANNUR, 53=BAJAL, 54=JEPPINAMUGER, 55=ATTAVARA, 56=MANGALADEVI, 57=HOIGE BAZAR, 58=BOLAR, 59=JEPPU, 60=BENGRE.
+Religion: H=Hindu, M=Muslim, C=Christian.
+
+## LIVE MONGODB DATA:
+{MONGO_CONTEXT}
+
+## DATA FOLDER FILES:
+{FILE_CONTEXT}
 """
 
 
 # ── Export helper ─────────────────────────────────────────────────────────────
 
 def _ai_make_export(spec, fmt):
-    """Convert an AI-generated exportspec dict into a downloadable file."""
     columns = spec.get('columns', [])
     rows    = spec.get('rows', [])
     fname   = spec.get('filename', f'export_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
-
     df = pd.DataFrame(rows, columns=columns) if columns else pd.DataFrame(rows)
 
     if fmt == 'csv':
-        buf = _io.BytesIO()
-        df.to_csv(buf, index=False)
-        return buf.getvalue(), 'text/csv', fname if fname.endswith('.csv') else fname + '.csv'
+        buf = _io.BytesIO(); df.to_csv(buf, index=False)
+        return buf.getvalue(), 'text/csv', fname if fname.endswith('.csv') else fname+'.csv'
 
     if fmt in ('xlsx', 'excel'):
         buf = _io.BytesIO()
         with pd.ExcelWriter(buf, engine='openpyxl') as w:
             df.to_excel(w, index=False, sheet_name='Data')
-        return (
-            buf.getvalue(),
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            fname if fname.endswith('.xlsx') else fname + '.xlsx',
-        )
+        return (buf.getvalue(),
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                fname if fname.endswith('.xlsx') else fname+'.xlsx')
 
-    # PDF — reportlab if available, else fall back to CSV
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
-        from reportlab.lib import colors as _rlcolors
+        from reportlab.lib import colors as _rlc
         from reportlab.lib.styles import getSampleStyleSheet
-        buf = _io.BytesIO()
-        doc = SimpleDocTemplate(buf, pagesize=A4)
-        styles = getSampleStyleSheet()
-        tbl_data = [columns] + [[str(r.get(c, '')) for c in columns] for r in rows]
-        tbl = Table(tbl_data)
+        buf  = _io.BytesIO()
+        doc  = SimpleDocTemplate(buf, pagesize=A4)
+        data = [columns] + [[str(r.get(c,'')) for c in columns] for r in rows]
+        tbl  = Table(data)
         tbl.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), _rlcolors.HexColor('#1a237e')),
-            ('TEXTCOLOR',  (0, 0), (-1, 0), _rlcolors.white),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [_rlcolors.white, _rlcolors.HexColor('#f5f5f5')]),
-            ('GRID', (0, 0), (-1, -1), 0.5, _rlcolors.grey),
+            ('BACKGROUND',(0,0),(-1,0),_rlc.HexColor('#1a237e')),
+            ('TEXTCOLOR',(0,0),(-1,0),_rlc.white),
+            ('ROWBACKGROUNDS',(0,1),(-1,-1),[_rlc.white,_rlc.HexColor('#f5f5f5')]),
+            ('GRID',(0,0),(-1,-1),0.5,_rlc.grey),
         ]))
-        doc.build([Paragraph(fname, styles['Title']), tbl])
-        return buf.getvalue(), 'application/pdf', fname if fname.endswith('.pdf') else fname + '.pdf'
+        doc.build([Paragraph(fname, getSampleStyleSheet()['Title']), tbl])
+        return buf.getvalue(),'application/pdf', fname if fname.endswith('.pdf') else fname+'.pdf'
     except ImportError:
-        buf = _io.BytesIO()
-        df.to_csv(buf, index=False)
-        return buf.getvalue(), 'text/csv', fname.replace('.pdf', '.csv')
+        buf = _io.BytesIO(); df.to_csv(buf, index=False)
+        return buf.getvalue(),'text/csv', fname.replace('.pdf','.csv')
 
 
 # ── Views ─────────────────────────────────────────────────────────────────────
 
 @csrf_exempt
-@require_http_methods(['POST', 'OPTIONS', 'GET'])
+@require_http_methods(['POST', 'GET', 'OPTIONS'])
 def api_ai_chat(request):
-    """
-    POST /api/ai/chat/
-    Body: { "message": "...", "history": [...], "includeData": true }
-    """
-    # ── CORS preflight ────────────────────────────────────────────────────────
+    """POST /api/ai/chat/"""
     if request.method == 'OPTIONS':
         return _ai_cors(request, JsonResponse({}))
 
-    user = _user_from_request(request)
+    try:
+        user = _user_from_request(request)
+    except Exception as e:
+        return _ai_err(request, f'Auth error: {e}', 500)
     if not user:
-        return _ai_cors(request, JsonResponse(
-            {'success': False, 'message': 'Authentication required.'}, status=401))
+        return _ai_err(request, 'Authentication required.', 401)
     if not _is_approved(user):
-        return _ai_cors(request, JsonResponse(
-            {'success': False, 'message': 'Account pending approval.'}, status=403))
+        return _ai_err(request, 'Account pending approval.', 403)
 
     try:
         body = json.loads(request.body)
     except Exception:
-        return _ai_cors(request, JsonResponse(
-            {'success': False, 'message': 'Invalid JSON.'}, status=400))
+        return _ai_err(request, 'Invalid JSON body.', 400)
 
     message      = (body.get('message') or '').strip()
     history      = body.get('history', [])
     include_data = body.get('includeData', True)
-
     if not message:
-        return _ai_cors(request, JsonResponse(
-            {'success': False, 'message': 'message is required.'}, status=400))
+        return _ai_err(request, 'message field is required.', 400)
 
-    # ── Build data context ────────────────────────────────────────────────────
+    # Build context
     if include_data:
-        data_context, files_used = _ai_load_data_context()
+        try:
+            mongo_ctx, mongo_sources = _ai_load_mongo_context()
+        except Exception as e:
+            mongo_ctx, mongo_sources = f'MongoDB error: {e}', []
+        try:
+            file_ctx, file_sources = _ai_load_file_context()
+        except Exception as e:
+            file_ctx, file_sources = f'File error: {e}', []
+        all_sources = mongo_sources + file_sources
     else:
-        data_context, files_used = 'Data context disabled by user.', []
+        mongo_ctx = file_ctx = 'Disabled.'
+        all_sources = []
 
-    system_prompt = _AI_CHAT_SYSTEM.replace('{DATA_CONTEXT}', data_context)
+    system_prompt = (
+        _AI_CHAT_SYSTEM
+        .replace('{MONGO_CONTEXT}', mongo_ctx)
+        .replace('{FILE_CONTEXT}',  file_ctx or 'No files in backend/data/.')
+    )
 
-    # ── Build messages list ───────────────────────────────────────────────────
+    # Build message history
     messages = []
-    for h in history[-20:]:
-        role    = h.get('role', 'user')
-        content = h.get('content', '')
-        if role in ('user', 'assistant') and content:
-            messages.append({'role': role, 'content': content})
+    try:
+        for h in history[-20:]:
+            r, c = h.get('role','user'), h.get('content','')
+            if r in ('user','assistant') and c:
+                messages.append({'role': r, 'content': c})
+    except Exception:
+        pass
     messages.append({'role': 'user', 'content': message})
 
-    # ── Call Anthropic (reuse existing lazy client) ───────────────────────────
+    # Call Anthropic
+    client, err = _ai_get_client()
+    if not client:
+        return _ai_err(request, err, 500)
     try:
-        client   = _get_anthropic()
-        response = client.messages.create(
-            model      = 'claude-opus-4-5',
-            max_tokens = 4096,
-            system     = system_prompt,
-            messages   = messages,
+        response   = client.messages.create(
+            model='claude-opus-4-5', max_tokens=4096,
+            system=system_prompt, messages=messages,
         )
-        reply_text = ''.join(b.text for b in response.content if hasattr(b, 'text'))
+        reply_text = ''.join(b.text for b in response.content if hasattr(b,'text'))
     except Exception as e:
         traceback.print_exc()
-        return _ai_cors(request, JsonResponse(
-            {'success': False, 'message': f'Anthropic API error: {str(e)}'}, status=500))
+        return _ai_err(request, f'Anthropic API error: {e}', 500)
 
-    # ── Parse chartspec / exportspec blocks ───────────────────────────────────
-    chart_spec  = None
-    export_spec = None
+    # Parse specs
+    chart_spec = export_spec = None
+    try:
+        m = re.search(r'```chartspec\s*(\{.*?\})\s*```', reply_text, re.DOTALL)
+        if m: chart_spec = json.loads(m.group(1))
+    except Exception: pass
+    try:
+        m = re.search(r'```exportspec\s*(\{.*?\})\s*```', reply_text, re.DOTALL)
+        if m: export_spec = json.loads(m.group(1))
+    except Exception: pass
 
-    chart_match = re.search(r'```chartspec\s*(\{.*?\})\s*```', reply_text, re.DOTALL)
-    if chart_match:
-        try:
-            chart_spec = json.loads(chart_match.group(1))
-        except Exception:
-            pass
-
-    export_match = re.search(r'```exportspec\s*(\{.*?\})\s*```', reply_text, re.DOTALL)
-    if export_match:
-        try:
-            export_spec = json.loads(export_match.group(1))
-        except Exception:
-            pass
-
-    clean_reply = re.sub(r'```(chartspec|exportspec).*?```', '', reply_text, flags=re.DOTALL).strip()
+    clean = re.sub(r'```(chartspec|exportspec).*?```','', reply_text, flags=re.DOTALL).strip()
 
     return _ai_cors(request, JsonResponse({
-        'success':    True,
-        'reply':      clean_reply,
-        'chartSpec':  chart_spec,
-        'exportSpec': export_spec,
-        'filesUsed':  files_used,
+        'success': True, 'reply': clean,
+        'chartSpec': chart_spec, 'exportSpec': export_spec,
+        'filesUsed': all_sources,
     }))
 
 
 @csrf_exempt
 @require_http_methods(['POST', 'OPTIONS'])
 def api_ai_chat_export(request):
-    """
-    POST /api/ai/chat/export/
-    Body: { "exportSpec": { "format":"csv","filename":"...","columns":[...],"rows":[...] } }
-    """
     if request.method == 'OPTIONS':
         return _ai_cors(request, JsonResponse({}))
-
-    user = _user_from_request(request)
-    if not user:
-        return _ai_cors(request, JsonResponse(
-            {'success': False, 'message': 'Authentication required.'}, status=401))
-    if not _is_approved(user):
-        return _ai_cors(request, JsonResponse(
-            {'success': False, 'message': 'Account pending approval.'}, status=403))
-
+    try:
+        user = _user_from_request(request)
+    except Exception as e:
+        return _ai_err(request, f'Auth error: {e}', 500)
+    if not user:   return _ai_err(request, 'Authentication required.', 401)
+    if not _is_approved(user): return _ai_err(request, 'Account pending approval.', 403)
     try:
         body = json.loads(request.body)
         spec = body.get('exportSpec', {})
-        fmt  = spec.get('format', 'csv').lower()
+        fmt  = spec.get('format','csv').lower()
     except Exception:
-        return _ai_cors(request, JsonResponse(
-            {'success': False, 'message': 'Invalid request.'}, status=400))
-
+        return _ai_err(request, 'Invalid request body.', 400)
     try:
         from django.http import HttpResponse as _HR
-        file_bytes, mime, filename = _ai_make_export(spec, fmt)
-        resp = _HR(file_bytes, content_type=mime)
-        resp['Content-Disposition'] = f'attachment; filename="{filename}"'
+        fb, mime, fn = _ai_make_export(spec, fmt)
+        resp = _HR(fb, content_type=mime)
+        resp['Content-Disposition'] = f'attachment; filename="{fn}"'
         return _ai_cors(request, resp)
     except Exception as e:
         traceback.print_exc()
-        return _ai_cors(request, JsonResponse({'success': False, 'message': str(e)}, status=500))
+        return _ai_err(request, f'Export failed: {e}', 500)
 
 
 @csrf_exempt
 @require_http_methods(['GET', 'OPTIONS'])
 def api_ai_data_files(request):
-    """GET /api/ai/data-files/ — list files in backend/data/"""
     if request.method == 'OPTIONS':
         return _ai_cors(request, JsonResponse({}))
+    try:
+        user = _user_from_request(request)
+    except Exception as e:
+        return _ai_err(request, f'Auth error: {e}', 500)
+    if not user:   return _ai_err(request, 'Authentication required.', 401)
+    if not _is_approved(user): return _ai_err(request, 'Account pending approval.', 403)
 
-    user = _user_from_request(request)
-    if not user:
-        return _ai_cors(request, JsonResponse(
-            {'success': False, 'message': 'Authentication required.'}, status=401))
-    if not _is_approved(user):
-        return _ai_cors(request, JsonResponse(
-            {'success': False, 'message': 'Account pending approval.'}, status=403))
+    # MongoDB collection counts
+    mongo_sources = []
+    try:
+        db1 = get_db(); db2 = get_survey_db()
+        mongo_sources = [
+            {'name':'2025 Voter Roll',   'ext':'mongodb','type':'collection',
+             'size': db1['2025'].estimated_document_count()},
+            {'name':'Survey Records',    'ext':'mongodb','type':'collection',
+             'size': db2['SurveyRecords'].estimated_document_count()},
+            {'name':'2023 Polling Data', 'ext':'mongodb','type':'collection',
+             'size': db2['2023_polled_notpolled'].estimated_document_count()},
+            {'name':'2002 Voter Roll',   'ext':'mongodb','type':'collection',
+             'size': db2['2002'].estimated_document_count()},
+            {'name':'Future Voters',     'ext':'mongodb','type':'collection',
+             'size': db2['FutureVoters'].estimated_document_count()},
+            {'name':'Deceased Records',  'ext':'mongodb','type':'collection',
+             'size': db2['Deceased'].estimated_document_count()},
+        ]
+    except Exception as e:
+        mongo_sources = [{'name':f'MongoDB error: {e}','ext':'error','size':0,'type':'error'}]
 
-    files = []
-    if _os.path.isdir(_AI_DATA_DIR):
-        for fname in sorted(_os.listdir(_AI_DATA_DIR)):
-            ext = _os.path.splitext(fname)[1].lower()
-            if ext in _AI_SUPPORTED_EXTS:
-                path = _os.path.join(_AI_DATA_DIR, fname)
-                files.append({
-                    'name':     fname,
-                    'ext':      ext.lstrip('.'),
-                    'size':     _os.path.getsize(path),
-                    'modified': datetime.fromtimestamp(
-                        _os.path.getmtime(path), tz=timezone.utc
-                    ).isoformat(),
+    # Local files — show ALL files with size info, no filtering
+    local_files = []
+    try:
+        if _os2.path.isdir(_AI_DATA_DIR):
+            for fname in sorted(_os2.listdir(_AI_DATA_DIR)):
+                ext = _os2.path.splitext(fname)[1].lower()
+                if ext not in _AI_SUPPORTED_EXTS: continue
+                path    = _os2.path.join(_AI_DATA_DIR, fname)
+                size_mb = _os2.path.getsize(path)/(1024*1024)
+                local_files.append({
+                    'name':    fname,
+                    'ext':     ext.lstrip('.'),
+                    'size':    _os2.path.getsize(path),
+                    'size_mb': round(size_mb,1),
+                    'skipped': False,   # no files skipped — streaming handles all sizes
+                    'type':    'file',
                 })
-    return _ai_cors(request, JsonResponse({'success': True, 'files': files}))
+    except Exception as e:
+        local_files = [{'name':f'File error: {e}','ext':'error','size':0,'type':'error'}]
+
+    return _ai_cors(request, JsonResponse({
+        'success':     True,
+        'files':       mongo_sources + local_files,
+        'mongo_count': len(mongo_sources),
+        'file_count':  len(local_files),
+        'limits': {
+            'excel_max_rows'     : _AI_EXCEL_MAX_ROWS,
+            'csv_max_rows'       : _AI_CSV_MAX_ROWS,
+            'pdf_max_pages'      : _AI_PDF_MAX_PAGES,
+            'chars_per_file'     : _AI_CHARS_PER_FILE,
+            'total_chars_budget' : _AI_TOTAL_CHARS_FILES,
+            'max_files'          : _AI_MAX_FILES,
+        },
+    }))
