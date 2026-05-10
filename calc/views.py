@@ -5354,3 +5354,376 @@ def api_admin_location_dates(request):
     ]
     dates = [doc['_id'] for doc in loc_col.aggregate(pipeline)]
     return JsonResponse({'success': True, 'dates': dates})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI CHAT — Anthropic-powered chat with constituency data files
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Reads all supported files from  backend/data/  and uses them as context
+# for an Anthropic claude-opus-4-5 powered chat.
+#
+# New endpoints (add to urls.py):
+#   path('ai/chat/',         views.api_ai_chat,         name='api_ai_chat'),
+#   path('ai/chat/export/',  views.api_ai_chat_export,  name='api_ai_chat_export'),
+#   path('ai/data-files/',   views.api_ai_data_files,   name='api_ai_data_files'),
+#
+# Required pip packages:
+#   anthropic  pandas  openpyxl  pymupdf  python-docx  reportlab
+#
+# Required env var on Render (already needed by existing AI endpoints):
+#   ANTHROPIC_API_KEY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import io as _io
+
+# ── optional imports (graceful degradation) ───────────────────────────────────
+try:
+    import fitz as _fitz          # PyMuPDF  → pip install pymupdf
+    _PYMUPDF_OK = True
+except ImportError:
+    _PYMUPDF_OK = False
+
+try:
+    import docx as _docx_lib      # python-docx → pip install python-docx
+    _DOCX_LIB_OK = True
+except ImportError:
+    _DOCX_LIB_OK = False
+
+# ── data folder path ──────────────────────────────────────────────────────────
+_AI_DATA_DIR   = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'data')
+_AI_EXPORT_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'exports')
+_os.makedirs(_AI_DATA_DIR,   exist_ok=True)
+_os.makedirs(_AI_EXPORT_DIR, exist_ok=True)
+
+_AI_SUPPORTED_EXTS = {'.xlsx', '.xls', '.csv', '.pdf', '.docx', '.doc', '.txt'}
+
+# ── file readers ──────────────────────────────────────────────────────────────
+
+def _ai_read_excel(path, max_rows=300):
+    try:
+        xf  = pd.ExcelFile(path)
+        out = []
+        for sheet in xf.sheet_names:
+            df = xf.parse(sheet, nrows=max_rows).dropna(how='all').fillna('')
+            out.append(f'[Sheet: {sheet}]')
+            out.append(df.to_string(index=False, max_rows=max_rows))
+        return '\n'.join(out)
+    except Exception as e:
+        return f'[Could not read {_os.path.basename(path)}: {e}]'
+
+
+def _ai_read_csv(path, max_rows=400):
+    try:
+        df = pd.read_csv(path, nrows=max_rows, encoding='utf-8', on_bad_lines='skip').fillna('')
+        return df.to_string(index=False, max_rows=max_rows)
+    except Exception as e:
+        return f'[Could not read {_os.path.basename(path)}: {e}]'
+
+
+def _ai_read_pdf(path, max_pages=15):
+    if not _PYMUPDF_OK:
+        return f'[PyMuPDF not installed — cannot read {_os.path.basename(path)}]'
+    try:
+        doc   = _fitz.open(path)
+        pages = []
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+            pages.append(page.get_text())
+        doc.close()
+        return '\n'.join(pages)[:12000]
+    except Exception as e:
+        return f'[Could not read {_os.path.basename(path)}: {e}]'
+
+
+def _ai_read_docx(path):
+    if not _DOCX_LIB_OK:
+        return f'[python-docx not installed — cannot read {_os.path.basename(path)}]'
+    try:
+        doc  = _docx_lib.Document(path)
+        text = [p.text for p in doc.paragraphs if p.text.strip()]
+        return '\n'.join(text)[:12000]
+    except Exception as e:
+        return f'[Could not read {_os.path.basename(path)}: {e}]'
+
+
+def _ai_read_txt(path):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            return f.read()[:12000]
+    except Exception as e:
+        return f'[Could not read {_os.path.basename(path)}: {e}]'
+
+
+def _ai_load_data_context(max_files=12, max_chars_per_file=6000):
+    """Walk backend/data/ and build a text context from all supported files."""
+    files_found = []
+    sections    = []
+
+    if not _os.path.isdir(_AI_DATA_DIR):
+        return 'No data directory found at backend/data/.', []
+
+    for fname in sorted(_os.listdir(_AI_DATA_DIR)):
+        ext = _os.path.splitext(fname)[1].lower()
+        if ext not in _AI_SUPPORTED_EXTS:
+            continue
+        path = _os.path.join(_AI_DATA_DIR, fname)
+        files_found.append(fname)
+        if len(sections) >= max_files:
+            break
+
+        if ext in ('.xlsx', '.xls'):
+            raw = _ai_read_excel(path)
+        elif ext == '.csv':
+            raw = _ai_read_csv(path)
+        elif ext == '.pdf':
+            raw = _ai_read_pdf(path)
+        elif ext in ('.docx', '.doc'):
+            raw = _ai_read_docx(path)
+        else:
+            raw = _ai_read_txt(path)
+
+        sections.append(f'===== FILE: {fname} =====\n{raw[:max_chars_per_file]}\n')
+
+    ctx = '\n'.join(sections) if sections else 'No data files found in backend/data/.'
+    return ctx, files_found
+
+
+# ── system prompt ─────────────────────────────────────────────────────────────
+
+_AI_CHAT_SYSTEM = """You are an expert political data analyst and constituency intelligence assistant for the Mangaluru South Assembly Constituency, Karnataka, India. You have deep knowledge of election strategy, voter behaviour, demographics, and local governance.
+
+You have access to real constituency data files (voter lists, survey data, scheme beneficiary lists, historical election results, ward-wise demographics, etc.) provided below.
+
+## Your capabilities:
+1. Answer questions about voters, wards, booths, demographics, religion-wise breakdown, survey progress, scheme reach, etc.
+2. Provide strategic political insights with actionable recommendations.
+3. Generate structured analysis with numbers, percentages, and comparisons.
+4. When data supports it, output chart specifications in JSON so the frontend can render interactive charts.
+5. When asked to export data, generate a structured export payload.
+
+## Ward reference (wards 21-60, total 40 wards):
+Wards: 21=PADAVU, 24=DEREBAIL SOUTH, 25=DEREBAIL WEST, 26=DEREBAIL SOUTH WEST, 27=BOLOOR, 28=MANNAGUDDA, 29=KAMBLA, 30=KODIALBAIL, 31=BEJAI, 32=KADRI NORTH, 33=KADRI SOUTH, 34=SHIVBHAG, 35=PADAVU CENTRAL, 36=PADAVU POORVA, 37=MAROLI, 38=BENDUR, 39=FALNIR, 40=COURT, 41=CENTRAL, 42=DONGERKERY, 43=KUDROLI, 44=NAVAYATH, 45=PORT, 46=CANTONMENT, 47=MILAGRIS, 48=VALENCIA, 49=KANKANADY, 50=ALAPE DAKSHINA, 51=ALAPE UTTARA, 52=KANNUR, 53=BAJAL, 54=JEPPINAMUGER, 55=ATTAVARA, 56=MANGALADEVI, 57=HOIGE BAZAR, 58=BOLAR, 59=JEPPU, 60=BENGRE. Religion keys: H=Hindu, M=Muslim, C=Christian.
+
+## Response format rules:
+- Always ground answers in the provided data. Cite file names when relevant.
+- For numerical analysis, show calculations and reasoning.
+- When a chart would help understanding, include a JSON block like:
+  ```chartspec
+  {"type":"bar","title":"...","labels":[...],"datasets":[{"label":"...","data":[...]}]}
+  ```
+  Supported chart types: bar, line, pie, doughnut, radar, stackedBar
+- If the user asks for an Excel/CSV/PDF output, respond with an export block:
+  ```exportspec
+  {"format":"csv","filename":"ward_analysis.csv","columns":["Ward","Total Voters","Surveyed"],"rows":[...]}
+  ```
+- Be specific, strategic, and data-driven.
+
+## Constituency data files loaded:
+{DATA_CONTEXT}
+"""
+
+# ── export helper ─────────────────────────────────────────────────────────────
+
+def _ai_make_export(spec, fmt):
+    """Build a downloadable file from an exportspec dict. Returns (bytes, mime, filename)."""
+    columns  = spec.get('columns', [])
+    rows     = spec.get('rows', [])
+    fname    = spec.get('filename', f'export_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+
+    df = pd.DataFrame(rows, columns=columns) if columns else pd.DataFrame(rows)
+
+    if fmt == 'csv':
+        buf = _io.BytesIO()
+        df.to_csv(buf, index=False)
+        return buf.getvalue(), 'text/csv', fname if fname.endswith('.csv') else fname + '.csv'
+
+    if fmt in ('xlsx', 'excel'):
+        buf = _io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as w:
+            df.to_excel(w, index=False, sheet_name='Data')
+        return (buf.getvalue(),
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                fname if fname.endswith('.xlsx') else fname + '.xlsx')
+
+    # PDF — reportlab if available, else fall back to CSV
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+        from reportlab.lib import colors as _rlcolors
+        from reportlab.lib.styles import getSampleStyleSheet
+        buf = _io.BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=A4)
+        styles = getSampleStyleSheet()
+        data = [columns] + [[str(r.get(c, '')) for c in columns] for r in rows]
+        tbl  = Table(data)
+        tbl.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), _rlcolors.HexColor('#1a237e')),
+            ('TEXTCOLOR',  (0, 0), (-1, 0), _rlcolors.white),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [_rlcolors.white, _rlcolors.HexColor('#f5f5f5')]),
+            ('GRID', (0, 0), (-1, -1), 0.5, _rlcolors.grey),
+        ]))
+        doc.build([Paragraph(fname, styles['Title']), tbl])
+        return buf.getvalue(), 'application/pdf', fname if fname.endswith('.pdf') else fname + '.pdf'
+    except ImportError:
+        buf = _io.BytesIO()
+        df.to_csv(buf, index=False)
+        return buf.getvalue(), 'text/csv', fname.replace('.pdf', '.csv')
+
+
+# ── views ─────────────────────────────────────────────────────────────────────
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def api_ai_chat(request):
+    """
+    POST /api/ai/chat/
+    Body: {
+      "message":     "...",
+      "history":     [{"role":"user","content":"..."}, ...],
+      "includeData": true
+    }
+    Returns: {
+      "success":    true,
+      "reply":      "...",
+      "chartSpec":  {...} | null,
+      "exportSpec": {...} | null,
+      "filesUsed":  [...]
+    }
+    """
+    user = _user_from_request(request)
+    if not user:
+        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+    if not _is_approved(user):
+        return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
+
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        return JsonResponse({'success': False, 'message': 'Invalid JSON.'}, status=400)
+
+    message      = (body.get('message') or '').strip()
+    history      = body.get('history', [])
+    include_data = body.get('includeData', True)
+
+    if not message:
+        return JsonResponse({'success': False, 'message': 'message is required.'}, status=400)
+
+    # ── Build data context ────────────────────────────────────────────────────
+    if include_data:
+        data_context, files_used = _ai_load_data_context()
+    else:
+        data_context, files_used = 'Data context disabled by user.', []
+
+    system_prompt = _AI_CHAT_SYSTEM.replace('{DATA_CONTEXT}', data_context)
+
+    # ── Build messages list ───────────────────────────────────────────────────
+    messages = []
+    for h in history[-20:]:
+        role    = h.get('role', 'user')
+        content = h.get('content', '')
+        if role in ('user', 'assistant') and content:
+            messages.append({'role': role, 'content': content})
+    messages.append({'role': 'user', 'content': message})
+
+    # ── Call Anthropic ────────────────────────────────────────────────────────
+    try:
+        client   = _get_anthropic()
+        response = client.messages.create(
+            model      = 'claude-opus-4-5',
+            max_tokens = 4096,
+            system     = system_prompt,
+            messages   = messages,
+        )
+        reply_text = ''.join(b.text for b in response.content if hasattr(b, 'text'))
+    except Exception as e:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': f'Anthropic API error: {str(e)}'}, status=500)
+
+    # ── Parse chartspec and exportspec blocks ─────────────────────────────────
+    chart_spec  = None
+    export_spec = None
+
+    chart_match = re.search(r'```chartspec\s*(\{.*?\})\s*```', reply_text, re.DOTALL)
+    if chart_match:
+        try:
+            chart_spec = json.loads(chart_match.group(1))
+        except Exception:
+            pass
+
+    export_match = re.search(r'```exportspec\s*(\{.*?\})\s*```', reply_text, re.DOTALL)
+    if export_match:
+        try:
+            export_spec = json.loads(export_match.group(1))
+        except Exception:
+            pass
+
+    # Strip raw spec blocks from the visible reply
+    clean_reply = re.sub(r'```(chartspec|exportspec).*?```', '', reply_text, flags=re.DOTALL).strip()
+
+    return JsonResponse({
+        'success':    True,
+        'reply':      clean_reply,
+        'chartSpec':  chart_spec,
+        'exportSpec': export_spec,
+        'filesUsed':  files_used,
+    })
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def api_ai_chat_export(request):
+    """
+    POST /api/ai/chat/export/
+    Body: { "exportSpec": { "format":"csv","filename":"...","columns":[...],"rows":[...] } }
+    Streams the generated file as a download.
+    """
+    user = _user_from_request(request)
+    if not user:
+        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+    if not _is_approved(user):
+        return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
+
+    try:
+        body = json.loads(request.body)
+        spec = body.get('exportSpec', {})
+        fmt  = spec.get('format', 'csv').lower()
+    except Exception:
+        return JsonResponse({'success': False, 'message': 'Invalid request.'}, status=400)
+
+    try:
+        from django.http import HttpResponse as _HR
+        file_bytes, mime, filename = _ai_make_export(spec, fmt)
+        resp = _HR(file_bytes, content_type=mime)
+        resp['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return resp
+    except Exception as e:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(e)}, status=500)
+
+
+@require_http_methods(['GET'])
+def api_ai_data_files(request):
+    """GET /api/ai/data-files/ — list files in backend/data/"""
+    user = _user_from_request(request)
+    if not user:
+        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+    if not _is_approved(user):
+        return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
+
+    files = []
+    if _os.path.isdir(_AI_DATA_DIR):
+        for fname in sorted(_os.listdir(_AI_DATA_DIR)):
+            ext = _os.path.splitext(fname)[1].lower()
+            if ext in _AI_SUPPORTED_EXTS:
+                path = _os.path.join(_AI_DATA_DIR, fname)
+                files.append({
+                    'name':     fname,
+                    'ext':      ext.lstrip('.'),
+                    'size':     _os.path.getsize(path),
+                    'modified': datetime.fromtimestamp(
+                        _os.path.getmtime(path), tz=timezone.utc
+                    ).isoformat(),
+                })
+    return JsonResponse({'success': True, 'files': files})
