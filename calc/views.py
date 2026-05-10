@@ -5360,7 +5360,7 @@ def api_admin_location_dates(request):
 # AI CHAT — Anthropic-powered chat backed by live MongoDB + data folder files
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# Context budget (claude-opus-4-5 has 200k token window):
+# Context budget (claude-sonnet-4-20250514 has 200k token window):
 #   MongoDB summaries   : ~10,000 tokens  (always included)
 #   Data folder files   : up to ~80,000 tokens total across all files
 #   Conversation history: up to 20 turns
@@ -5901,6 +5901,61 @@ def _is_simple_message(msg: str) -> bool:
     return bool(_SIMPLE_INTENT_RE.match(msg.strip()))
 
 
+# ── Instant replies for simple messages — zero API calls, responds in <10ms ───
+# Keyed by lowercase stripped message (exact match first), then falls back to
+# a generic greeting reply for anything _is_simple_message() matched.
+
+_INSTANT_REPLIES = {
+    'hi':         'Hi there! 👋 How can I help you with constituency data today?',
+    'hello':      'Hello! How can I assist you today?',
+    'hey':        'Hey! What can I help you with?',
+    'thanks':     'You\'re welcome! Let me know if you need anything else.',
+    'thank you':  'You\'re welcome! Feel free to ask anything.',
+    'ty':         'You\'re welcome!',
+    'ok':         'Got it! Let me know if you need anything.',
+    'okay':       'Sure! Ask away whenever you\'re ready.',
+    'bye':        'Goodbye! Come back anytime you need data insights.',
+    'goodbye':    'Goodbye! Have a great day!',
+    'great':      'Glad to help! What else can I do for you?',
+    'cool':       'Awesome! Anything else you\'d like to know?',
+    'got it':     'Great! Let me know if you have more questions.',
+    'understood': 'Perfect! What else can I help you with?',
+    'who are you': (
+        'I\'m your Constituency Intelligence Assistant for Mangaluru South '
+        '(Constituency 175). I can answer questions about voter data, ward stats, '
+        'survey records, scheme eligibility, SIR analysis, and more!'
+    ),
+    'what can you do': (
+        'I can help you with:\n'
+        '• Voter roll stats (ward-wise, booth-wise, religion, gender)\n'
+        '• Survey data analysis\n'
+        '• 2023 election polling breakdowns\n'
+        '• SIR analysis (2002 vs 2025 voter rolls)\n'
+        '• Scheme eligibility\n'
+        '• Future voters & deceased records\n\n'
+        'Just ask your question!'
+    ),
+    'help': (
+        'Sure! You can ask me things like:\n'
+        '• "Show me ward 25 voter breakdown"\n'
+        '• "Which ward has the most Muslim voters?"\n'
+        '• "Compare polled vs not-polled in 2023 for Boloor"\n'
+        '• "How many BJP members are surveyed?"\n\n'
+        'What would you like to know?'
+    ),
+}
+
+_INSTANT_REPLY_DEFAULT = 'Hello! How can I help you with constituency data today?'
+
+
+def _get_instant_reply(msg: str):
+    """Return a hardcoded instant reply string, or None if not a simple message."""
+    if not _is_simple_message(msg):
+        return None
+    key = msg.strip().lower().rstrip('!?.').strip()
+    return _INSTANT_REPLIES.get(key, _INSTANT_REPLY_DEFAULT)
+
+
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 _AI_CHAT_SYSTEM = """You are an expert political data analyst and constituency intelligence assistant for the Mangaluru South Assembly Constituency (Constituency 175), Karnataka, India.
@@ -6024,11 +6079,16 @@ def api_ai_chat(request):
     if not message:
         return _ai_err(request, 'message field is required.', 400)
 
+    # ── Instant reply for greetings — no DB, no API, responds in <10 ms ─────
+    _instant = _get_instant_reply(message)
+    if _instant:
+        return _ai_cors(request, JsonResponse({
+            'success': True, 'reply': _instant,
+            'chartSpec': None, 'exportSpec': None, 'filesUsed': [],
+        }))
+
     # Build context
-    # Skip heavy DB / file loading for simple greetings or conversational messages.
-    # This saves 1-3 s of DB round-trips and prevents the AI from citing voter
-    # data in response to "hi", "thanks", etc.
-    _skip_data = not include_data or _is_simple_message(message)
+    _skip_data = not include_data
 
     if not _skip_data:
         try:
@@ -6068,7 +6128,7 @@ def api_ai_chat(request):
         return _ai_err(request, err, 500)
     try:
         response   = client.messages.create(
-            model='claude-opus-4-5', max_tokens=4096,
+            model='claude-sonnet-4-20250514', max_tokens=4096,
             system=system_prompt, messages=messages,
         )
         reply_text = ''.join(b.text for b in response.content if hasattr(b,'text'))
