@@ -5359,38 +5359,21 @@ def api_admin_location_dates(request):
 # ═══════════════════════════════════════════════════════════════════════════════
 # AI CHAT — Anthropic-powered chat with constituency data files
 # ═══════════════════════════════════════════════════════════════════════════════
-#
-# Reads all supported files from  backend/data/  and uses them as context
-# for an Anthropic claude-opus-4-5 powered chat.
-#
-# New endpoints (add to urls.py):
-#   path('ai/chat/',         views.api_ai_chat,         name='api_ai_chat'),
-#   path('ai/chat/export/',  views.api_ai_chat_export,  name='api_ai_chat_export'),
-#   path('ai/data-files/',   views.api_ai_data_files,   name='api_ai_data_files'),
-#
-# Required pip packages:
-#   anthropic  pandas  openpyxl  pymupdf  python-docx  reportlab
-#
-# Required env var on Render (already needed by existing AI endpoints):
-#   ANTHROPIC_API_KEY
-# ═══════════════════════════════════════════════════════════════════════════════
 
 import io as _io
 
-# ── optional imports (graceful degradation) ───────────────────────────────────
 try:
-    import fitz as _fitz          # PyMuPDF  → pip install pymupdf
+    import fitz as _fitz
     _PYMUPDF_OK = True
 except ImportError:
     _PYMUPDF_OK = False
 
 try:
-    import docx as _docx_lib      # python-docx → pip install python-docx
+    import docx as _docx_lib
     _DOCX_LIB_OK = True
 except ImportError:
     _DOCX_LIB_OK = False
 
-# ── data folder path ──────────────────────────────────────────────────────────
 _AI_DATA_DIR   = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'data')
 _AI_EXPORT_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'exports')
 _os.makedirs(_AI_DATA_DIR,   exist_ok=True)
@@ -5398,7 +5381,21 @@ _os.makedirs(_AI_EXPORT_DIR, exist_ok=True)
 
 _AI_SUPPORTED_EXTS = {'.xlsx', '.xls', '.csv', '.pdf', '.docx', '.doc', '.txt'}
 
-# ── file readers ──────────────────────────────────────────────────────────────
+
+# ── CORS helper ───────────────────────────────────────────────────────────────
+
+def _ai_cors(request, response):
+    """Add CORS headers so the browser preflight (OPTIONS) and real request both pass."""
+    origin = request.META.get('HTTP_ORIGIN', '')
+    if origin:
+        response['Access-Control-Allow-Origin']      = origin
+        response['Access-Control-Allow-Credentials'] = 'true'
+        response['Access-Control-Allow-Methods']     = 'POST, GET, OPTIONS'
+        response['Access-Control-Allow-Headers']     = 'Content-Type, Authorization, X-CSRFToken'
+    return response
+
+
+# ── File readers ──────────────────────────────────────────────────────────────
 
 def _ai_read_excel(path, max_rows=300):
     try:
@@ -5490,7 +5487,7 @@ def _ai_load_data_context(max_files=12, max_chars_per_file=6000):
     return ctx, files_found
 
 
-# ── system prompt ─────────────────────────────────────────────────────────────
+# ── System prompt ─────────────────────────────────────────────────────────────
 
 _AI_CHAT_SYSTEM = """You are an expert political data analyst and constituency intelligence assistant for the Mangaluru South Assembly Constituency, Karnataka, India. You have deep knowledge of election strategy, voter behaviour, demographics, and local governance.
 
@@ -5524,13 +5521,14 @@ Wards: 21=PADAVU, 24=DEREBAIL SOUTH, 25=DEREBAIL WEST, 26=DEREBAIL SOUTH WEST, 2
 {DATA_CONTEXT}
 """
 
-# ── export helper ─────────────────────────────────────────────────────────────
+
+# ── Export helper ─────────────────────────────────────────────────────────────
 
 def _ai_make_export(spec, fmt):
-    """Build a downloadable file from an exportspec dict. Returns (bytes, mime, filename)."""
-    columns  = spec.get('columns', [])
-    rows     = spec.get('rows', [])
-    fname    = spec.get('filename', f'export_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+    """Convert an AI-generated exportspec dict into a downloadable file."""
+    columns = spec.get('columns', [])
+    rows    = spec.get('rows', [])
+    fname   = spec.get('filename', f'export_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
 
     df = pd.DataFrame(rows, columns=columns) if columns else pd.DataFrame(rows)
 
@@ -5543,9 +5541,11 @@ def _ai_make_export(spec, fmt):
         buf = _io.BytesIO()
         with pd.ExcelWriter(buf, engine='openpyxl') as w:
             df.to_excel(w, index=False, sheet_name='Data')
-        return (buf.getvalue(),
-                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                fname if fname.endswith('.xlsx') else fname + '.xlsx')
+        return (
+            buf.getvalue(),
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            fname if fname.endswith('.xlsx') else fname + '.xlsx',
+        )
 
     # PDF — reportlab if available, else fall back to CSV
     try:
@@ -5556,8 +5556,8 @@ def _ai_make_export(spec, fmt):
         buf = _io.BytesIO()
         doc = SimpleDocTemplate(buf, pagesize=A4)
         styles = getSampleStyleSheet()
-        data = [columns] + [[str(r.get(c, '')) for c in columns] for r in rows]
-        tbl  = Table(data)
+        tbl_data = [columns] + [[str(r.get(c, '')) for c in columns] for r in rows]
+        tbl = Table(tbl_data)
         tbl.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), _rlcolors.HexColor('#1a237e')),
             ('TEXTCOLOR',  (0, 0), (-1, 0), _rlcolors.white),
@@ -5572,43 +5572,40 @@ def _ai_make_export(spec, fmt):
         return buf.getvalue(), 'text/csv', fname.replace('.pdf', '.csv')
 
 
-# ── views ─────────────────────────────────────────────────────────────────────
+# ── Views ─────────────────────────────────────────────────────────────────────
 
 @csrf_exempt
-@require_http_methods(['POST'])
+@require_http_methods(['POST', 'OPTIONS', 'GET'])
 def api_ai_chat(request):
     """
     POST /api/ai/chat/
-    Body: {
-      "message":     "...",
-      "history":     [{"role":"user","content":"..."}, ...],
-      "includeData": true
-    }
-    Returns: {
-      "success":    true,
-      "reply":      "...",
-      "chartSpec":  {...} | null,
-      "exportSpec": {...} | null,
-      "filesUsed":  [...]
-    }
+    Body: { "message": "...", "history": [...], "includeData": true }
     """
+    # ── CORS preflight ────────────────────────────────────────────────────────
+    if request.method == 'OPTIONS':
+        return _ai_cors(request, JsonResponse({}))
+
     user = _user_from_request(request)
     if not user:
-        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+        return _ai_cors(request, JsonResponse(
+            {'success': False, 'message': 'Authentication required.'}, status=401))
     if not _is_approved(user):
-        return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
+        return _ai_cors(request, JsonResponse(
+            {'success': False, 'message': 'Account pending approval.'}, status=403))
 
     try:
         body = json.loads(request.body)
     except Exception:
-        return JsonResponse({'success': False, 'message': 'Invalid JSON.'}, status=400)
+        return _ai_cors(request, JsonResponse(
+            {'success': False, 'message': 'Invalid JSON.'}, status=400))
 
     message      = (body.get('message') or '').strip()
     history      = body.get('history', [])
     include_data = body.get('includeData', True)
 
     if not message:
-        return JsonResponse({'success': False, 'message': 'message is required.'}, status=400)
+        return _ai_cors(request, JsonResponse(
+            {'success': False, 'message': 'message is required.'}, status=400))
 
     # ── Build data context ────────────────────────────────────────────────────
     if include_data:
@@ -5627,7 +5624,7 @@ def api_ai_chat(request):
             messages.append({'role': role, 'content': content})
     messages.append({'role': 'user', 'content': message})
 
-    # ── Call Anthropic ────────────────────────────────────────────────────────
+    # ── Call Anthropic (reuse existing lazy client) ───────────────────────────
     try:
         client   = _get_anthropic()
         response = client.messages.create(
@@ -5639,9 +5636,10 @@ def api_ai_chat(request):
         reply_text = ''.join(b.text for b in response.content if hasattr(b, 'text'))
     except Exception as e:
         traceback.print_exc()
-        return JsonResponse({'success': False, 'message': f'Anthropic API error: {str(e)}'}, status=500)
+        return _ai_cors(request, JsonResponse(
+            {'success': False, 'message': f'Anthropic API error: {str(e)}'}, status=500))
 
-    # ── Parse chartspec and exportspec blocks ─────────────────────────────────
+    # ── Parse chartspec / exportspec blocks ───────────────────────────────────
     chart_spec  = None
     export_spec = None
 
@@ -5659,58 +5657,68 @@ def api_ai_chat(request):
         except Exception:
             pass
 
-    # Strip raw spec blocks from the visible reply
     clean_reply = re.sub(r'```(chartspec|exportspec).*?```', '', reply_text, flags=re.DOTALL).strip()
 
-    return JsonResponse({
+    return _ai_cors(request, JsonResponse({
         'success':    True,
         'reply':      clean_reply,
         'chartSpec':  chart_spec,
         'exportSpec': export_spec,
         'filesUsed':  files_used,
-    })
+    }))
 
 
 @csrf_exempt
-@require_http_methods(['POST'])
+@require_http_methods(['POST', 'OPTIONS'])
 def api_ai_chat_export(request):
     """
     POST /api/ai/chat/export/
     Body: { "exportSpec": { "format":"csv","filename":"...","columns":[...],"rows":[...] } }
-    Streams the generated file as a download.
     """
+    if request.method == 'OPTIONS':
+        return _ai_cors(request, JsonResponse({}))
+
     user = _user_from_request(request)
     if not user:
-        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+        return _ai_cors(request, JsonResponse(
+            {'success': False, 'message': 'Authentication required.'}, status=401))
     if not _is_approved(user):
-        return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
+        return _ai_cors(request, JsonResponse(
+            {'success': False, 'message': 'Account pending approval.'}, status=403))
 
     try:
         body = json.loads(request.body)
         spec = body.get('exportSpec', {})
         fmt  = spec.get('format', 'csv').lower()
     except Exception:
-        return JsonResponse({'success': False, 'message': 'Invalid request.'}, status=400)
+        return _ai_cors(request, JsonResponse(
+            {'success': False, 'message': 'Invalid request.'}, status=400))
 
     try:
         from django.http import HttpResponse as _HR
         file_bytes, mime, filename = _ai_make_export(spec, fmt)
         resp = _HR(file_bytes, content_type=mime)
         resp['Content-Disposition'] = f'attachment; filename="{filename}"'
-        return resp
+        return _ai_cors(request, resp)
     except Exception as e:
         traceback.print_exc()
-        return JsonResponse({'success': False, 'message': str(e)}, status=500)
+        return _ai_cors(request, JsonResponse({'success': False, 'message': str(e)}, status=500))
 
 
-@require_http_methods(['GET'])
+@csrf_exempt
+@require_http_methods(['GET', 'OPTIONS'])
 def api_ai_data_files(request):
     """GET /api/ai/data-files/ — list files in backend/data/"""
+    if request.method == 'OPTIONS':
+        return _ai_cors(request, JsonResponse({}))
+
     user = _user_from_request(request)
     if not user:
-        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+        return _ai_cors(request, JsonResponse(
+            {'success': False, 'message': 'Authentication required.'}, status=401))
     if not _is_approved(user):
-        return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
+        return _ai_cors(request, JsonResponse(
+            {'success': False, 'message': 'Account pending approval.'}, status=403))
 
     files = []
     if _os.path.isdir(_AI_DATA_DIR):
@@ -5726,4 +5734,4 @@ def api_ai_data_files(request):
                         _os.path.getmtime(path), tz=timezone.utc
                     ).isoformat(),
                 })
-    return JsonResponse({'success': True, 'files': files})
+    return _ai_cors(request, JsonResponse({'success': True, 'files': files}))

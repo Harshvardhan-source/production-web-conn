@@ -8,45 +8,68 @@ RENDER_HOST = os.environ.get('RENDER_EXTERNAL_HOSTNAME', '')
 
 ALLOWED_HOSTS = [
     RENDER_HOST,
-    'production-web-conn.onrender.com',   # Django backend — explicit fallback
+    'production-web-conn-2.onrender.com',
+    'production-web-conn.onrender.com',
 ]
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 
 # ── CSRF ──────────────────────────────────────────────────────────────────────
-# Must include BOTH the backend domain AND the frontend domain.
-# Django checks Origin header against this list on every POST/PUT/DELETE.
 CSRF_TRUSTED_ORIGINS = [
     f"https://{RENDER_HOST}",
-    "https://production-web-conn-2.onrender.com",      # Django backend
-    "https://frontend-production-web-ux7k.onrender.com",  # React frontend (sends requests here)
+    "https://production-web-conn-2.onrender.com",
+    "https://production-web-conn.onrender.com",
+    "https://frontend-production-web-ux7k.onrender.com",
 ]
 
-CSRF_COOKIE_SAMESITE  = 'None'   # cross-site cookie requires None in production
-CSRF_COOKIE_SECURE    = True     # must be True when SameSite=None
-CSRF_COOKIE_HTTPONLY  = False    # React must read csrftoken cookie via JS
+CSRF_COOKIE_SAMESITE  = 'None'
+CSRF_COOKIE_SECURE    = True
+CSRF_COOKIE_HTTPONLY  = False
 
 SESSION_COOKIE_SAMESITE = 'None'
 SESSION_COOKIE_SECURE   = True
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
+# corsheaders middleware handles all standard endpoints.
+# The _ai_cors() helper in views.py additionally handles OPTIONS preflight
+# for the AI chat endpoints specifically.
 CORS_ALLOWED_ORIGINS = [
-    "https://frontend-production-web-ux7k.onrender.com",   # React frontend
-    "https://production-web-conn-1-qoya.onrender.com",     # FastAPI (if it calls Django)
+    "https://frontend-production-web-ux7k.onrender.com",
+    "https://production-web-conn-1-qoya.onrender.com",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
 CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_ALL_ORIGINS = False   # keep explicit — never True in production
+
+# Allow ALL headers so Authorization + X-CSRFToken both pass through
 CORS_ALLOW_HEADERS = [
-    'accept', 'accept-encoding', 'authorization', 'content-type',
-    'dnt', 'origin', 'user-agent', 'x-csrftoken', 'x-requested-with',
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
 ]
 
-# ── Middleware (order matters — CorsMiddleware must be first) ─────────────────
+# Allow all standard methods including OPTIONS (preflight)
+CORS_ALLOW_METHODS = [
+    'DELETE',
+    'GET',
+    'OPTIONS',
+    'PATCH',
+    'POST',
+    'PUT',
+]
+
+# ── Middleware (order matters — CorsMiddleware MUST be first) ─────────────────
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',           # 1st — always
-    'django.middleware.security.SecurityMiddleware',   # 2nd — always
-    'whitenoise.middleware.WhiteNoiseMiddleware',      # 3rd — after Security
+    'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -73,10 +96,13 @@ DATABASES = {
     }
 }
 
-# ── MongoDB (from Render env vars) ────────────────────────────────────────────
+# ── MongoDB ───────────────────────────────────────────────────────────────────
 MONGODB_URL   = os.getenv('MONGODB_URL')
 MONGODB_URL_2 = os.getenv('MONGODB_URL_2')
 
+# ── Anthropic ─────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
-GCS_BUCKET_NAME = os.getenv('GCS_BUCKET_NAME')
+
+# ── GCS ───────────────────────────────────────────────────────────────────────
+GCS_BUCKET_NAME      = os.getenv('GCS_BUCKET_NAME')
 GCS_CREDENTIALS_JSON = os.getenv('GCS_CREDENTIALS_JSON')

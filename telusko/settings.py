@@ -21,10 +21,11 @@ INSTALLED_APPS = [
     'whitenoise.runserver_nostatic',
 ]
 
+# ── Middleware (CorsMiddleware must be first) ──────────────────────────────────
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',           # 1st — always
-    'django.middleware.security.SecurityMiddleware',   # 2nd — always
-    'whitenoise.middleware.WhiteNoiseMiddleware',      # 3rd — after Security
+    'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -33,29 +34,42 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-# CORS - allow React dev server
+# ── CORS ──────────────────────────────────────────────────────────────────────
 CORS_ALLOWED_ORIGINS = [
     'https://frontend-production-web-ux7k.onrender.com',
     'http://localhost:3000',
     'http://127.0.0.1:3000',
-   
 ]
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = [
-    'accept', 'accept-encoding', 'authorization', 'content-type',
-    'dnt', 'origin', 'user-agent', 'x-csrftoken', 'x-requested-with',
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+]
+CORS_ALLOW_METHODS = [
+    'DELETE',
+    'GET',
+    'OPTIONS',
+    'PATCH',
+    'POST',
+    'PUT',
 ]
 
-# CSRF trusted for React dev server
+# ── CSRF ──────────────────────────────────────────────────────────────────────
 CSRF_TRUSTED_ORIGINS = [
     'http://localhost:3000',
     'http://127.0.0.1:3000',
     'http://localhost:8000',
     'https://frontend-production-web-ux7k.onrender.com',
-  
 ]
 CSRF_COOKIE_SAMESITE = 'Lax'
-CSRF_COOKIE_HTTPONLY = False  # React needs to read it
+CSRF_COOKIE_HTTPONLY = False
 SESSION_COOKIE_SAMESITE = 'Lax'
 
 ROOT_URLCONF = 'telusko.urls'
@@ -101,18 +115,21 @@ STATIC_URL = '/static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 STATIC_DIR = os.path.join(BASE_DIR, 'static')
 STATICFILES_DIRS = [STATIC_DIR] if os.path.exists(STATIC_DIR) else []
-# STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# MongoDB connection (update with your actual credentials)
-MONGODB_URL =  os.getenv("MONGODB_URL")
-MONGODB_URL_2 =  os.getenv("MONGODB_URL_2")
-# Large file upload support
+# ── MongoDB ───────────────────────────────────────────────────────────────────
+MONGODB_URL   = os.getenv("MONGODB_URL")
+MONGODB_URL_2 = os.getenv("MONGODB_URL_2")
+
+# ── Large file upload support ─────────────────────────────────────────────────
 DATA_UPLOAD_MAX_MEMORY_SIZE = 104857600   # 100 MB
 FILE_UPLOAD_MAX_MEMORY_SIZE = 104857600   # 100 MB
-FILE_UPLOAD_TEMP_DIR        = None     
+FILE_UPLOAD_TEMP_DIR        = None
 
+# ── Anthropic ─────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
-GCS_BUCKET_NAME = os.getenv('GCS_BUCKET_NAME')
+
+# ── GCS ───────────────────────────────────────────────────────────────────────
+GCS_BUCKET_NAME      = os.getenv('GCS_BUCKET_NAME')
 GCS_CREDENTIALS_JSON = os.getenv('GCS_CREDENTIALS_JSON')
