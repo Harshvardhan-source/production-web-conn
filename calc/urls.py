@@ -80,6 +80,7 @@ urlpatterns = [
     # AI Insights (existing)
     path('ai/query-insight/',        views.api_ai_query_insight,      name='api_ai_query_insight'),
     path('ai/birdseye-view/',        views.api_ai_birdseye_view,      name='api_ai_birdseye_view'),
+    path('ai/swot-overview/',        views.api_swot_overview,         name='api_swot_overview'),
 
     # ── AI Chat — NEW ─────────────────────────────────────────────────────────
     path('ai/chat/',                 views.api_ai_chat,               name='api_ai_chat'),
