@@ -5901,60 +5901,6 @@ def _is_simple_message(msg: str) -> bool:
     return bool(_SIMPLE_INTENT_RE.match(msg.strip()))
 
 
-# ── Instant replies for simple messages — zero API calls, responds in <10ms ───
-# Keyed by lowercase stripped message (exact match first), then falls back to
-# a generic greeting reply for anything _is_simple_message() matched.
-
-_INSTANT_REPLIES = {
-    'hi':         'Hi there! 👋 How can I help you with constituency data today?',
-    'hello':      'Hello! How can I assist you today?',
-    'hey':        'Hey! What can I help you with?',
-    'thanks':     'You\'re welcome! Let me know if you need anything else.',
-    'thank you':  'You\'re welcome! Feel free to ask anything.',
-    'ty':         'You\'re welcome!',
-    'ok':         'Got it! Let me know if you need anything.',
-    'okay':       'Sure! Ask away whenever you\'re ready.',
-    'bye':        'Goodbye! Come back anytime you need data insights.',
-    'goodbye':    'Goodbye! Have a great day!',
-    'great':      'Glad to help! What else can I do for you?',
-    'cool':       'Awesome! Anything else you\'d like to know?',
-    'got it':     'Great! Let me know if you have more questions.',
-    'understood': 'Perfect! What else can I help you with?',
-    'who are you': (
-        'I\'m your Constituency Intelligence Assistant for Mangaluru South '
-        '(Constituency 175). I can answer questions about voter data, ward stats, '
-        'survey records, scheme eligibility, SIR analysis, and more!'
-    ),
-    'what can you do': (
-        'I can help you with:\n'
-        '• Voter roll stats (ward-wise, booth-wise, religion, gender)\n'
-        '• Survey data analysis\n'
-        '• 2023 election polling breakdowns\n'
-        '• SIR analysis (2002 vs 2025 voter rolls)\n'
-        '• Scheme eligibility\n'
-        '• Future voters & deceased records\n\n'
-        'Just ask your question!'
-    ),
-    'help': (
-        'Sure! You can ask me things like:\n'
-        '• "Show me ward 25 voter breakdown"\n'
-        '• "Which ward has the most Muslim voters?"\n'
-        '• "Compare polled vs not-polled in 2023 for Boloor"\n'
-        '• "How many BJP members are surveyed?"\n\n'
-        'What would you like to know?'
-    ),
-}
-
-_INSTANT_REPLY_DEFAULT = 'Hello! How can I help you with constituency data today?'
-
-
-def _get_instant_reply(msg: str):
-    """Return a hardcoded instant reply string, or None if not a simple message."""
-    if not _is_simple_message(msg):
-        return None
-    key = msg.strip().lower().rstrip('!?.').strip()
-    return _INSTANT_REPLIES.get(key, _INSTANT_REPLY_DEFAULT)
-
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
@@ -6079,39 +6025,7 @@ def api_ai_chat(request):
     if not message:
         return _ai_err(request, 'message field is required.', 400)
 
-    # ── Instant reply for greetings — no DB, no API, responds in <10 ms ─────
-    _instant = _get_instant_reply(message)
-    if _instant:
-        return _ai_cors(request, JsonResponse({
-            'success': True, 'reply': _instant,
-            'chartSpec': None, 'exportSpec': None, 'filesUsed': [],
-        }))
-
-    # Build context
-    _skip_data = not include_data
-
-    if not _skip_data:
-        try:
-            mongo_ctx, mongo_sources = _ai_load_mongo_context()
-        except Exception as e:
-            mongo_ctx, mongo_sources = f'MongoDB error: {e}', []
-        try:
-            file_ctx, file_sources = _ai_load_file_context()
-        except Exception as e:
-            file_ctx, file_sources = f'File error: {e}', []
-        all_sources = mongo_sources + file_sources
-    else:
-        mongo_ctx   = 'Not loaded — no data context needed for this message.'
-        file_ctx    = 'Not loaded — no data context needed for this message.'
-        all_sources = []
-
-    system_prompt = (
-        _AI_CHAT_SYSTEM
-        .replace('{MONGO_CONTEXT}', mongo_ctx)
-        .replace('{FILE_CONTEXT}',  file_ctx or 'No files in backend/data/.')
-    )
-
-    # Build message history
+    # Build message history (shared by both paths below)
     messages = []
     try:
         for h in history[-20:]:
@@ -6126,6 +6040,52 @@ def api_ai_chat(request):
     client, err = _ai_get_client()
     if not client:
         return _ai_err(request, err, 500)
+
+    # ── Simple/conversational message — skip all DB & file loading ──────────
+    # Use a lightweight system prompt so the model replies naturally and fast,
+    # without waiting for MongoDB aggregations or file reads.
+    if _is_simple_message(message):
+        _simple_system = (
+            "You are a friendly assistant for Mangaluru South Constituency Connect. "
+            "Reply naturally and conversationally. Keep it short and warm. "
+            "Do not mention data, voter records, or analytics unless the user asks."
+        )
+        try:
+            response   = client.messages.create(
+                model='claude-haiku-4-5-20251001', max_tokens=256,
+                system=_simple_system, messages=messages,
+            )
+            reply_text = ''.join(b.text for b in response.content if hasattr(b,'text'))
+        except Exception as e:
+            traceback.print_exc()
+            return _ai_err(request, f'Anthropic API error: {e}', 500)
+        return _ai_cors(request, JsonResponse({
+            'success': True, 'reply': reply_text,
+            'chartSpec': None, 'exportSpec': None, 'filesUsed': [],
+        }))
+
+    # ── Data question — load full MongoDB + file context ─────────────────────
+    if include_data:
+        try:
+            mongo_ctx, mongo_sources = _ai_load_mongo_context()
+        except Exception as e:
+            mongo_ctx, mongo_sources = f'MongoDB error: {e}', []
+        try:
+            file_ctx, file_sources = _ai_load_file_context()
+        except Exception as e:
+            file_ctx, file_sources = f'File error: {e}', []
+        all_sources = mongo_sources + file_sources
+    else:
+        mongo_ctx   = 'Disabled.'
+        file_ctx    = 'Disabled.'
+        all_sources = []
+
+    system_prompt = (
+        _AI_CHAT_SYSTEM
+        .replace('{MONGO_CONTEXT}', mongo_ctx)
+        .replace('{FILE_CONTEXT}',  file_ctx or 'No files in backend/data/.')
+    )
+
     try:
         response   = client.messages.create(
             model='claude-sonnet-4-20250514', max_tokens=4096,
