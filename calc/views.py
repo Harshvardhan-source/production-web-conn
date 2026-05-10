@@ -5875,9 +5875,37 @@ def _ai_load_file_context():
     return '\n\n'.join(sections), files_used
 
 
+# ── Simple-intent detection — skip DB loading for greetings/conversational msgs ─
+# Any message that matches this pattern gets answered without touching MongoDB
+# or reading files.  This saves 1-3 s of DB round-trips and avoids the AI
+# awkwardly citing voter data in response to "hi" or "thanks".
+
+_SIMPLE_INTENT_RE = re.compile(
+    r'^\s*('
+    r'hi+|hello+|hey+|howdy|'
+    r'good\s*(morning|afternoon|evening|night|day)|'
+    r'thanks?(\s+you)?|thank\s*you|ty|'
+    r'ok(ay)?|sure|yep|yeah|yup|nope|no+|yes+|'
+    r'great|cool|awesome|nice|got\s*it|understood|'
+    r'bye+|goodbye|see\s*ya|'
+    r'what\s+(can|do)\s+you\s+do|'
+    r'who\s+are\s+you|'
+    r'help'
+    r')\s*[!?.]*\s*$',
+    re.IGNORECASE,
+)
+
+def _is_simple_message(msg: str) -> bool:
+    """Return True if the message is a simple greeting or conversational filler
+    that does not need any data source context."""
+    return bool(_SIMPLE_INTENT_RE.match(msg.strip()))
+
+
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 _AI_CHAT_SYSTEM = """You are an expert political data analyst and constituency intelligence assistant for the Mangaluru South Assembly Constituency (Constituency 175), Karnataka, India.
+
+**Important behavioural rule**: If the user sends a simple greeting (e.g. "hi", "hello", "thanks", "bye") or a purely conversational message, reply warmly and naturally — do NOT reference data sources, tables, charts, or MongoDB context. Reserve data analysis only for questions that actually require it.
 
 You have access to LIVE data from MongoDB (aggregated summaries) plus full content of data files. All data is real and current.
 
@@ -5890,13 +5918,24 @@ You have access to LIVE data from MongoDB (aggregated summaries) plus full conte
 - Supplementary files from the data folder
 
 ## Output formats:
-When a chart helps, include:
+
+### Tables — ALWAYS use GFM markdown pipe tables for any tabular or comparative data.
+Example format:
+| Ward | Hindu | Muslim | Christian | Total |
+|------|-------|--------|-----------|-------|
+| Padavu | 3200 | 450 | 120 | 3770 |
+
+Use tables for: ward comparisons, voter counts, religion breakdowns, scheme beneficiary lists,
+booth-wise data, any multi-column data, metrics, rankings, before/after comparisons.
+NEVER present structured data as raw pipe text without the separator (---|---) row.
+
+### Charts — include when a visual trend or distribution helps:
 ```chartspec
 {"type":"bar","title":"...","labels":[...],"datasets":[{"label":"...","data":[...]}]}
 ```
 Supported types: bar, line, pie, doughnut, radar, stackedBar
 
-When user asks for a downloadable file, include:
+### Exports — include when user asks for a downloadable file:
 ```exportspec
 {"format":"csv","filename":"analysis.csv","columns":["Col1","Col2"],"rows":[{"Col1":"v1","Col2":"v2"}]}
 ```
@@ -5986,7 +6025,12 @@ def api_ai_chat(request):
         return _ai_err(request, 'message field is required.', 400)
 
     # Build context
-    if include_data:
+    # Skip heavy DB / file loading for simple greetings or conversational messages.
+    # This saves 1-3 s of DB round-trips and prevents the AI from citing voter
+    # data in response to "hi", "thanks", etc.
+    _skip_data = not include_data or _is_simple_message(message)
+
+    if not _skip_data:
         try:
             mongo_ctx, mongo_sources = _ai_load_mongo_context()
         except Exception as e:
@@ -5997,7 +6041,8 @@ def api_ai_chat(request):
             file_ctx, file_sources = f'File error: {e}', []
         all_sources = mongo_sources + file_sources
     else:
-        mongo_ctx = file_ctx = 'Disabled.'
+        mongo_ctx   = 'Not loaded — no data context needed for this message.'
+        file_ctx    = 'Not loaded — no data context needed for this message.'
         all_sources = []
 
     system_prompt = (
