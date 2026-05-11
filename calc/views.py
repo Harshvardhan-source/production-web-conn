@@ -6418,18 +6418,29 @@ def api_swot_overview(request):
         client = _get_anthropic()
         message = client.messages.create(
             model      = "claude-haiku-4-5",
-            max_tokens = 900,
+            max_tokens = 1500,           # raised: 900 was causing JSON truncation mid-response
             system     = system_prompt,
             messages   = [{"role": "user", "content": user_prompt}],
         )
         raw = "".join(b.text for b in message.content if hasattr(b, "text")).strip()
-        raw = raw.lstrip("```json").lstrip("```").rstrip("```").strip()
+
+        # ── Strip markdown fences properly (lstrip/rstrip work on char sets, not substrings) ──
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)   # leading ```json or ```
+        raw = re.sub(r'\s*```$',          '', raw)   # trailing ```
+        raw = raw.strip()
+
+        # ── If model added preamble/postamble, extract the JSON object ──
+        m = re.search(r'\{[\s\S]*\}', raw)
+        if m:
+            raw = m.group(0)
+
         try:
             overview = json.loads(raw)
         except json.JSONDecodeError:
+            # Last-resort: return a clean error object (no raw JSON leaked into fields)
             overview = {
                 "headline": f"{TAB_TITLES.get(tab, tab)} — Analysis",
-                "summary":  raw[:400] if raw else "Could not parse structured response.",
+                "summary":  "The AI response could not be parsed. Please regenerate.",
                 "bullets":  [],
                 "callout":  None,
             }
