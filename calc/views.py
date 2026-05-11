@@ -5897,6 +5897,86 @@ def api_ward_places(request):
     return _places_cors(request, JsonResponse({'success': False, 'message': 'Method not allowed.'}, status=405))
 
 
+@csrf_exempt
+@require_http_methods(['GET', 'OPTIONS'])
+def api_local_places_summary(request):
+    """
+    GET /api/local-places-summary/
+    Returns constituency-wide counts + full list of all local places,
+    grouped by type and ward, for the Dashboard overview panel.
+
+    Response:
+    {
+      "success": true,
+      "total": 42,
+      "counts": { "club": 10, "temple": 18, "church": 8, "mosque": 6 },
+      "byWard": [
+        { "ward": 28, "wardName": "MANNAGUDDA",
+          "places": [{"_id":"..","type":"club","name":"..","address":".."},...],
+          "counts": { "club":1, "temple":2, "church":0, "mosque":0 } },
+        ...
+      ]
+    }
+    """
+    if request.method == 'OPTIONS':
+        resp = JsonResponse({})
+        origin = request.META.get('HTTP_ORIGIN', '')
+        if origin:
+            resp['Access-Control-Allow-Origin']      = origin
+            resp['Access-Control-Allow-Credentials'] = 'true'
+            resp['Access-Control-Allow-Methods']     = 'GET, OPTIONS'
+            resp['Access-Control-Allow-Headers']     = 'Content-Type, Authorization, X-CSRFToken'
+        return resp
+
+    try:
+        user = _user_from_request(request)
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Auth error: {e}'}, status=500)
+    if not user:
+        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+    if not _is_approved(user):
+        return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
+
+    try:
+        coll = get_survey_db()['WardData']
+        docs = list(coll.find(
+            {'record_type': 'local_place'},
+            {'_id': 1, 'ward': 1, 'wardName': 1, 'type': 1, 'name': 1, 'address': 1}
+        ).sort([('ward', 1), ('type', 1), ('name', 1)]))
+
+        for d in docs:
+            d['_id'] = str(d['_id'])
+
+        type_counts = {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0}
+        for d in docs:
+            t = d.get('type', '')
+            if t in type_counts:
+                type_counts[t] += 1
+
+        ward_map = {}
+        for d in docs:
+            ward  = d.get('ward', 0)
+            wname = d.get('wardName', f'Ward {ward}')
+            if ward not in ward_map:
+                ward_map[ward] = {
+                    'ward': ward, 'wardName': wname, 'places': [],
+                    'counts': {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0},
+                }
+            ward_map[ward]['places'].append(d)
+            t = d.get('type', '')
+            if t in ward_map[ward]['counts']:
+                ward_map[ward]['counts'][t] += 1
+
+        by_ward = sorted(ward_map.values(), key=lambda w: w['ward'])
+
+        return JsonResponse({
+            'success': True, 'total': len(docs),
+            'counts': type_counts, 'byWard': by_ward,
+        })
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': str(e)}, status=500)
+
+
 import threading as _threading
 
 # Cache: (fname, mtime, size) → file_id string
