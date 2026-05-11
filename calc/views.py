@@ -6320,7 +6320,7 @@ def _ai_make_export(spec, fmt):
 # ── Views ─────────────────────────────────────────────────────────────────────
 
 @csrf_exempt
-@require_http_methods(["POST"])
+@require_http_methods(["POST", "OPTIONS"])
 def api_swot_overview(request):
     """
     POST /api/ai/swot-overview/
@@ -6329,20 +6329,24 @@ def api_swot_overview(request):
     The frontend serialises the exact data arrays shown in that tab and sends it here.
     Claude analyses that data directly — no MongoDB lookup needed.
     """
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        return _ai_cors(request, JsonResponse({}))
+
     user = _user_from_request(request)
     if not user:
-        return JsonResponse({"error": "Unauthorized"}, status=401)
+        return _ai_cors(request, JsonResponse({"error": "Unauthorized"}, status=401))
 
     try:
         body = json.loads(request.body)
     except Exception:
-        return JsonResponse({"error": "Invalid JSON"}, status=400)
+        return _ai_cors(request, JsonResponse({"error": "Invalid JSON"}, status=400))
 
     tab      = (body.get("tab")     or "swot").strip().lower()
     tab_data = (body.get("tabData") or "").strip()
 
     if not tab_data:
-        return JsonResponse({"error": "tabData is required"}, status=400)
+        return _ai_cors(request, JsonResponse({"error": "tabData is required"}, status=400))
 
     TAB_TITLES = {
         "swot":        "Political SWOT Analysis",
@@ -6429,10 +6433,10 @@ def api_swot_overview(request):
                 "bullets":  [],
                 "callout":  None,
             }
-        return JsonResponse({"success": True, "overview": overview})
+        return _ai_cors(request, JsonResponse({"success": True, "overview": overview}))
     except Exception as exc:
         traceback.print_exc()
-        return JsonResponse({"error": str(exc)}, status=500)
+        return _ai_cors(request, JsonResponse({"error": str(exc)}, status=500))
 
 @csrf_exempt
 @require_http_methods(['POST', 'GET', 'OPTIONS'])
