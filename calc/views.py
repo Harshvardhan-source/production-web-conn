@@ -6244,11 +6244,10 @@ def _ai_make_export(spec, fmt):
 def api_swot_overview(request):
     """
     POST /api/ai/swot-overview/
-    Body: { "tab": "swot" | "wards" | "demographic" | "election" }
+    Body: { "tab": "swot"|"wards"|"demographic"|"election", "tabData": "<serialised tab data>" }
 
-    Returns a concise AI-generated overview for a specific SWOT page tab,
-    grounded in Mangaluru South 2023 election data.
-    Response: { "success": true, "overview": { "headline", "summary", "bullets", "callout" } }
+    The frontend serialises the exact data arrays shown in that tab and sends it here.
+    Claude analyses that data directly — no MongoDB lookup needed.
     """
     user = _user_from_request(request)
     if not user:
@@ -6259,109 +6258,101 @@ def api_swot_overview(request):
     except Exception:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
-    tab = (body.get("tab") or "swot").strip().lower()
+    tab      = (body.get("tab")     or "swot").strip().lower()
+    tab_data = (body.get("tabData") or "").strip()
 
-    TAB_CONTEXTS = {
-        "swot": (
-            "Political SWOT Analysis tab for Mangaluru City South MCC (38 wards, 2,46,952 voters, 2023 election).\n"
-            "KEY FACTS:\n"
-            "- BJP won 25/38 wards (65.8%), Congress 13/38\n"
-            "- BJP vote share 56.1% vs Congress 42.0% (overall)\n"
-            "- 3 NARROW BJP wins: Attavara +9.9%, Mangaladevi +9.8%, Padav East +7.5%\n"
-            "- 3 flippable Congress wards: Shivabagh −4.8% (183 vote gap), Court −11% (turnout), Bajal −11.4%\n"
-            "- BJP strongholds: Kambla 80.1%, Mannagudda 79.3%, Central 78.2%, Boloor 71.3%\n"
-            "- Congress strongholds: Kudroli −41.2%, Bendoor −39.4%, Falnir −34.0%\n"
-            "- Unpolled voter opportunity: ~38,000 registered voters did not vote in 2023\n"
-            "- Total votes: BJP 66,451 vs Congress 89,998 (Congress raw surplus but geographically inefficient)\n"
-            "Generate a strategic political overview of this SWOT analysis."
-        ),
-        "wards": (
-            "Ward Strength Analysis tab for Mangaluru City South (38 wards, 2023 MCC election).\n"
-            "KEY FACTS:\n"
-            "- 8 STRONG BJP wins (>40% lead): Kambla 80.1%, Mannagudda 79.3%, Central 78.2%, Boloor 71.3%, Dongarakery 71.3%, Derebail Nairuthya 71.8%, Kadri North 72.0%, Padav West 69.8%\n"
-            "- 14 MEDIUM BJP wins (10–40% lead): avg lead ~25%, includes Bejai 21.1%, Kankanady 25.2%, Bolar 26.2%\n"
-            "- 3 NARROW BJP wins (<10% lead): Attavara +9.9%, Mangaladevi +9.8%, Padav East +7.5%\n"
-            "- 13 Congress wins: 5 unwinnable (Muslim majority), 5 lost (−8% to −25%), 3 flippable\n"
-            "- AVG polling wards (below 60% turnout): Court 48.8%, Milagress 55.4%, Bendoor 56.9%, Falnir 58.8%\n"
-            "- STRONG polling wards: Bengre 71.6%, Bajal 69.5%, Padav West 70.9%, Boloor 73.0%\n"
-            "Generate a strategic overview of ward-by-ward strength patterns."
-        ),
-        "demographic": (
-            "Demographic Analysis tab for Mangaluru City South (booth-level religion analysis, 2023).\n"
-            "KEY FACTS:\n"
-            "- Muslim-dominant booths: 18 booths with 60–100% Muslim population\n"
-            "  BJP avg in these booths: ~12%, Congress ~85%. 8 classified 'Unwinnable' for BJP.\n"
-            "  Highest Muslim: Bengre Booth 97 (100% Muslim), BJP only 4.6%\n"
-            "- Christian-dominant booths: 15 booths with 40–96% Christian population\n"
-            "  BJP avg in these: ~28%. Falnir Booth 158 (96% Christian): BJP only 12.5%\n"
-            "- Hindu-majority wards: BJP averages 68–80%. Kambla (93% Hindu) BJP 80.1%.\n"
-            "- Muslim voters: ~18% citywide. Christian voters: ~10% citywide. Hindu: ~72%.\n"
-            "- Minority consolidation: Congress captures 85–95% of Muslim votes, 55–70% of Christian votes.\n"
-            "- Key swing: Catholic/Christian voters — split ~50/50 in Modi wave elections, 35/65 in local elections.\n"
-            "Generate a strategic overview of the demographic voting patterns."
-        ),
-        "election": (
-            "Previous Election Analysis tab for Mangaluru City South (2013–2023, 5 elections, 38 wards).\n"
-            "KEY FACTS:\n"
-            "- 2013 (ULB): Congress won 25 wards — BJP had KJP split (rebel factor)\n"
-            "- 2014 (ULB): BJP won 26 wards — Modi wave, +15% avg surge, Hindu consolidation\n"
-            "- 2018 (ULB): BJP won 25 wards — consolidation after reunification\n"
-            "- 2019 (LS Lok Sabha): BJP peak — all wards showed +8–15% higher than MLA avg\n"
-            "- 2023 (MLA): BJP won 25 wards — but 36 booths flipped BJP→Congress vs 2018\n"
-            "- Critical swing: 2019→2023 avg BJP drop of −7.8% across 18 wards (anti-incumbency gap)\n"
-            "- Bengre IMPLOSION: BJP 80.1% in 2018 → 12.2% in 2023 (−67.9% in Booth 98)\n"
-            "- Bajal COLLAPSE: BJP 53% in 2018 → 8.3% in 2023 at key booths\n"
-            "- 3 booths winnable via 3rd-party consolidation: Attavara-222 (2 vote gap), Cantonment-146 (3 votes), Padav Central-42 (5 votes)\n"
-            "- 14 ironclad BJP wards: won all 3+ elections (2014, 2018, 2023)\n"
-            "- 18 structural Congress booths: won 4/4 elections — cannot be flipped in one election cycle\n"
-            "Generate a strategic overview of the historical election trend analysis."
-        ),
-    }
-
-    context = TAB_CONTEXTS.get(tab, TAB_CONTEXTS["swot"])
+    if not tab_data:
+        return JsonResponse({"error": "tabData is required"}, status=400)
 
     TAB_TITLES = {
-        "swot": "Political SWOT Analysis",
-        "wards": "Ward Strength Analysis",
+        "swot":        "Political SWOT Analysis",
+        "wards":       "Ward Strength Analysis",
         "demographic": "Demographic Analysis",
-        "election": "Previous Election History",
+        "election":    "Previous Election History",
+    }
+
+    TAB_FOCUS = {
+        "swot": (
+            "Analyse the complete Political SWOT for Mangaluru City South. "
+            "Focus on: BJP vs Congress ward results, vote shares, narrow wins at risk, "
+            "flip opportunities, strongholds, SWOT quadrant insights, and 2028 priorities. "
+            "Every insight must cite a real ward name, percentage, or vote count from the data."
+        ),
+        "wards": (
+            "Analyse ward-by-ward electoral strength for Mangaluru City South. "
+            "Focus on: strong vs narrow vs lost ward patterns, turnout performance (STRONG vs AVG polling), "
+            "which wards are most at risk, which need turnout push, and the overall distribution. "
+            "Cite specific ward names, BJP%, turnout figures from the data."
+        ),
+        "demographic": (
+            "Analyse the religion-wise demographic voting patterns for Mangaluru City South. "
+            "Focus on: Muslim-dominant booth patterns, Christian-dominant booth swing behaviour, "
+            "ward viability by religious composition, minority consolidation vs BJP performance, "
+            "and which demographic segments are persuadable. "
+            "Cite actual booth numbers, Muslim%, Christian%, BJP% from the data."
+        ),
+        "election": (
+            "Analyse the 5-election historical trend for Mangaluru City South (2013-2023). "
+            "Focus on: which wards are structurally BJP vs structurally Congress across elections, "
+            "which wards showed dangerous swings (Bengre, Bajal), booth flip patterns, "
+            "vote leakage via 3rd parties, variance/stability scores, and 2028 outlook. "
+            "Cite specific elections, ward names, swing percentages, and booth numbers from the data."
+        ),
     }
 
     system_prompt = (
-        "You are a senior political analyst for Mangaluru South constituency (Karnataka, India). "
-        "Based on the election data provided, generate a concise strategic overview. "
-        "Return ONLY a valid JSON object — no markdown, no preamble, no trailing text. "
-        "Schema:\n"
-        '{"headline":"A sharp 10-15 word strategic headline for this tab","summary":"2-3 sentence plain-language strategic summary",'
-        '"bullets":['
-        '{"icon":"🎯","text":"Key insight or action point, 1-2 sentences"},'
-        '{"icon":"⚠️","text":"Key risk or vulnerability, 1-2 sentences"},'
-        '{"icon":"📈","text":"Key opportunity or trend, 1-2 sentences"},'
-        '{"icon":"🔑","text":"Single most critical strategic priority, 1-2 sentences"}],'
-        '"callout":{"label":"Bottom-line verdict","text":"1 sentence — the single most important takeaway for 2028 campaign strategy","color":"#f59e0b or #10b981 or #ef4444 or #22d3ee"}}'
+        "You are a senior political analyst for Mangaluru South constituency (Karnataka, India), "
+        "Constituency 175, Mangaluru City Municipal Corporation — 38 wards, 2023 election data.\n\n"
+        f"TASK: {TAB_FOCUS.get(tab, TAB_FOCUS['swot'])}\n\n"
+        "The user has provided the exact data from the tab they are viewing. "
+        "Analyse only what is in the data. Do not invent numbers or reference data not provided.\n\n"
+        "Return ONLY a valid JSON object — no markdown fences, no preamble, no trailing text.\n"
+        "Schema (all fields required, every field must contain real data from the input):\n"
+        '{\n'
+        '  "headline": "10-15 word headline — must cite a real number or ward name from the data",\n'
+        '  "summary": "2-3 sentence strategic summary — must reference specific ward names, %, or vote counts",\n'
+        '  "bullets": [\n'
+        '    {"icon":"🎯","text":"Key insight with a real ward/booth name and number"},\n'
+        '    {"icon":"⚠️","text":"Key risk — cite the specific ward or booth and its margin"},\n'
+        '    {"icon":"📈","text":"Key opportunity — cite specific numbers from the data"},\n'
+        '    {"icon":"🔑","text":"Single most critical 2028 action — specific and measurable"}\n'
+        '  ],\n'
+        '  "callout": {\n'
+        '    "label": "Bottom-line verdict",\n'
+        '    "text": "1 sentence with the single most important takeaway, citing a real number",\n'
+        '    "color": "#f59e0b"\n'
+        '  }\n'
+        '}'
     )
 
-    user_prompt = f"Tab: {TAB_TITLES.get(tab, tab)}\n\nData context:\n{context}"
+    user_prompt = (
+        f"Tab: {TAB_TITLES.get(tab, tab)}\n\n"
+        f"=== TAB DATA (exact data shown in this tab) ===\n{tab_data}"
+    )
 
     try:
         client = _get_anthropic()
         message = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=800,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
+            model      = "claude-haiku-4-5",
+            max_tokens = 900,
+            system     = system_prompt,
+            messages   = [{"role": "user", "content": user_prompt}],
         )
         raw = "".join(b.text for b in message.content if hasattr(b, "text")).strip()
         raw = raw.lstrip("```json").lstrip("```").rstrip("```").strip()
         try:
             overview = json.loads(raw)
         except json.JSONDecodeError:
-            overview = {"_raw": raw, "headline": "Analysis ready", "summary": raw[:300], "bullets": [], "callout": None}
+            overview = {
+                "headline": f"{TAB_TITLES.get(tab, tab)} — Analysis",
+                "summary":  raw[:400] if raw else "Could not parse structured response.",
+                "bullets":  [],
+                "callout":  None,
+            }
         return JsonResponse({"success": True, "overview": overview})
     except Exception as exc:
         traceback.print_exc()
         return JsonResponse({"error": str(exc)}, status=500)
-
 
 @csrf_exempt
 @require_http_methods(['POST', 'GET', 'OPTIONS'])
