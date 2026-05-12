@@ -4888,9 +4888,26 @@ def api_ai_query_insight(request):
         '{"ctx":"Economic","signal":"S/W/O/T/N","color":"#10b981","note":"1 line"},'
         '{"ctx":"Health","signal":"S/W/O/T/N","color":"#22d3ee","note":"1 line"},'
         '{"ctx":"Political","signal":"S/W/O/T/N","color":"#f59e0b","note":"1 line"}]},'
-        '"recommendation":"One specific actionable recommendation for 2028",'
+        '"schemes":['
+        '{"name":"<Exact Karnataka/Central government scheme name>","reason":"<1 sentence why this segment qualifies>","ministry":"<Ministry or Dept>","impact":"High/Medium/Low"},'
+        '{"name":"<scheme 2>","reason":"<reason>","ministry":"<ministry>","impact":"High/Medium/Low"},'
+        '{"name":"<scheme 3>","reason":"<reason>","ministry":"<ministry>","impact":"High/Medium/Low"}],'
+        '"recommendation":"One specific actionable recommendation for 2028 campaign strategy",'
         '"riskLevel":"Low/Medium/High/Critical",'
         '"riskColor":"#10b981 or #f59e0b or #fb923c or #f87171"}'
+        "\n\nFor the schemes field: suggest 2-4 REAL Karnataka state or Central government welfare schemes "
+        "that are directly applicable to this voter segment based on their demographic (economic status, "
+        "health conditions, employment, education, religion, gender). "
+        "Examples by category:\n"
+        "- APL/BPL: PM Awas Yojana, Pradhan Mantri Jan Dhan Yojana, Atal Pension Yojana\n"
+        "- Health: Ayushman Bharat PM-JAY, Karnataka Arogya Karnataka Scheme, PM Jan Arogya Yojana\n"
+        "- Unemployment: PM Kaushal Vikas Yojana, MGNREGA, Startup Karnataka\n"
+        "- Farmers: PM Kisan Samman Nidhi, Krishi Bhagya, Soil Health Card\n"
+        "- Women: PM Ujjwala Yojana, Stree Shakti, Mathru Poorna\n"
+        "- Elderly: Indira Gandhi National Old Age Pension, Atal Vayo Abhyuday\n"
+        "- SC/ST: Post Matric Scholarship, Ambedkar Avas Yojana\n"
+        "- Education: PM Scholarship, Vidyasiri, Rajiv Gandhi Scholarship\n"
+        "Only suggest schemes that genuinely match the segment's query filters."
     )
 
     try:
