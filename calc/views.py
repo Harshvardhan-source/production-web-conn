@@ -6344,7 +6344,10 @@ def api_swot_overview(request):
     if request.method == 'OPTIONS':
         return _ai_cors(request, JsonResponse({}))
 
-    user = _user_from_request(request)
+    try:
+        user = _user_from_request(request)
+    except Exception as e:
+        return _ai_cors(request, JsonResponse({"error": f"Auth error: {e}"}, status=500))
     if not user:
         return _ai_cors(request, JsonResponse({"error": "Unauthorized"}, status=401))
 
@@ -6428,7 +6431,7 @@ def api_swot_overview(request):
     try:
         client = _get_anthropic()
         message = client.messages.create(
-            model      = "claude-haiku-4-5",
+            model      = "claude-haiku-4-5-20251001",
             max_tokens = 1500,           # raised: 900 was causing JSON truncation mid-response
             system     = system_prompt,
             messages   = [{"role": "user", "content": user_prompt}],
@@ -6512,7 +6515,7 @@ def api_ai_chat(request):
         msgs.append({'role': 'user', 'content': message})
         try:
             response   = client.messages.create(
-                model='claude-haiku-4-5', max_tokens=256,
+                model='claude-haiku-4-5-20251001', max_tokens=256,
                 system=_simple_system, messages=msgs,
             )
             reply_text = ''.join(b.text for b in response.content if hasattr(b,'text'))
