@@ -6579,11 +6579,14 @@ def api_ai_chat(request):
             system     = system_prompt,
             messages   = messages,
         )
-        # Files API requires the files-api beta header
+        # Files API requires beta client — betas param only works on client.beta.messages.create()
         if doc_blocks:
-            kwargs['betas'] = ['files-api-2025-04-14']
-
-        response   = client.messages.create(**kwargs)
+            response = client.beta.messages.create(
+                **kwargs,
+                betas=['files-api-2025-04-14'],
+            )
+        else:
+            response = client.messages.create(**kwargs)
         reply_text = ''.join(b.text for b in response.content if hasattr(b,'text'))
     except Exception as e:
         traceback.print_exc()
