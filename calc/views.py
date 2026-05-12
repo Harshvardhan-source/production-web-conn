@@ -4888,9 +4888,20 @@ def api_ai_query_insight(request):
         '{"ctx":"Economic","signal":"S/W/O/T/N","color":"#10b981","note":"1 line"},'
         '{"ctx":"Health","signal":"S/W/O/T/N","color":"#22d3ee","note":"1 line"},'
         '{"ctx":"Political","signal":"S/W/O/T/N","color":"#f59e0b","note":"1 line"}]},'
+        '"suggestedSchemes":['
+        '{"name":"Scheme name (central or state)","ministry":"Ministry/Department","relevance":"Why it applies to this voter segment","impact":"High/Medium/Low"},'
+        '{"name":"Another applicable scheme","ministry":"Ministry/Department","relevance":"Why it applies","impact":"High/Medium/Low"}'
+        '],'
         '"recommendation":"One specific actionable recommendation for 2028",'
         '"riskLevel":"Low/Medium/High/Critical",'
-        '"riskColor":"#10b981 or #f59e0b or #fb923c or #f87171"}'
+        '"riskColor":"#10b981 or #f59e0b or #fb923c or #f87171"}\n\n'
+        "For suggestedSchemes: include 2-4 real central/state government schemes (Karnataka or India) "
+        "that are most applicable to this voter segment based on their demographic filters "
+        "(economic status, employment, health, education, religion, community). "
+        "Examples: PM-KISAN for farmers, Ayushman Bharat for health, PM Awas Yojana for housing, "
+        "Skill India for unemployed youth, PM Ujjwala for BPL women, MGNREGS for rural labour, "
+        "Karnataka Rajiv Gandhi Housing Corp schemes, Devaraj Urs BC Corporation loans, etc. "
+        "Only suggest schemes genuinely relevant to the segment's filters."
     )
 
     try:
