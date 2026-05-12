@@ -5428,7 +5428,7 @@ _AI_CSV_MAX_ROWS      = 3000      # rows read from csv
 _AI_PDF_MAX_PAGES     = 30        # pages from pdf
 _AI_CHARS_PER_FILE    = 80_000    # ~20k tokens — max chars extracted per file
 _AI_TOTAL_CHARS_FILES = 320_000   # ~80k tokens — total chars across ALL files
-_AI_MAX_FILES         = 30        # max number of files loaded per request
+_AI_MAX_FILES         = 5         # max files per request — keep well under 200k token limit
 
 
 # ── CORS + error helpers ──────────────────────────────────────────────────────
