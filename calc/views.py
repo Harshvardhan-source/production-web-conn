@@ -21,6 +21,7 @@ from bson import ObjectId
 import ast
 import jwt as pyjwt
 import threading
+import anthropic as _anthropic_mod
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # WARD REFERENCE — SINGLE SOURCE OF TRUTH
@@ -4785,17 +4786,10 @@ def api_ml_constituency_swot(request):
 _ANTHROPIC_CLIENT = None
 
 def _get_anthropic():
-    """Lazy-init Anthropic client. Import is deferred so a missing package only
-    errors when an AI endpoint is actually called, not at Django startup."""
+    """Init Anthropic client once and reuse. anthropic is imported at module
+    level so it is fully loaded before any request arrives."""
     global _ANTHROPIC_CLIENT
     if _ANTHROPIC_CLIENT is None:
-        try:
-            import anthropic as _anthropic_mod
-        except ImportError:
-            raise ImportError(
-                "The 'anthropic' package is required for AI endpoints. "
-                "Add 'anthropic' to requirements.txt and redeploy."
-            )
         import os
         api_key = (
             getattr(settings, 'ANTHROPIC_API_KEY', None)
@@ -5453,16 +5447,13 @@ def _ai_err(request, msg, status=500):
 
 def _ai_get_client():
     try:
-        import anthropic as _ant
         api_key = (
             getattr(settings, 'ANTHROPIC_API_KEY', None)
             or _os2.environ.get('ANTHROPIC_API_KEY', '')
         )
         if not api_key:
             return None, 'ANTHROPIC_API_KEY not set in Render environment variables.'
-        return _ant.Anthropic(api_key=api_key), None
-    except ImportError:
-        return None, 'anthropic package not installed. Add "anthropic" to requirements.txt.'
+        return _anthropic_mod.Anthropic(api_key=api_key), None
     except Exception as e:
         return None, f'Anthropic client error: {e}'
 
