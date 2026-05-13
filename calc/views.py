@@ -6482,9 +6482,53 @@ def _get_or_upload_file(client, fname: str, path: str) -> tuple:
         return None, fname, None
 
 
-def _ai_load_files_api(client) -> tuple:
+# ── Keyword → file selector ───────────────────────────────────────────────────
+# Token budget: 200k - 4096 output - ~40k overhead = ~156k for files
+# TIER1 alone = 151,250 tokens → 97.7% of window, safe.
+# Extra files only load if a specific keyword is detected AND budget allows.
+
+_TIER1_FILES = {
+    '2023p.xlsx',
+    'Mangaluru_FULLSCALE_Analysis_v2.xlsx',
+    'Mangaluru_Election_Strategy_Report.xlsx',
+}
+
+# Remaining token budget after Tier1 = ~4,504 — only tiny files fit
+# Add keyword-triggered extras only when budget allows
+_KW_FILES = {
+    r'2019|lok sabha':          ('2019_full_data4.xlsx',              7938),
+    r'strategy|wsi|gameplan|intel': ('BJP_Political_Intelligence_System.xlsx', 12672),
+    r'caste|community|turnout': ('BJP_Boothwise_CasteReligion_Turnout_Strategy.xlsx', 19471),
+    r'2018':                    ('2018_WARD_WISE_STATISTICAL_ANALYSIS__BOOTHWISE_SEGREGATION_FINAL.xlsx', 29746),
+    r'2014':                    ('2014_STATISTICAL_ANALYSIS.xlsx',    21922),
+    r'2013':                    ('2013_WARD_WISE_STATISTICAL_ANALYSIS.xlsx', 17397),
+}
+_FILE_TOKEN_BUDGET = 155_000   # hard ceiling — never exceed this
+
+def _select_files_for_message(message: str) -> list:
+    """Return ordered list of filenames to load, respecting token budget."""
+    ml      = message.lower() if message else ''
+    selected = list(_TIER1_FILES)
+    used     = sum(t for kw, (fn, t) in _KW_FILES.items() if fn in _TIER1_FILES)
+    # Recalculate tier1 actual tokens
+    tier1_tok = 87_570 + 35_037 + 28_643   # 151,250
+    used = tier1_tok
+
+    for pattern, (fname, ftok) in _KW_FILES.items():
+        if fname in selected:
+            continue
+        if re.search(pattern, ml) and (used + ftok) <= _FILE_TOKEN_BUDGET:
+            selected.append(fname)
+            used += ftok
+
+    return selected
+
+
+def _ai_load_files_api(client, message: str = '') -> tuple:
     """
-    Upload all files in backend/data/ to Anthropic Files API.
+    Upload files in backend/data/ to Anthropic Files API.
+    Only loads files selected by _select_files_for_message() to stay
+    within the 200k context window.
     Returns (document_blocks, files_used, fallback_text).
     """
     document_blocks = []
@@ -6494,17 +6538,15 @@ def _ai_load_files_api(client) -> tuple:
     if not _os2.path.isdir(_AI_DATA_DIR):
         return [], [], ''
 
+    # Which files to load for this specific message
+    wanted   = set(_select_files_for_message(message))
     all_files = sorted(_os2.listdir(_AI_DATA_DIR))
-    loaded    = 0
 
     for fname in all_files:
-        if loaded >= _AI_MAX_FILES:
-            break
-
-        ext = _os2.path.splitext(fname)[1].lower()
-        if ext not in (_AI_SUPPORTED_EXTS | set(_FILES_API_MIME.keys()) | _FILES_API_CONVERT):
+        if fname not in wanted:
             continue
 
+        ext  = _os2.path.splitext(fname)[1].lower()
         path = _os2.path.join(_AI_DATA_DIR, fname)
         fid, display, mime = _get_or_upload_file(client, fname, path)
 
@@ -6520,7 +6562,6 @@ def _ai_load_files_api(client) -> tuple:
                 ),
             })
             files_used.append(fname)
-            loaded += 1
         else:
             # Fallback — inline text extraction
             print(f'[Files API] Falling back to inline text for: {fname}')
@@ -6539,17 +6580,15 @@ def _ai_load_files_api(client) -> tuple:
                 excerpt = raw[:_AI_CHARS_PER_FILE]
                 fallback_parts.append(f'===== FILE: {fname} =====\n{excerpt}')
                 files_used.append(fname + ' (inline)')
-                loaded += 1
             except Exception as e:
                 print(f'[Files API] Inline fallback also failed for {fname}: {e}')
 
     fallback_text = '\n\n'.join(fallback_parts)
     print(f'[Files API] Ready: {len(document_blocks)} via Files API, '
-          f'{len(fallback_parts)} inline fallbacks')
+          f'{len(fallback_parts)} inline fallbacks '
+          f'(wanted: {sorted(wanted)})')
     return document_blocks, files_used, fallback_text
 
-
-# ── Legacy inline readers (fallback when Files API upload fails) ──────────────
 
 def _ai_read_csv_stream(path):
     try:
@@ -6967,7 +7006,7 @@ def api_ai_chat(request):
         mongo_ctx = f'MongoDB error: {e}'
 
     try:
-        doc_blocks, file_sources, fallback_txt = _ai_load_files_api(client)
+        doc_blocks, file_sources, fallback_txt = _ai_load_files_api(client, message)
         all_sources.extend(file_sources)
     except Exception as e:
         print(f'[Files API] Error in _ai_load_files_api: {e}')
@@ -7375,4 +7414,3 @@ def api_local_places_summary(request):
         })
     except Exception as e:
         return JsonResponse({'success': False, 'message': str(e)}, status=500)
-
