@@ -5372,30 +5372,30 @@ def api_admin_location_dates(request):
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # Context budget (claude-sonnet-4-20250514 has 200k token window):
-#   MongoDB summaries   : ~10,000 tokens  (always included)
-#   Data folder files   : up to ~80,000 tokens total across all files
+#   MongoDB summaries   : ~15,000 tokens  (always included — 15 collections)
+#   Data folder files   : up to ~100,000 tokens via Files API (upload once, reuse)
 #   Conversation history: up to 20 turns
-#   System prompt text  : ~2,000 tokens
+#   System prompt text  : ~3,000 tokens
 #   AI response         : 4,096 tokens (max_tokens)
 #
-# File reading strategy per format:
-#   .xlsx / .xls  — openpyxl read_only streaming (no RAM spike regardless of size)
-#                   reads ALL rows up to _AI_EXCEL_MAX_ROWS per sheet
+# File RAG strategy:
+#   .xlsx / .xls  — smart chunker: per-sheet metadata headers + clean CSV rows
+#                   (replaces flat dump — model knows exactly what each sheet is)
 #   .csv          — pandas chunked read, up to _AI_CSV_MAX_ROWS rows
 #   .pdf          — PyMuPDF page-by-page, up to _AI_PDF_MAX_PAGES
 #   .docx         — python-docx paragraph extraction, full document
 #   .txt          — direct read
 #
-# Each file's extracted text is capped at _AI_CHARS_PER_FILE characters
-# before being added to the prompt. Total across all files capped at
-# _AI_TOTAL_CHARS_FILES characters (~60k tokens).
-#
-# There is NO file size limit — even a 1 GB xlsx is safe because openpyxl
-# read_only mode streams one row at a time and we stop after _AI_EXCEL_MAX_ROWS.
+# MongoDB RAG strategy:
+#   15 context builders run in PARALLEL via ThreadPoolExecutor
+#   Each builder covers one collection with lightweight $facet aggregations
+#   Any builder failure is caught and logged — never crashes the request
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import io as _io
 import os as _os2
+import re as _re2
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import fitz as _fitz
@@ -5417,19 +5417,12 @@ except Exception:
     _AI_DATA_DIR = '/tmp/ai_data'
     _os2.makedirs(_AI_DATA_DIR, exist_ok=True)
 
-_AI_SUPPORTED_EXTS = {'.xlsx', '.xls', '.csv', '.pdf', '.docx', '.doc', '.txt'}
-
-# ── Context budget controls ───────────────────────────────────────────────────
-# Tune these to balance coverage vs token cost.
-# 1 token ≈ 4 characters of English text.
-
-_AI_EXCEL_MAX_ROWS    = 2000      # rows per sheet streamed from xlsx (no RAM risk)
-_AI_CSV_MAX_ROWS      = 3000      # rows read from csv
-_AI_PDF_MAX_PAGES     = 30        # pages from pdf
-_AI_CHARS_PER_FILE    = 80_000    # ~20k tokens — max chars extracted per file
-_AI_TOTAL_CHARS_FILES = 320_000   # ~80k tokens — total chars across ALL files
-_AI_MAX_FILES         = 5         # max files per request — keep well under 200k token limit
-
+_AI_SUPPORTED_EXTS    = {'.xlsx', '.xls', '.csv', '.pdf', '.docx', '.doc', '.txt'}
+_AI_CSV_MAX_ROWS      = 3000
+_AI_PDF_MAX_PAGES     = 30
+_AI_CHARS_PER_FILE    = 80_000
+_AI_TOTAL_CHARS_FILES = 320_000
+_AI_MAX_FILES         = 13      # cover all xlsx files in data/
 
 # ── CORS + error helpers ──────────────────────────────────────────────────────
 
@@ -5469,8 +5462,17 @@ def _ai_get_client():
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# MONGODB CONTEXT BUILDERS — lightweight aggregations, no raw row dumps
+# MONGODB CONTEXT BUILDERS — 15 collections, parallel execution
 # ════════════════════════════════════════════════════════════════════════════════
+
+def _safe_count(collection):
+    try:
+        return collection.estimated_document_count()
+    except Exception:
+        return 0
+
+
+# ── Builder 1: 2025 Voter Roll ────────────────────────────────────────────────
 
 def _ai_ctx_voter_roll_summary():
     try:
@@ -5483,12 +5485,12 @@ def _ai_ctx_voter_roll_summary():
         ).sort('number', 1))
 
         lines = ['=== 2025 Voter Roll — Ward-wise Summary ===',
-                 f'Total wards: {len(ward_refs)}',
-                 '',
+                 f'Total wards: {len(ward_refs)}', '',
                  f"{'Ward':>4}  {'Name':<22}  {'Total':>7}  {'Male':>6}  "
                  f"{'Female':>7}  {'Hindu':>6}  {'Muslim':>7}  {'Christian':>9}"]
 
-        grand = {'total':0,'male':0,'female':0,'hindu':0,'muslim':0,'christian':0}
+        grand = {'total': 0, 'male': 0, 'female': 0,
+                 'hindu': 0, 'muslim': 0, 'christian': 0}
         for w in ward_refs:
             t  = w.get('totalCount',     0) or 0
             m  = w.get('totalMale',      0) or 0
@@ -5497,52 +5499,53 @@ def _ai_ctx_voter_roll_summary():
             mu = w.get('totalMuslim',    0) or 0
             c  = w.get('totalChristian', 0) or 0
             lines.append(
-                f"{w.get('number',''):>4}  {w.get('name',''):.<22}  "
+                f"{w.get('number', ''):>4}  {w.get('name', ''):.<22}  "
                 f"{t:>7,}  {m:>6,}  {f:>7,}  {h:>6,}  {mu:>7,}  {c:>9,}"
             )
-            grand['total']    += t; grand['male']  += m; grand['female']    += f
-            grand['hindu']    += h; grand['muslim']+= mu;grand['christian'] += c
+            grand['total']    += t; grand['male']    += m; grand['female']    += f
+            grand['hindu']    += h; grand['muslim']  += mu; grand['christian'] += c
 
         lines.append(
             f"{'TOTAL':>4}  {'':.<22}  "
             f"{grand['total']:>7,}  {grand['male']:>6,}  {grand['female']:>7,}  "
             f"{grand['hindu']:>6,}  {grand['muslim']:>7,}  {grand['christian']:>9,}"
         )
-
         hmc = {r['_id']: r['n'] for r in db['2025'].aggregate([
-            {'$match': {'Predicted_Religion_Label': {'$in': ['H','M','C']}}},
+            {'$match': {'Predicted_Religion_Label': {'$in': ['H', 'M', 'C']}}},
             {'$group': {'_id': '$Predicted_Religion_Label', 'n': {'$sum': 1}}},
         ])}
         lines += ['', 'Predicted Religion Labels (2025 roll):',
-                  f"  Hindu (H)    : {hmc.get('H',0):,}",
-                  f"  Muslim (M)   : {hmc.get('M',0):,}",
-                  f"  Christian (C): {hmc.get('C',0):,}"]
+                  f"  Hindu (H)    : {hmc.get('H', 0):,}",
+                  f"  Muslim (M)   : {hmc.get('M', 0):,}",
+                  f"  Christian (C): {hmc.get('C', 0):,}"]
         return '\n'.join(lines)
     except Exception as e:
         return f'[2025 voter roll summary error: {e}]'
 
 
+# ── Builder 2: Survey Records ─────────────────────────────────────────────────
+
 def _ai_ctx_survey_summary():
     try:
         db  = get_survey_db()
         res = list(db['SurveyRecords'].aggregate([{'$facet': {
-            'total'      : [{'$count': 'n'}],
-            'by_ward'    : [
+            'total'       : [{'$count': 'n'}],
+            'by_ward'     : [
                 {'$match': {'wardNumber': {'$exists': True, '$ne': None, '$ne': ''}}},
                 {'$group': {'_id': {'$toString': '$wardNumber'}, 'count': {'$sum': 1}}},
-                {'$sort':  {'count': -1}}, {'$limit': 40},
+                {'$sort': {'count': -1}}, {'$limit': 40},
             ],
-            'by_religion': [{'$group': {'_id': '$religion',     'n': {'$sum': 1}}}, {'$sort': {'n': -1}}],
-            'by_gender'  : [{'$group': {'_id': '$gender',       'n': {'$sum': 1}}}],
-            'by_economic': [{'$group': {'_id': '$economicStatus','n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 8}],
-            'by_community': [{'$group': {'_id': '$community',   'n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 8}],
-            'by_employment':[{'$group': {'_id': '$employmentStatus','n': {'$sum': 1}}}, {'$sort': {'n': -1}}],
-            'by_health'  : [{'$group': {'_id': '$healthStatus', 'n': {'$sum': 1}}}, {'$sort': {'n': -1}}],
-            'by_education': [{'$group': {'_id': '$education',   'n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 10}],
-            'outstation' : [{'$match': {'outstationResident': 'Yes'}}, {'$count': 'n'}],
-            'party_members':[{'$match': {'partyMember': 'Yes'}}, {'$count': 'n'}],
-            'diff_abled' : [{'$match': {'differentlyAbled': 'Yes'}}, {'$count': 'n'}],
-            'schemes'    : [
+            'by_religion' : [{'$group': {'_id': '$religion',        'n': {'$sum': 1}}}, {'$sort': {'n': -1}}],
+            'by_gender'   : [{'$group': {'_id': '$gender',          'n': {'$sum': 1}}}],
+            'by_economic' : [{'$group': {'_id': '$economicStatus',  'n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 8}],
+            'by_community': [{'$group': {'_id': '$community',       'n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 8}],
+            'by_employment': [{'$group': {'_id': '$employmentStatus','n': {'$sum': 1}}}, {'$sort': {'n': -1}}],
+            'by_health'   : [{'$group': {'_id': '$healthStatus',    'n': {'$sum': 1}}}, {'$sort': {'n': -1}}],
+            'by_education': [{'$group': {'_id': '$education',       'n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 10}],
+            'outstation'  : [{'$match': {'outstationResident': 'Yes'}}, {'$count': 'n'}],
+            'party_members': [{'$match': {'partyMember': 'Yes'}}, {'$count': 'n'}],
+            'diff_abled'  : [{'$match': {'differentlyAbled': 'Yes'}}, {'$count': 'n'}],
+            'schemes'     : [
                 {'$unwind': '$schemesUsed'},
                 {'$group': {'_id': '$schemesUsed', 'n': {'$sum': 1}}},
                 {'$sort': {'n': -1}}, {'$limit': 15},
@@ -5555,22 +5558,22 @@ def _ai_ctx_survey_summary():
 
         lines.append('\nWard-wise Survey Count:')
         for w in res['by_ward']:
-            lines.append(f"  Ward {w['_id']:>3} ({wmap.get(w['_id'],''):.<22}): {w['count']:,}")
+            lines.append(f"  Ward {w['_id']:>3} ({wmap.get(w['_id'], ''):.<22}): {w['count']:,}")
 
         def _section(title, items, key='_id', val='n'):
             lines.append(f'\n{title}:')
             for r in items:
                 if r.get(key):
-                    pct = f" ({round(r[val]/total*100,1)}%)" if total else ''
+                    pct = f" ({round(r[val] / total * 100, 1)}%)" if total else ''
                     lines.append(f"  {str(r[key]):<20}: {r[val]:,}{pct}")
 
-        _section('Religion',          res['by_religion'])
-        _section('Gender',            res['by_gender'])
-        _section('Economic Status',   res['by_economic'])
-        _section('Community',         res['by_community'])
-        _section('Employment',        res['by_employment'])
-        _section('Health Status',     res['by_health'])
-        _section('Education',         res['by_education'])
+        _section('Religion',        res['by_religion'])
+        _section('Gender',          res['by_gender'])
+        _section('Economic Status', res['by_economic'])
+        _section('Community',       res['by_community'])
+        _section('Employment',      res['by_employment'])
+        _section('Health Status',   res['by_health'])
+        _section('Education',       res['by_education'])
 
         out_n = res['outstation'][0]['n']    if res['outstation']    else 0
         pm_n  = res['party_members'][0]['n'] if res['party_members'] else 0
@@ -5590,10 +5593,12 @@ def _ai_ctx_survey_summary():
         return f'[SurveyRecords summary error: {e}]'
 
 
+# ── Builder 3: 2023 Polling Data ──────────────────────────────────────────────
+
 def _ai_ctx_polling_summary():
     try:
-        db    = get_survey_db()
-        rows  = list(db['2023_polled_notpolled'].aggregate([
+        db   = get_survey_db()
+        rows = list(db['2023_polled_notpolled'].aggregate([
             {'$group': {
                 '_id': {'ward': '$Ward', 'rel': '$Religion', 'status': '$Polling status'},
                 'n': {'$sum': 1},
@@ -5604,29 +5609,30 @@ def _ai_ctx_polling_summary():
         if not rows:
             return '[2023 polling data: empty]'
 
-        rel_map  = {'Hindu': 'H', 'Muslim': 'M', 'Christian': 'C'}
+        rel_map   = {'Hindu': 'H', 'Muslim': 'M', 'Christian': 'C'}
         ward_data = {}
         for r in rows:
             ward = r['_id'].get('ward', 'Unknown')
             rk   = rel_map.get(r['_id'].get('rel', ''))
             if not rk:
                 continue
-            ward_data.setdefault(ward, {'H':{}, 'M':{}, 'C':{}})
+            ward_data.setdefault(ward, {'H': {}, 'M': {}, 'C': {}})
             k = 'polled' if r['_id'].get('status') == 'Polled' else 'notPolled'
             ward_data[ward][rk][k] = ward_data[ward][rk].get(k, 0) + r['n']
 
         lines = [f'=== 2023 Election Polling Data ({total:,} voters) ===',
                  f"{'Ward':<26}  {'H-Poll':>7}  {'H-No':>6}  "
-                 f"{'M-Poll':>7}  {'M-No':>6}  {'C-Poll':>7}  {'C-No':>6}  {'H%':>5}  {'M%':>5}  {'C%':>5}"]
+                 f"{'M-Poll':>7}  {'M-No':>6}  {'C-Poll':>7}  {'C-No':>6}  "
+                 f"{'H%':>5}  {'M%':>5}  {'C%':>5}"]
 
         for ward in sorted(ward_data):
-            d  = ward_data[ward]
-            hp = d['H'].get('polled',0); hn = d['H'].get('notPolled',0)
-            mp = d['M'].get('polled',0); mn = d['M'].get('notPolled',0)
-            cp = d['C'].get('polled',0); cn = d['C'].get('notPolled',0)
-            hpct = round(hp/(hp+hn)*100,1) if (hp+hn) else 0
-            mpct = round(mp/(mp+mn)*100,1) if (mp+mn) else 0
-            cpct = round(cp/(cp+cn)*100,1) if (cp+cn) else 0
+            d    = ward_data[ward]
+            hp   = d['H'].get('polled', 0); hn = d['H'].get('notPolled', 0)
+            mp   = d['M'].get('polled', 0); mn = d['M'].get('notPolled', 0)
+            cp   = d['C'].get('polled', 0); cn = d['C'].get('notPolled', 0)
+            hpct = round(hp / (hp + hn) * 100, 1) if (hp + hn) else 0
+            mpct = round(mp / (mp + mn) * 100, 1) if (mp + mn) else 0
+            cpct = round(cp / (cp + cn) * 100, 1) if (cp + cn) else 0
             lines.append(
                 f"{ward:<26}  {hp:>7,}  {hn:>6,}  {mp:>7,}  {mn:>6,}  "
                 f"{cp:>7,}  {cn:>6,}  {hpct:>5}  {mpct:>5}  {cpct:>5}"
@@ -5636,30 +5642,67 @@ def _ai_ctx_polling_summary():
         return f'[2023 polling summary error: {e}]'
 
 
+# ── Builder 4: SIR Analysis ───────────────────────────────────────────────────
+
 def _ai_ctx_sir_summary():
     try:
-        db = get_survey_db()
+        db  = get_survey_db()
+        db2 = get_db()
+
         counts = {
-            'New Additions' : db['SIR_NewAdditions'].count_documents({}),
-            'Deletions'     : db['SIR_Deleted'].count_documents({}),
-            'Modifications' : db['SIR_Modified'].count_documents({}),
-            'Suspicious'    : db['SIR_Suspicious'].count_documents({}),
-            'Retained'      : db['SIR_Retained'].count_documents({}),
-            'Not Found'     : db['SIR_NotFound'].count_documents({}),
+            'New Additions': _safe_count(db['SIR_NewAdditions']),
+            'Not Found'    : _safe_count(db['SIR_NotFound']),
+            'Suspicious'   : _safe_count(db['SIR_Suspicious']),
+            'Genuine'      : _safe_count(db['genuine_voters']),
         }
-        db2   = get_db()
-        v2002 = db['2002'].estimated_document_count()
-        v2025 = db2['2025'].estimated_document_count()
+        for optional in ('SIR_Deleted', 'SIR_Modified', 'SIR_Retained'):
+            try:
+                n = db[optional].estimated_document_count()
+                if n:
+                    counts[optional.replace('SIR_', '')] = n
+            except Exception:
+                pass
+
+        v2002 = _safe_count(db['2002'])
+        v2025 = _safe_count(db2['2025'])
+
         lines = ['=== SIR (Summary Intensive Revision) — 2002 vs 2025 ===',
                  f'2002 voter roll size : {v2002:,}',
                  f'2025 voter roll size : {v2025:,}',
-                 f'Net change          : {v2025-v2002:+,}', '']
+                 f'Net change           : {v2025 - v2002:+,}', '']
         for k, v in counts.items():
             lines.append(f'  {k:<18}: {v:,}')
+
+        try:
+            wa = list(db['SIR_NewAdditions'].aggregate([
+                {'$group': {'_id': '$ward', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}}, {'$limit': 10},
+            ]))
+            if wa:
+                lines.append('\nTop wards by SIR New Additions:')
+                for w in wa:
+                    lines.append(f"  {str(w['_id']):<30}: {w['n']:,}")
+        except Exception:
+            pass
+
+        try:
+            ws = list(db['SIR_Suspicious'].aggregate([
+                {'$group': {'_id': '$ward', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}}, {'$limit': 10},
+            ]))
+            if ws:
+                lines.append('\nTop wards by SIR Suspicious:')
+                for w in ws:
+                    lines.append(f"  {str(w['_id']):<30}: {w['n']:,}")
+        except Exception:
+            pass
+
         return '\n'.join(lines)
     except Exception as e:
         return f'[SIR summary error: {e}]'
 
+
+# ── Builder 5: Booth-wise Counts ─────────────────────────────────────────────
 
 def _ai_ctx_booth_summary():
     try:
@@ -5668,18 +5711,18 @@ def _ai_ctx_booth_summary():
             {'$group': {
                 '_id'   : {'$toString': '$Part No'},
                 'total' : {'$sum': 1},
-                'male'  : {'$sum': {'$cond': [{'$eq': ['$Gender', 'Male']},  1, 0]}},
-                'female': {'$sum': {'$cond': [{'$eq': ['$Gender', 'Female']},1, 0]}},
-                'H'     : {'$sum': {'$cond': [{'$eq': ['$Predicted_Religion_Label','H']},1,0]}},
-                'M'     : {'$sum': {'$cond': [{'$eq': ['$Predicted_Religion_Label','M']},1,0]}},
-                'C'     : {'$sum': {'$cond': [{'$eq': ['$Predicted_Religion_Label','C']},1,0]}},
+                'male'  : {'$sum': {'$cond': [{'$eq': ['$Gender', 'Male']},   1, 0]}},
+                'female': {'$sum': {'$cond': [{'$eq': ['$Gender', 'Female']}, 1, 0]}},
+                'H'     : {'$sum': {'$cond': [{'$eq': ['$Predicted_Religion_Label', 'H']}, 1, 0]}},
+                'M'     : {'$sum': {'$cond': [{'$eq': ['$Predicted_Religion_Label', 'M']}, 1, 0]}},
+                'C'     : {'$sum': {'$cond': [{'$eq': ['$Predicted_Religion_Label', 'C']}, 1, 0]}},
             }},
             {'$sort': {'_id': 1}},
         ]))
         if not booths:
             return '[Booth summary: no data]'
 
-        tot = sum(b['total'] for b in booths)
+        tot   = sum(b['total'] for b in booths)
         lines = [f'=== Booth-wise Voter Counts (2025) — {len(booths)} booths, {tot:,} total ===',
                  f"{'Booth':>5}  {'Ward':>4}  {'Total':>6}  "
                  f"{'Male':>6}  {'Female':>7}  {'H':>6}  {'M':>6}  {'C':>6}"]
@@ -5697,344 +5740,700 @@ def _ai_ctx_booth_summary():
         return f'[Booth summary error: {e}]'
 
 
+# ── Builder 6: Future Voters & Deceased ──────────────────────────────────────
+
 def _ai_ctx_future_deceased():
-    """Future voters (eligible by 2028) and deceased records count."""
     try:
         db     = get_survey_db()
-        future = db['FutureVoters'].count_documents({})
-        dec    = db['Deceased'].count_documents({})
+        future = _safe_count(db['FutureVoters'])
+        dec    = _safe_count(db['Deceased'])
 
-        # Gender split of future voters
         fv_gen = {r['_id']: r['n'] for r in db['FutureVoters'].aggregate([
             {'$group': {'_id': '$gender', 'n': {'$sum': 1}}}
         ])}
 
         lines = ['=== Future Voters & Deceased ===',
                  f'Future voters (eligible by 2028): {future:,}',
-                 f"  Male  : {fv_gen.get('Male',  fv_gen.get('M', 0)):,}",
+                 f"  Male  : {fv_gen.get('Male',   fv_gen.get('M', 0)):,}",
                  f"  Female: {fv_gen.get('Female', fv_gen.get('F', 0)):,}",
                  f'Deceased records captured       : {dec:,}']
+
+        try:
+            fw = list(db['FutureVoters'].aggregate([
+                {'$group': {'_id': '$wardNumber', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}}, {'$limit': 10},
+            ]))
+            if fw:
+                lines.append('\nTop wards by Future Voters:')
+                for w in fw:
+                    wname = WARD_NUM_TO_NAME.get(str(w['_id']), str(w['_id']))
+                    lines.append(f"  Ward {w['_id']} {wname:<22}: {w['n']:,}")
+        except Exception:
+            pass
+
+        try:
+            da = list(db['Deceased'].aggregate([
+                {'$group': {'_id': '$gender', 'n': {'$sum': 1}}}
+            ]))
+            if da:
+                lines.append('\nDeceased by gender:')
+                for d in da:
+                    lines.append(f"  {str(d['_id']):<10}: {d['n']:,}")
+        except Exception:
+            pass
+
         return '\n'.join(lines)
     except Exception as e:
         return f'[Future/Deceased summary error: {e}]'
 
 
+# ── Builder 7: Community / Caste Count 2023 ──────────────────────────────────
+
+def _ai_ctx_caste_count_2023():
+    try:
+        db   = get_survey_db()
+        docs = list(db['Community_caste_based_count_2023'].find(
+            {},
+            {'_id': 0, 'Community / Caste': 1, 'Broad Category': 1,
+             'Polled': 1, 'Non-Polled': 1}
+        ).sort('Polled', -1).limit(40))
+
+        if not docs:
+            return '[Community_caste_based_count_2023: empty]'
+
+        total_polled = 0
+        total_np     = 0
+        for d in docs:
+            try:
+                total_polled += int(str(d.get('Polled', 0)).replace(',', ''))
+            except Exception:
+                pass
+            try:
+                total_np += int(str(d.get('Non-Polled', 0)).replace(',', ''))
+            except Exception:
+                pass
+
+        lines = ['=== Community / Caste-Based Count 2023 ===',
+                 f'Grand Polled    : {total_polled:,}',
+                 f'Grand Non-Polled: {total_np:,}', '',
+                 f"{'Community / Caste':<35}  {'Broad Category':<16}  "
+                 f"{'Polled':>9}  {'Non-Polled':>11}"]
+        for d in docs:
+            comm  = str(d.get('Community / Caste', ''))[:34]
+            broad = str(d.get('Broad Category', ''))[:15]
+            pol   = str(d.get('Polled', '-'))
+            np_   = str(d.get('Non-Polled', '-'))
+            lines.append(f"{comm:<35}  {broad:<16}  {pol:>9}  {np_:>11}")
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[Community_caste_based_count_2023 error: {e}]'
+
+
+# ── Builder 8: Polled/NotPolled with Caste 2023 ───────────────────────────────
+
+def _ai_ctx_polled_notpolled_caste():
+    try:
+        db    = get_survey_db()
+        total = _safe_count(db['Polled_NotPolled_caste_2023'])
+
+        agg = list(db['Polled_NotPolled_caste_2023'].aggregate([{'$facet': {
+            'by_status'  : [{'$group': {'_id': '$Status',            'n': {'$sum': 1}}}, {'$sort': {'n': -1}}],
+            'by_category': [{'$group': {'_id': '$Category',          'n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 10}],
+            'by_caste'   : [{'$group': {'_id': '$Community / Caste', 'n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 20}],
+            'by_booth'   : [{'$group': {'_id': '$Booth',             'n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 15}],
+            'by_gender'  : [{'$group': {'_id': '$Gen',               'n': {'$sum': 1}}}],
+        }}]))[0]
+
+        lines = ['=== Polled / Not-Polled with Caste (2023) ===',
+                 f'Total records: {total:,}', '']
+
+        def _sec(title, items):
+            lines.append(f'{title}:')
+            for r in items:
+                if r.get('_id'):
+                    pct = f" ({round(r['n'] / total * 100, 1)}%)" if total else ''
+                    lines.append(f"  {str(r['_id']):<30}: {r['n']:,}{pct}")
+            lines.append('')
+
+        _sec('Polling Status',             agg['by_status'])
+        _sec('Broad Category',             agg['by_category'])
+        _sec('Gender (M/F)',               agg['by_gender'])
+        _sec('Community / Caste (top 20)', agg['by_caste'])
+        _sec('Booth (top 15)',             agg['by_booth'])
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[Polled_NotPolled_caste_2023 error: {e}]'
+
+
+# ── Builder 9: Ward Information (ward-booth-2026) ─────────────────────────────
+
+def _ai_ctx_ward_booth_2026():
+    try:
+        db   = get_survey_db()
+        docs = list(db['ward-booth-2026'].find({}).sort('Ward No', 1).limit(50))
+        if not docs:
+            return '[ward-booth-2026: empty]'
+
+        total_e = sum(d.get('Total Electors (E)', 0) or 0 for d in docs)
+        total_m = sum(d.get('Electors Mapped (M)', 0) or 0 for d in docs)
+
+        lines = ['=== Ward Information (2026) ===',
+                 f'Total wards loaded: {len(docs)}',
+                 f'Total Electors (E): {total_e:,}',
+                 f'Total Mapped (M)  : {total_m:,}',
+                 f'Overall % Mapped  : {round(total_m / total_e * 100, 2) if total_e else 0}%',
+                 '',
+                 f"{'Ward':>4}  {'Name':<25}  {'E':>6}  {'D':>6}  "
+                 f"{'H':>6}  {'J':>6}  {'K':>6}  {'M':>6}  {'M%':>6}"]
+
+        for d in docs:
+            lines.append(
+                f"{str(d.get('Ward No', '')):>4}  "
+                f"{str(d.get('Ward Name', '')):.<25}  "
+                f"{d.get('Total Electors (E)', 0) or 0:>6,}  "
+                f"{d.get('Cutoff Elec (D)', 0) or 0:>6,}  "
+                f"{d.get('Total Mapped (H)', 0) or 0:>6,}  "
+                f"{d.get('AgeoCutoff (J)', 0) or 0:>6,}  "
+                f"{d.get('Progeny>18 (K)', 0) or 0:>6,}  "
+                f"{d.get('Electors Mapped (M)', 0) or 0:>6,}  "
+                f"{str(d.get('% Total (MoE)', '')):>6}"
+            )
+        lines.append('\nKey: E=Total Electors, D=Cutoff, H=BLO Mapped, J=AgeoCutoff, '
+                     'K=Progeny>18, M=Electors Mapped')
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[ward-booth-2026 error: {e}]'
+
+
+# ── Builder 10: Booth Details (ward-booth-details) ────────────────────────────
+
+def _ai_ctx_ward_booth_details():
+    try:
+        db   = get_survey_db()
+        docs = list(db['ward-booth-details'].find({}).sort(
+            [('Ward', 1), ('Booth (Part)', 1)]).limit(300))
+        if not docs:
+            return '[ward-booth-details: empty]'
+
+        total_e = sum(d.get('Total Electors (E)', 0) or 0 for d in docs)
+
+        lines = ['=== Booth Details (ward-booth-details) ===',
+                 f'Total booth records: {len(docs)}',
+                 f'Total Electors     : {total_e:,}', '',
+                 f"{'Ward':>4}  {'Ward Name':<22}  {'Booth':>5}  "
+                 f"{'Electors':>8}  {'Cutoff':>7}  {'Mapped':>7}  {'I%':>6}  {'N%':>6}"]
+
+        for d in docs:
+            lines.append(
+                f"{str(d.get('Ward', '')):>4}  "
+                f"{str(d.get('Ward Name', '')):.<22}  "
+                f"{str(d.get('Booth (Part)', '')):>5}  "
+                f"{d.get('Total Electors (E)', 0) or 0:>8,}  "
+                f"{d.get('Cutoff (D)', 0) or 0:>7,}  "
+                f"{d.get('Total Mapped (H)', 0) or 0:>7,}  "
+                f"{str(d.get('I% (orig.)', '')):>6}  "
+                f"{str(d.get('N% (orig.)', '')):>6}"
+            )
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[ward-booth-details error: {e}]'
+
+
+# ── Builder 11: NotFoundRecordSurvey ─────────────────────────────────────────
+
+def _ai_ctx_not_found_survey():
+    try:
+        db    = get_survey_db()
+        total = _safe_count(db['NotFoundRecordSurvey'])
+
+        agg = list(db['NotFoundRecordSurvey'].aggregate([{'$facet': {
+            'by_ward'  : [{'$group': {'_id': '$wardNumber', 'n': {'$sum': 1}}},
+                          {'$sort': {'n': -1}}, {'$limit': 20}],
+            'by_reason': [{'$group': {'_id': '$reason',    'n': {'$sum': 1}}},
+                          {'$sort': {'n': -1}}, {'$limit': 10}],
+            'by_status': [{'$group': {'_id': '$status',    'n': {'$sum': 1}}},
+                          {'$sort': {'n': -1}}],
+        }}]))[0]
+
+        lines = ['=== NotFoundRecordSurvey (Non-Located Voters) ===',
+                 f'Total not-found records: {total:,}', '']
+
+        if agg['by_ward']:
+            lines.append('Ward-wise (top 20):')
+            for w in agg['by_ward']:
+                wname = WARD_NUM_TO_NAME.get(str(w['_id']), str(w['_id']))
+                pct   = round(w['n'] / total * 100, 1) if total else 0
+                lines.append(f"  Ward {w['_id']} {wname:<22}: {w['n']:,}  ({pct}%)")
+
+        if agg['by_reason']:
+            lines.append('\nReason breakdown:')
+            for r in agg['by_reason']:
+                if r['_id']:
+                    lines.append(f"  {str(r['_id']):<35}: {r['n']:,}")
+
+        if agg['by_status']:
+            lines.append('\nStatus breakdown:')
+            for s in agg['by_status']:
+                if s['_id']:
+                    lines.append(f"  {str(s['_id']):<20}: {s['n']:,}")
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[NotFoundRecordSurvey error: {e}]'
+
+
+# ── Builder 12: Coastal Karnataka Caste Reference ────────────────────────────
+
+def _ai_ctx_coastal_caste_reference():
+    try:
+        db    = get_survey_db()
+        total = _safe_count(db['coastal_karnataka_all_references_castes'])
+
+        agg = list(db['coastal_karnataka_all_references_castes'].aggregate([{'$facet': {
+            'by_caste'    : [{'$group': {'_id': '$Caste',            'n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 20}],
+            'by_category' : [{'$group': {'_id': '$Broad Category',   'n': {'$sum': 1}}}, {'$sort': {'n': -1}}],
+            'by_region'   : [{'$group': {'_id': '$Region',           'n': {'$sum': 1}}}, {'$sort': {'n': -1}}, {'$limit': 10}],
+            'by_assoc_type': [{'$group': {'_id': '$Association Type', 'n': {'$sum': 1}}}, {'$sort': {'n': -1}}],
+        }}]))[0]
+
+        lines = ['=== Coastal Karnataka Caste Reference ===',
+                 f'Total caste-surname mappings: {total:,}', '']
+
+        def _sec(title, items):
+            lines.append(f'{title}:')
+            for r in items:
+                if r.get('_id'):
+                    lines.append(f"  {str(r['_id']):<35}: {r['n']:,} entries")
+            lines.append('')
+
+        _sec('Broad Category', agg['by_category'])
+        _sec('Region',         agg['by_region'])
+        _sec('Association Type', agg['by_assoc_type'])
+        _sec('Top Castes',     agg['by_caste'])
+
+        try:
+            sample_docs = list(db['coastal_karnataka_all_references_castes'].aggregate([
+                {'$group': {'_id': '$Broad Category',
+                            'surnames': {'$push': '$Surname'},
+                            'castes':   {'$addToSet': '$Caste'}}},
+                {'$limit': 8},
+            ]))
+            if sample_docs:
+                lines.append('Sample Surname → Category mappings:')
+                for sd in sample_docs:
+                    s_list = ', '.join(str(s) for s in sd['surnames'][:5])
+                    c_list = ', '.join(str(c) for c in list(sd['castes'])[:3])
+                    lines.append(f"  [{sd['_id']}] Castes: {c_list}  |  Surnames: {s_list}")
+        except Exception:
+            pass
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[coastal_karnataka_all_references_castes error: {e}]'
+
+
+# ── Builder 13: NewQueryStack1 (SWOT) ────────────────────────────────────────
+
+def _ai_ctx_swot_stack():
+    try:
+        db    = get_survey_db()
+        total = _safe_count(db['NewQueryStack1'])
+        if total == 0:
+            return '[NewQueryStack1: empty]'
+
+        lines = ['=== Constituency SWOT / Intelligence Query Stack (NewQueryStack1) ===',
+                 f'Total documents: {total:,}']
+
+        sample_doc = db['NewQueryStack1'].find_one({'chunkIndex': 0})
+        if sample_doc and 'records' in sample_doc:
+            records = sample_doc.get('records', [])
+            lines.append(f'Records in chunk 0: {len(records)}')
+
+            label_counts = {}
+            field_counts = {}
+            for rec in records:
+                lbl = rec.get('label', 'Unknown')
+                label_counts[lbl] = label_counts.get(lbl, 0) + 1
+                cf = rec.get('comparisonField', '')
+                if cf:
+                    field_counts[cf] = field_counts.get(cf, 0) + 1
+
+            if label_counts:
+                lines.append('\nStrength Labels (chunk 0 sample):')
+                for lbl, cnt in sorted(label_counts.items(), key=lambda x: -x[1]):
+                    lines.append(f"  {lbl:<15}: {cnt} records")
+
+            if field_counts:
+                lines.append('\nComparison Fields (chunk 0 sample):')
+                for fld, cnt in sorted(field_counts.items(), key=lambda x: -x[1])[:10]:
+                    lines.append(f"  {fld:<25}: {cnt} records")
+
+            ctx_sample = next(
+                (rec.get('predictedContext', {}) for rec in records if rec.get('predictedContext')),
+                {}
+            )
+            if ctx_sample:
+                lines.append('\nSample Predicted Context keys:')
+                for k, v in ctx_sample.items():
+                    lines.append(f"  {k}: {v}")
+
+        lines.append('\n[Full SWOT records available via api_ai_query_insight / api_ai_birdseye_view]')
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[NewQueryStack1 error: {e}]'
+
+
+# ── Builder 14: 2002 Voter Roll ───────────────────────────────────────────────
+
+def _ai_ctx_voter_roll_2002():
+    try:
+        db    = get_survey_db()
+        total = _safe_count(db['2002'])
+
+        agg = list(db['2002'].aggregate([{'$facet': {
+            'by_gender': [{'$group': {'_id': '$Gender', 'n': {'$sum': 1}}}],
+            'age_stats': [
+                {'$match': {'Age': {'$type': ['int', 'long', 'double', 'string']}}},
+                {'$project': {'age_num': {'$toInt': {'$toString': '$Age'}}}},
+                {'$match': {'age_num': {'$gt': 0, '$lt': 120}}},
+                {'$group': {'_id': None,
+                            'avg': {'$avg': '$age_num'},
+                            'min': {'$min': '$age_num'},
+                            'max': {'$max': '$age_num'}}},
+            ],
+        }}]))[0]
+
+        lines = ['=== 2002 Voter Roll ===', f'Total voters (2002): {total:,}', '']
+
+        if agg.get('by_gender'):
+            lines.append('Gender breakdown:')
+            for g in agg['by_gender']:
+                pct = round(g['n'] / total * 100, 1) if total else 0
+                lines.append(f"  {str(g['_id']):<10}: {g['n']:,}  ({pct}%)")
+
+        if agg.get('age_stats') and agg['age_stats']:
+            s = agg['age_stats'][0]
+            lines.append(f"\nAge stats: Avg={round(s.get('avg', 0), 1)}, "
+                         f"Min={s.get('min', '-')}, Max={s.get('max', '-')}")
+
+        lines.append('\n[2002 roll is the baseline for SIR comparison — see SIR Analysis section]')
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[2002 voter roll summary error: {e}]'
+
+
+# ── Builder 15: Genuine Voters ────────────────────────────────────────────────
+
+def _ai_ctx_genuine_voters():
+    try:
+        db    = get_survey_db()
+        total = _safe_count(db['genuine_voters'])
+
+        agg = list(db['genuine_voters'].aggregate([{'$facet': {
+            'by_ward'    : [{'$group': {'_id': '$ward',     'n': {'$sum': 1}}},
+                            {'$sort': {'n': -1}}, {'$limit': 20}],
+            'by_booth'   : [{'$group': {'_id': '$booth',    'n': {'$sum': 1}}},
+                            {'$sort': {'n': -1}}, {'$limit': 15}],
+            'by_category': [{'$group': {'_id': '$category', 'n': {'$sum': 1}}},
+                            {'$sort': {'n': -1}}],
+        }}]))[0]
+
+        lines = ['=== Genuine Voters (SIR Verified) ===',
+                 f'Total genuine voters confirmed: {total:,}', '']
+
+        if agg.get('by_ward'):
+            lines.append('Ward-wise (top 20):')
+            for w in agg['by_ward']:
+                wname = WARD_NUM_TO_NAME.get(str(w['_id']), str(w['_id']))
+                lines.append(f"  {str(w['_id']):<5} {wname:<25}: {w['n']:,}")
+
+        if agg.get('by_category'):
+            lines.append('\nCategory breakdown:')
+            for c in agg['by_category']:
+                if c['_id']:
+                    lines.append(f"  {str(c['_id']):<25}: {c['n']:,}")
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[genuine_voters error: {e}]'
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PARALLEL MONGO CONTEXT LOADER
+# ════════════════════════════════════════════════════════════════════════════════
+
 def _ai_load_mongo_context():
-    """Run all MongoDB context builders and return combined text + source list."""
+    """
+    Run all 15 MongoDB context builders in parallel.
+    Returns (combined_text: str, sources: list[str]).
+    Total latency ≈ slowest single builder (~1-2 s), not sum of all.
+    """
     builders = [
-        ('2025 Voter Roll (Ward Summary)',  _ai_ctx_voter_roll_summary),
-        ('Survey Records',                  _ai_ctx_survey_summary),
-        ('2023 Polling Data',               _ai_ctx_polling_summary),
-        ('SIR Analysis (2002 vs 2025)',      _ai_ctx_sir_summary),
-        ('Booth-wise Counts',               _ai_ctx_booth_summary),
-        ('Future Voters & Deceased',        _ai_ctx_future_deceased),
+        ('2025 Voter Roll (Ward Summary)',        _ai_ctx_voter_roll_summary),
+        ('Survey Records',                        _ai_ctx_survey_summary),
+        ('2023 Polling Data',                     _ai_ctx_polling_summary),
+        ('SIR Analysis (2002 vs 2025)',            _ai_ctx_sir_summary),
+        ('Booth-wise Counts',                     _ai_ctx_booth_summary),
+        ('Future Voters & Deceased',              _ai_ctx_future_deceased),
+        ('Community/Caste Count 2023',            _ai_ctx_caste_count_2023),
+        ('Polled/NotPolled with Caste 2023',      _ai_ctx_polled_notpolled_caste),
+        ('Ward Information (2026)',               _ai_ctx_ward_booth_2026),
+        ('Booth Details',                         _ai_ctx_ward_booth_details),
+        ('NotFoundRecordSurvey',                  _ai_ctx_not_found_survey),
+        ('Coastal Karnataka Caste Reference',     _ai_ctx_coastal_caste_reference),
+        ('SWOT Query Stack (NewQueryStack1)',      _ai_ctx_swot_stack),
+        ('2002 Voter Roll',                       _ai_ctx_voter_roll_2002),
+        ('Genuine Voters (SIR Verified)',         _ai_ctx_genuine_voters),
     ]
-    sources  = []
-    sections = []
-    for label, fn in builders:
+
+    results = [None] * len(builders)
+    sources = []
+
+    def _run(idx, label, fn):
         try:
-            print(f'[AI Chat] MongoDB context: {label}')
-            sections.append(fn())
-            sources.append(label)
+            print(f'[AI Chat RAG] Loading: {label}')
+            text = fn()
+            return idx, label, text, True
         except Exception as e:
-            sections.append(f'[{label} — error: {e}]')
-    return '\n\n'.join(sections), sources
+            return idx, label, f'[{label} — error: {e}]', False
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_run, i, lbl, fn): i
+                   for i, (lbl, fn) in enumerate(builders)}
+        for future in as_completed(futures):
+            idx, label, text, ok = future.result()
+            results[idx] = text
+            if ok:
+                sources.append(label)
+
+    combined = '\n\n'.join(r for r in results if r)
+    return combined, sources
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# ANTHROPIC FILES API — Upload-once, reuse-by-ID
-#
-# How it works:
-#   1. On first request (or when a file changes), each file in backend/data/ is
-#      uploaded to Anthropic's Files API via client.beta.files.upload().
-#      Anthropic stores it server-side and returns a file_id (e.g. "file-abc123").
-#   2. The file_id is cached in _AI_FILE_ID_CACHE (in-process dict) keyed by
-#      (filename, mtime, size).  On Render, the worker process is long-lived so
-#      the cache survives many requests — files are uploaded at most once per
-#      deploy or content change.
-#   3. On each chat request the file_ids are passed to messages.create() as
-#      document blocks.  Anthropic reads the file directly from its storage —
-#      no text is injected into the system prompt, so context window is not wasted.
-#
-# Supported formats via Files API:
-#   PDF, TXT, CSV, DOCX — uploaded as-is (binary).
-#   XLSX / XLS           — converted to CSV first (Anthropic doesn't accept xlsx).
-#
-# Files that fail to upload fall back to inline text extraction (existing code).
+# FILES API — upload-once, reuse-by-ID, smart xlsx chunker
 # ════════════════════════════════════════════════════════════════════════════════
-
-# ════════════════════════════════════════════════════════════════════════════════
-# WARD LOCAL PLACES  — GET / POST / DELETE  /api/ward-places/
-#
-# Stores local clubs, temples, churches, mosques in the 'WardData' collection
-# of the main SurveyDataBase.  Each document:
-#   { record_type, ward, wardName, type, name, address, createdAt, createdBy }
-#
-# GET  ?ward=<int>  → list all places for that ward
-# POST              → add a place  (body: ward, wardName, type, name, address)
-# DELETE            → remove a place (body: id)
-# ════════════════════════════════════════════════════════════════════════════════
-
-_PLACE_ALLOWED_TYPES = {'club', 'temple', 'church', 'mosque'}
-
-
-def _places_cors(request, response):
-    origin = request.META.get('HTTP_ORIGIN', '')
-    if origin:
-        response['Access-Control-Allow-Origin']      = origin
-        response['Access-Control-Allow-Credentials'] = 'true'
-        response['Access-Control-Allow-Methods']     = 'GET, POST, DELETE, OPTIONS'
-        response['Access-Control-Allow-Headers']     = (
-            'Content-Type, Authorization, X-CSRFToken'
-        )
-    return response
-
-
-@csrf_exempt
-@require_http_methods(['GET', 'POST', 'DELETE', 'OPTIONS'])
-def api_ward_places(request):
-    """GET/POST/DELETE /api/ward-places/"""
-
-    if request.method == 'OPTIONS':
-        return _places_cors(request, JsonResponse({}))
-
-    # ── Auth ─────────────────────────────────────────────────────────────────
-    try:
-        user = _user_from_request(request)
-    except Exception as e:
-        return _places_cors(request, JsonResponse({'success': False, 'message': f'Auth error: {e}'}, status=500))
-    if not user:
-        return _places_cors(request, JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401))
-    if not _is_approved(user):
-        return _places_cors(request, JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403))
-
-    coll = get_survey_db()['WardData']
-
-    # ── GET — list all places for a ward ──────────────────────────────────────
-    if request.method == 'GET':
-        ward = request.GET.get('ward', '').strip()
-        if not ward:
-            return _places_cors(request, JsonResponse({'success': False, 'message': 'ward param required.'}, status=400))
-        try:
-            ward_int = int(ward)
-        except ValueError:
-            return _places_cors(request, JsonResponse({'success': False, 'message': 'ward must be a number.'}, status=400))
-
-        docs = list(coll.find(
-            {'ward': ward_int, 'record_type': 'local_place'},
-            {'_id': 1, 'type': 1, 'name': 1, 'address': 1, 'createdAt': 1, 'createdBy': 1}
-        ).sort('createdAt', 1))
-
-        for d in docs:
-            d['_id'] = str(d['_id'])
-            if isinstance(d.get('createdAt'), datetime):
-                d['createdAt'] = d['createdAt'].isoformat()
-
-        return _places_cors(request, JsonResponse({'success': True, 'places': docs}))
-
-    # ── POST — add a new place ────────────────────────────────────────────────
-    if request.method == 'POST':
-        try:
-            body = json.loads(request.body)
-        except Exception:
-            return _places_cors(request, JsonResponse({'success': False, 'message': 'Invalid JSON.'}, status=400))
-
-        ward      = body.get('ward')
-        ward_name = (body.get('wardName') or '').strip()
-        ptype     = (body.get('type') or '').strip().lower()
-        name      = (body.get('name') or '').strip()
-        address   = (body.get('address') or '').strip()
-
-        if not ward:
-            return _places_cors(request, JsonResponse({'success': False, 'message': 'ward is required.'}, status=400))
-        if ptype not in _PLACE_ALLOWED_TYPES:
-            return _places_cors(request, JsonResponse({'success': False, 'message': f'type must be one of {_PLACE_ALLOWED_TYPES}.'}, status=400))
-        if not name:
-            return _places_cors(request, JsonResponse({'success': False, 'message': 'name is required.'}, status=400))
-
-        try:
-            ward_int = int(ward)
-        except (ValueError, TypeError):
-            return _places_cors(request, JsonResponse({'success': False, 'message': 'ward must be a number.'}, status=400))
-
-        doc = {
-            'record_type': 'local_place',
-            'ward':        ward_int,
-            'wardName':    ward_name,
-            'type':        ptype,
-            'name':        name,
-            'address':     address,
-            'createdAt':   datetime.now(timezone.utc),
-            'createdBy':   user.get('username') or user.get('email') or 'unknown',
-        }
-
-        try:
-            result = coll.insert_one(doc)
-        except Exception as e:
-            return _places_cors(request, JsonResponse({'success': False, 'message': f'DB error: {e}'}, status=500))
-
-        return _places_cors(request, JsonResponse({
-            'success': True,
-            'place': {
-                '_id':      str(result.inserted_id),
-                'type':     ptype,
-                'name':     name,
-                'address':  address,
-                'createdAt': doc['createdAt'].isoformat(),
-            },
-        }))
-
-    # ── DELETE — remove a place by _id ────────────────────────────────────────
-    if request.method == 'DELETE':
-        try:
-            body     = json.loads(request.body)
-            place_id = body.get('id', '').strip()
-        except Exception:
-            return _places_cors(request, JsonResponse({'success': False, 'message': 'Invalid JSON.'}, status=400))
-
-        if not place_id:
-            return _places_cors(request, JsonResponse({'success': False, 'message': 'id is required.'}, status=400))
-
-        try:
-            result = coll.delete_one({'_id': ObjectId(place_id), 'record_type': 'local_place'})
-        except Exception as e:
-            return _places_cors(request, JsonResponse({'success': False, 'message': f'DB error: {e}'}, status=500))
-
-        if result.deleted_count == 0:
-            return _places_cors(request, JsonResponse({'success': False, 'message': 'Place not found.'}, status=404))
-
-        return _places_cors(request, JsonResponse({'success': True}))
-
-    return _places_cors(request, JsonResponse({'success': False, 'message': 'Method not allowed.'}, status=405))
-
-
-@csrf_exempt
-@require_http_methods(['GET', 'OPTIONS'])
-def api_local_places_summary(request):
-    """
-    GET /api/local-places-summary/
-    Returns constituency-wide counts + full list of all local places,
-    grouped by type and ward, for the Dashboard overview panel.
-
-    Response:
-    {
-      "success": true,
-      "total": 42,
-      "counts": { "club": 10, "temple": 18, "church": 8, "mosque": 6 },
-      "byWard": [
-        { "ward": 28, "wardName": "MANNAGUDDA",
-          "places": [{"_id":"..","type":"club","name":"..","address":".."},...],
-          "counts": { "club":1, "temple":2, "church":0, "mosque":0 } },
-        ...
-      ]
-    }
-    """
-    if request.method == 'OPTIONS':
-        resp = JsonResponse({})
-        origin = request.META.get('HTTP_ORIGIN', '')
-        if origin:
-            resp['Access-Control-Allow-Origin']      = origin
-            resp['Access-Control-Allow-Credentials'] = 'true'
-            resp['Access-Control-Allow-Methods']     = 'GET, OPTIONS'
-            resp['Access-Control-Allow-Headers']     = 'Content-Type, Authorization, X-CSRFToken'
-        return resp
-
-    try:
-        user = _user_from_request(request)
-    except Exception as e:
-        return JsonResponse({'success': False, 'message': f'Auth error: {e}'}, status=500)
-    if not user:
-        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
-    if not _is_approved(user):
-        return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
-
-    try:
-        coll = get_survey_db()['WardData']
-        docs = list(coll.find(
-            {'record_type': 'local_place'},
-            {'_id': 1, 'ward': 1, 'wardName': 1, 'type': 1, 'name': 1, 'address': 1}
-        ).sort([('ward', 1), ('type', 1), ('name', 1)]))
-
-        for d in docs:
-            d['_id'] = str(d['_id'])
-
-        type_counts = {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0}
-        for d in docs:
-            t = d.get('type', '')
-            if t in type_counts:
-                type_counts[t] += 1
-
-        ward_map = {}
-        for d in docs:
-            ward  = d.get('ward', 0)
-            wname = d.get('wardName', f'Ward {ward}')
-            if ward not in ward_map:
-                ward_map[ward] = {
-                    'ward': ward, 'wardName': wname, 'places': [],
-                    'counts': {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0},
-                }
-            ward_map[ward]['places'].append(d)
-            t = d.get('type', '')
-            if t in ward_map[ward]['counts']:
-                ward_map[ward]['counts'][t] += 1
-
-        by_ward = sorted(ward_map.values(), key=lambda w: w['ward'])
-
-        return JsonResponse({
-            'success': True, 'total': len(docs),
-            'counts': type_counts, 'byWard': by_ward,
-        })
-    except Exception as e:
-        return JsonResponse({'success': False, 'message': str(e)}, status=500)
-
 
 import threading as _threading
 
-# Cache: (fname, mtime, size) → file_id string
-_AI_FILE_ID_CACHE: dict = {}
-_AI_FILE_CACHE_LOCK = _threading.Lock()
+_AI_FILE_ID_CACHE: dict  = {}
+_AI_FILE_CACHE_LOCK      = _threading.Lock()
 
-# MIME types accepted directly by Files API
 _FILES_API_MIME = {
-    '.pdf':  'application/pdf',
-    '.txt':  'text/plain',
-    '.csv':  'text/plain',
+    '.pdf' : 'application/pdf',
+    '.txt' : 'text/plain',
+    '.csv' : 'text/plain',
     '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    '.doc':  'application/msword',
-    '.md':   'text/plain',
+    '.doc' : 'application/msword',
+    '.md'  : 'text/plain',
 }
-
-# Extensions that need conversion before upload
 _FILES_API_CONVERT = {'.xlsx', '.xls'}
 
+# ── Sheet description lookup ──────────────────────────────────────────────────
+
+_SHEET_DESC_MAP = {
+    'BOOTHWISE'               : 'Per-booth election results (BJP/INC/JDS%)',
+    'BOOTH WISE'              : 'Per-booth election results (BJP/INC/JDS%)',
+    'WARD WISE ANALYSIS'      : 'Ward-level statistical analysis (mean, std dev, variance)',
+    'WARDWISE ANALYISIS'      : 'Ward-level statistical analysis (2018)',
+    '3 YEAR WARD WISE ANALYSIS': '3-year ward comparison (2013, 2013+, 2018)',
+    'BJP WIN OR LOSS'         : 'Which booths/wards BJP won or lost',
+    'BJP'                     : 'BJP narrow-margin wards ranked by margin',
+    'CONGRESS'                : 'Congress narrow-margin wards ranked by margin',
+    'WARD-BOOTH'              : 'Ward to booth mapping / ward+booth election summary',
+    'MAIN WARD'               : 'Ward-level election summary',
+    'EXECUTIVE DASHBOARD'     : 'BJP executive summary: strong/medium/weak wards',
+    'WHY STRONG-MEDIUM-WEAK'  : 'Root cause analysis of ward performance',
+    'CASTE-RELIGION MATRIX'   : 'Caste × religion × gender voter matrix',
+    'HISTORICAL TREND 2013-23': 'BJP electoral trend 2013–2023 by ward',
+    'MATH FORMULA'            : 'Political math formulas for vote share projection',
+    'STRATEGY GAMEPLAN'       : 'BJP 5-pillar victory strategy',
+    'WARD ACTION TRACKER'     : 'Live ward-level operational tracking template',
+    'CAMPAIGN CALENDAR'       : 'T-12 to T-0 month campaign calendar',
+    'WSI SCORE'               : 'Ward Strength Index (BJP%×35% + Turnout×25% + ...)',
+    'BOOTHWISE MASTER'        : '249-booth caste × religion × turnout master table',
+    'WARD CONSOLIDATED'       : 'Ward-consolidated caste/religion analysis',
+    'COMMUNITY ANALYSIS'      : 'Community-wise turnout rankings',
+    'RELIGION'                : 'Religion × gender turnout (male/female split)',
+    'BOOTH PRIORITY LIST'     : 'Booth priority ranking by latent BJP votes',
+    'TURNOUT STRATEGY'        : 'Mathematical turnout targets by booth',
+    'MASTER DASHBOARD'        : 'Full-scale master dashboard: ward+booth overview',
+    'WARD ANALYSIS'           : 'Ward-wise full analysis: 2023+2018+caste',
+    'BOOTH ANALYSIS'          : '244/249-booth analysis: status, BJP%, margin, poll change',
+    'CASTE TURNOUT MATRIX'    : 'Minority/GC/OBC/unclassified turnout by ward',
+    'NON-POLLED OPPORTUNITY'  : 'Non-polled voter opportunity by ward and community',
+    'GENDER ANALYSIS'         : 'Female-dominant booths, gender mobilization strategy',
+    'STRONG WARD'             : 'Protection strategy for strong BJP wards',
+    'MEDIUM'                  : 'Upgrade plan for medium wards → strong',
+    'WEAK'                    : 'Conversion plan for weak wards → medium',
+    'FLIP TARGET'             : 'Wards and booths where BJP can flip Congress seats',
+    '100-DAY'                 : '100-day fool-proof campaign gameplan',
+    '90-DAY'                  : '90-day master action plan with phases',
+    'BOOTH INTERVENTION'      : 'Booth-level intervention sorted by margin (worst first)',
+    'SIR'                     : 'BLO mapping %, progeny %, BJP/Congress projections by ward',
+    'WARD DEEP'               : 'Multi-dimensional ward analysis with caste + polling',
+    'CASTE & RELIGION'        : 'Caste+religion profile: Muslim% → Congress / Hindu → BJP',
+    'ATTAVARA'                : 'ATTAVARA ward: 2023 vs 2018 booth-wise results',
+    'ALAPE'                   : 'ALAPE ward: 2023 vs 2018 booth-wise results',
+    'BAJAL'                   : 'BAJAL ward: 2023 vs 2018 booth-wise results',
+    'BEJAI'                   : 'BEJAI ward: 2023 vs 2018 booth-wise results',
+    'BENGRE'                  : 'BENGRE ward: 2023 vs 2018 booth-wise results',
+    'BOLOOR'                  : 'BOLOOR ward: 2023 vs 2018 booth-wise results',
+    'BOLAR'                   : 'BOLAR ward: 2023 vs 2018 booth-wise results',
+    'BUNDER'                  : 'BUNDER/NAVAYATH ward: 2023 vs 2018 booth-wise results',
+    'CENTRAL'                 : 'CENTRAL ward: 2023 vs 2018 booth-wise results',
+    'CONTONMENT'              : 'CANTONMENT ward: 2023 vs 2018 booth-wise results',
+    'COURT'                   : 'COURT ward: 2023 vs 2018 booth-wise results',
+    'DEREBAIL'                : 'DEREBAIL ward: 2023 vs 2018 booth-wise results',
+    'DONGAR'                  : 'DONGERKERY ward: 2023 vs 2018 booth-wise results',
+    'FALNIR'                  : 'FALNIR ward: 2023 vs 2018 booth-wise results',
+    'HOIGE'                   : 'HOIGE BAZAR ward: 2023 vs 2018 booth-wise results',
+    'JEPPINAMOGAR'            : 'JEPPINAMUGER ward: 2023 vs 2018 booth-wise results',
+    'JEPPU'                   : 'JEPPU ward: 2023 vs 2018 booth-wise results',
+    'KADRI'                   : 'KADRI ward: 2023 vs 2018 booth-wise results',
+    'KAMBALA'                 : 'KAMBLA ward: 2023 vs 2018 booth-wise results',
+    'KANKANADY'               : 'KANKANADY ward: 2023 vs 2018 booth-wise results',
+    'KANNUR'                  : 'KANNUR ward: 2023 vs 2018 booth-wise results',
+    'KODIALBAIL'              : 'KODIALBAIL ward: 2023 vs 2018 booth-wise results',
+    'KUDROLI'                 : 'KUDROLI ward: 2023 vs 2018 booth-wise results',
+    'MANNAGUDA'               : 'MANNAGUDDA ward: 2023 vs 2018 booth-wise results',
+    'MAROLI'                  : 'MAROLI ward: 2023 vs 2018 booth-wise results',
+    'MILAGRESS'               : 'MILAGRIS ward: 2023 vs 2018 booth-wise results',
+    'PADAV'                   : 'PADAVU ward variant: 2023 vs 2018 booth-wise results',
+    'PORT'                    : 'PORT ward: 2023 vs 2018 booth-wise results',
+    'SHIVABAGH'               : 'SHIVBHAG ward: 2023 vs 2018 booth-wise results',
+    'VALENCIA'                : 'VALENCIA ward: 2023 vs 2018 booth-wise results',
+}
+
+
+def _sheet_description(sheet_name: str) -> str:
+    clean = _re2.sub(r'[^\x00-\x7F]+', '', sheet_name).strip().upper()
+    for key, desc in _SHEET_DESC_MAP.items():
+        if key in clean:
+            return desc
+    return f'Data sheet: {sheet_name}'
+
+
+# ── Smart xlsx → rich text converter ─────────────────────────────────────────
 
 def _xlsx_to_csv_bytes(path: str) -> bytes:
-    """Convert xlsx/xls to CSV bytes for Files API upload."""
+    """
+    Convert xlsx to a rich, RAG-friendly text format.
+
+    Each sheet gets:
+      ## SHEET: <name>
+      ## DESCRIPTION: <auto-detected meaning>
+      ## COLUMNS (N): col1, col2, ...
+      ## ROWS: N
+      <CSV data rows>
+
+    Multi-row headers (rows 2+3 both containing headers) are merged.
+    Title/subtitle rows (row 1 with ≤2 non-empty cells) are skipped.
+    Up to 1000 data rows per sheet.
+    """
+    MAX_ROWS = 1000
+    MIN_HDR  = 3      # min non-empty cells to qualify as a header row
+
     try:
-        from openpyxl import load_workbook as _lw
-        import io as _io2
-        wb  = _lw(path, read_only=True, data_only=True)
-        buf = _io2.StringIO()
+        import openpyxl as _opxl
+        wb  = _opxl.load_workbook(path, data_only=True)
+        buf = _io.StringIO()
+
+        fname = path.split('/')[-1]
+        buf.write(f'# FILE: {fname}\n')
+        buf.write(f'# Sheets ({len(wb.sheetnames)}): {", ".join(wb.sheetnames)}\n\n')
+
         for sname in wb.sheetnames:
             ws = wb[sname]
-            buf.write(f'# Sheet: {sname}\n')
-            for row in ws.iter_rows(values_only=True):
-                buf.write(','.join('' if c is None else str(c).replace(',','') for c in row) + '\n')
+
+            # Collect rows (limit to MAX_ROWS + 10 header rows)
+            all_rows = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= MAX_ROWS + 10:
+                    break
+                all_rows.append(['' if c is None else str(c).strip() for c in row])
+
+            if not all_rows:
+                continue
+
+            # Find header row (first row with ≥ MIN_HDR non-empty cells)
+            hdr_idx = 0
+            for idx, row in enumerate(all_rows[:6]):
+                ne = [c for c in row if c and c not in ('None', 'nan', '')]
+                if len(ne) >= MIN_HDR:
+                    hdr_idx = idx
+                    break
+
+            headers    = all_rows[hdr_idx]
+            data_start = hdr_idx + 1
+
+            # Merge two-row headers (e.g. row2+row3 both have partial headers)
+            if hdr_idx + 1 < len(all_rows):
+                nr  = all_rows[hdr_idx + 1]
+                mc  = sum(1 for i, h in enumerate(nr)
+                          if h and i < len(headers) and not headers[i])
+                if mc >= 2:
+                    merged = []
+                    for i in range(max(len(headers), len(nr))):
+                        h  = headers[i] if i < len(headers) else ''
+                        n_ = nr[i]      if i < len(nr)      else ''
+                        merged.append((h + ' ' + n_).strip() if h and n_ else (h or n_))
+                    headers    = merged
+                    data_start = hdr_idx + 2
+
+            # Clean column names
+            def _clean(c):
+                c = _re2.sub(r'[^\x00-\x7F]+', '', c).strip()
+                c = _re2.sub(r'\s+', ' ', c)
+                return c or 'col'
+
+            clean_hdrs = [_clean(h) for h in headers]
+            while clean_hdrs and clean_hdrs[-1] in ('', 'col'):
+                clean_hdrs.pop()
+
+            # Filter blank data rows
+            data_rows = [
+                r for r in all_rows[data_start: data_start + MAX_ROWS]
+                if any(c for c in r if c and c not in ('None', 'nan'))
+            ]
+
+            desc = _sheet_description(sname)
+            buf.write(f'## SHEET: {sname}\n')
+            buf.write(f'## DESCRIPTION: {desc}\n')
+            buf.write(f'## COLUMNS ({len(clean_hdrs)}): {", ".join(clean_hdrs[:12])}'
+                      f'{"..." if len(clean_hdrs) > 12 else ""}\n')
+            buf.write(f'## ROWS: {len(data_rows)}\n\n')
+
+            buf.write(','.join(clean_hdrs) + '\n')
+            for row in data_rows:
+                padded  = (list(row) + [''] * max(0, len(clean_hdrs) - len(row)))[:len(clean_hdrs)]
+                escaped = []
+                for cell in padded:
+                    cell = str(cell).replace('\n', ' ').replace('\r', '')
+                    if ',' in cell or '"' in cell:
+                        cell = '"' + cell.replace('"', '""') + '"'
+                    escaped.append(cell)
+                buf.write(','.join(escaped) + '\n')
+
             buf.write('\n')
+
         wb.close()
         return buf.getvalue().encode('utf-8')
+
     except Exception as e:
-        return f'[Excel conversion error: {e}]'.encode()
+        return f'[Excel conversion error for {path}: {e}]'.encode('utf-8')
 
 
 def _get_or_upload_file(client, fname: str, path: str) -> tuple:
     """
-    Return (file_id, display_name, mime_type) for a given data file.
-    Uploads to Files API if not cached or if file has changed.
+    Return (file_id, display_name, mime_type).
+    Uploads to Anthropic Files API once; caches by (name, mtime, size).
     Returns (None, fname, None) on failure — caller falls back to inline text.
     """
     try:
-        stat     = _os2.stat(path)
+        stat      = _os2.stat(path)
         cache_key = (fname, int(stat.st_mtime), stat.st_size)
     except Exception:
         return None, fname, None
@@ -6045,14 +6444,12 @@ def _get_or_upload_file(client, fname: str, path: str) -> tuple:
             print(f'[Files API] Cache hit: {fname} → {fid}')
             return fid, fname, None
 
-    # Not cached — upload now
     ext = _os2.path.splitext(fname)[1].lower()
 
     try:
         if ext in _FILES_API_CONVERT:
-            # xlsx → csv bytes
-            file_bytes  = _xlsx_to_csv_bytes(path)
-            upload_name = fname.rsplit('.',1)[0] + '.csv'
+            file_bytes  = _xlsx_to_csv_bytes(path)   # ← smart chunker
+            upload_name = fname.rsplit('.', 1)[0] + '.txt'
             mime        = 'text/plain'
         elif ext in _FILES_API_MIME:
             with open(path, 'rb') as f:
@@ -6060,16 +6457,14 @@ def _get_or_upload_file(client, fname: str, path: str) -> tuple:
             upload_name = fname
             mime        = _FILES_API_MIME[ext]
         else:
-            # Try as plain text
             with open(path, 'rb') as f:
                 file_bytes = f.read()
             upload_name = fname
             mime        = 'text/plain'
 
         size_mb = len(file_bytes) / (1024 * 1024)
-        print(f'[Files API] Uploading: {fname} → {upload_name} ({size_mb:.1f} MB)')
+        print(f'[Files API] Uploading: {fname} → {upload_name} ({size_mb:.2f} MB)')
 
-        # Anthropic Files API upload
         import io as _io3
         response = client.beta.files.upload(
             file=(upload_name, _io3.BytesIO(file_bytes), mime),
@@ -6090,10 +6485,7 @@ def _get_or_upload_file(client, fname: str, path: str) -> tuple:
 def _ai_load_files_api(client) -> tuple:
     """
     Upload all files in backend/data/ to Anthropic Files API.
-    Returns:
-      document_blocks — list of content blocks to include in messages
-      files_used      — list of filenames successfully uploaded
-      fallback_text   — inline text for files that failed upload
+    Returns (document_blocks, files_used, fallback_text).
     """
     document_blocks = []
     files_used      = []
@@ -6117,24 +6509,24 @@ def _ai_load_files_api(client) -> tuple:
         fid, display, mime = _get_or_upload_file(client, fname, path)
 
         if fid:
-            # Success — add as a Files API document block
             document_blocks.append({
-                'type': 'document',
-                'source': {
-                    'type':    'file',
-                    'file_id': fid,
-                },
-                'title':   fname,
-                'context': f'Political/socio-economic data file: {fname}',
+                'type'   : 'document',
+                'source' : {'type': 'file', 'file_id': fid},
+                'title'  : fname,
+                'context': (
+                    f'Election/political data file: {fname}. '
+                    f'Each section is prefixed with ## SHEET: <name> and '
+                    f'## DESCRIPTION: <what the sheet contains>.'
+                ),
             })
             files_used.append(fname)
             loaded += 1
         else:
-            # Fallback — read as inline text (existing streaming logic)
+            # Fallback — inline text extraction
             print(f'[Files API] Falling back to inline text for: {fname}')
             try:
                 if ext in ('.xlsx', '.xls'):
-                    raw = _ai_read_excel_stream(path)
+                    raw = _xlsx_to_csv_bytes(path).decode('utf-8', errors='ignore')
                 elif ext == '.csv':
                     raw = _ai_read_csv_stream(path)
                 elif ext == '.pdf':
@@ -6157,52 +6549,42 @@ def _ai_load_files_api(client) -> tuple:
     return document_blocks, files_used, fallback_text
 
 
-# ── Legacy inline readers (kept as fallback for files that can't be uploaded) ──
-
-def _ai_read_excel_stream(path):
-    try:
-        from openpyxl import load_workbook as _lw
-        wb  = _lw(path, read_only=True, data_only=True)
-        out = []
-        for sname in wb.sheetnames:
-            ws   = wb[sname]
-            rows = []
-            for i, row in enumerate(ws.iter_rows(values_only=True)):
-                if i >= _AI_EXCEL_MAX_ROWS:
-                    rows.append(f'... (showing first {_AI_EXCEL_MAX_ROWS} of more rows)')
-                    break
-                rows.append('\t'.join('' if c is None else str(c) for c in row))
-            out.append(f'[Sheet: {sname}]\n' + '\n'.join(rows))
-        wb.close()
-        return '\n\n'.join(out)
-    except Exception as e:
-        return f'[Excel read error: {e}]'
+# ── Legacy inline readers (fallback when Files API upload fails) ──────────────
 
 def _ai_read_csv_stream(path):
     try:
         chunks, total_rows = [], 0
         for chunk in pd.read_csv(path, chunksize=1000, encoding='utf-8',
                                   on_bad_lines='skip', low_memory=False):
-            chunks.append(chunk.fillna('')); total_rows += len(chunk)
-            if total_rows >= _AI_CSV_MAX_ROWS: break
-        if not chunks: return '[Empty CSV]'
+            chunks.append(chunk.fillna(''))
+            total_rows += len(chunk)
+            if total_rows >= _AI_CSV_MAX_ROWS:
+                break
+        if not chunks:
+            return '[Empty CSV]'
         df = pd.concat(chunks).head(_AI_CSV_MAX_ROWS)
         return f'({len(df):,} rows)\n{df.to_string(index=False)}'
     except Exception as e:
         return f'[CSV read error: {e}]'
 
+
 def _ai_read_pdf_stream(path):
-    if not _PYMUPDF_OK: return '[PyMuPDF not installed]'
+    if not _PYMUPDF_OK:
+        return '[PyMuPDF not installed]'
     try:
-        doc = _fitz.open(path); pages = []
+        doc   = _fitz.open(path)
+        pages = []
         for i in range(min(_AI_PDF_MAX_PAGES, len(doc))):
-            pages.append(f'[Page {i+1}]\n{doc[i].get_text()}')
-        doc.close(); return '\n'.join(pages)
+            pages.append(f'[Page {i + 1}]\n{doc[i].get_text()}')
+        doc.close()
+        return '\n'.join(pages)
     except Exception as e:
         return f'[PDF read error: {e}]'
 
+
 def _ai_read_docx_stream(path):
-    if not _DOCX_LIB_OK: return '[python-docx not installed]'
+    if not _DOCX_LIB_OK:
+        return '[python-docx not installed]'
     try:
         doc = _docx_lib.Document(path)
         return '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
@@ -6210,12 +6592,11 @@ def _ai_read_docx_stream(path):
         return f'[Docx read error: {e}]'
 
 
-# ── Simple-intent detection — skip DB loading for greetings/conversational msgs ─
-# Any message that matches this pattern gets answered without touching MongoDB
-# or reading files.  This saves 1-3 s of DB round-trips and avoids the AI
-# awkwardly citing voter data in response to "hi" or "thanks".
+# ════════════════════════════════════════════════════════════════════════════════
+# SIMPLE-INTENT DETECTION
+# ════════════════════════════════════════════════════════════════════════════════
 
-_SIMPLE_INTENT_RE = re.compile(
+_SIMPLE_INTENT_RE = _re2.compile(
     r'^\s*('
     r'hi+|hello+|hey+|howdy|'
     r'good\s*(morning|afternoon|evening|night|day)|'
@@ -6227,58 +6608,116 @@ _SIMPLE_INTENT_RE = re.compile(
     r'who\s+are\s+you|'
     r'help'
     r')\s*[!?.]*\s*$',
-    re.IGNORECASE,
+    _re2.IGNORECASE,
 )
 
+
 def _is_simple_message(msg: str) -> bool:
-    """Return True if the message is a simple greeting or conversational filler
-    that does not need any data source context."""
     return bool(_SIMPLE_INTENT_RE.match(msg.strip()))
 
 
-
-# ── System prompt ─────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════════
+# SYSTEM PROMPT
+# ════════════════════════════════════════════════════════════════════════════════
 
 _AI_CHAT_SYSTEM = """You are an expert political data analyst and constituency intelligence assistant for the Mangaluru South Assembly Constituency (Constituency 175), Karnataka, India.
 
 **Important behavioural rule**: If the user sends a simple greeting (e.g. "hi", "hello", "thanks", "bye") or a purely conversational message, reply warmly and naturally — do NOT reference data sources, tables, charts, or MongoDB context. Reserve data analysis only for questions that actually require it.
 
-You have access to LIVE data from MongoDB (aggregated summaries) PLUS the full content of data files supplied as document attachments (via Anthropic Files API). All data is real and current.
+You have access to LIVE data from MongoDB (aggregated summaries in the MONGODB DATA section below) PLUS the full content of data files supplied as document attachments via Anthropic Files API. All data is real and current.
 
-## Data sources:
-- 2025 voter roll: ward-wise and booth-wise totals, gender, religion (H/M/C)
-- Survey Records: field survey data — religion, community, economic status, employment, health, education, schemes used, outstation voters, BJP party members
-- 2023 election polling: polled vs not-polled by ward and religion with percentages
-- SIR analysis: comparison between 2002 and 2025 voter rolls (new additions, deletions, modifications, suspicious)
-- Future voters (eligible by 2028) and deceased records
-- Supplementary political/socio-economic files attached as documents below
+## MongoDB Collections (Live Aggregated Summaries)
 
-## Output formats:
+| Collection | What it contains |
+|---|---|
+| 2025 voter roll | Ward & booth totals, gender, religion (H/M/C) |
+| 2002 voter roll | Historical roll for SIR comparison |
+| SurveyRecords | Field survey: religion, community, economic status, employment, health, schemes, BJP members |
+| 2023_polled_notpolled | 2023 polling: polled vs not-polled by ward & religion |
+| Community_caste_based_count_2023 | Pre-aggregated community/caste polled totals |
+| Polled_NotPolled_caste_2023 | Per-voter caste + polling status |
+| ward-booth-2026 | Ward-level electors, cutoff, mapping stats |
+| ward-booth-details | Booth-level mapping & completion % |
+| Deceased | Deceased voter records |
+| FutureVoters | Future voters eligible by 2028 |
+| NotFoundRecordSurvey | Not-found voter survey records |
+| coastal_karnataka_all_references_castes | Surname → caste/community/region reference |
+| NewQueryStack1 | Constituency-level SWOT/intelligence |
+| SIR_NewAdditions | SIR: newly added voters |
+| SIR_NotFound | SIR: voters not found |
+| SIR_Suspicious | SIR: suspicious entries |
+| genuine_voters | SIR: confirmed genuine voters |
 
-### Tables — ALWAYS use GFM markdown pipe tables for any tabular or comparative data.
-Example format:
-| Ward | Hindu | Muslim | Christian | Total |
-|------|-------|--------|-----------|-------|
-| Padavu | 3200 | 450 | 120 | 3770 |
+## Data Files (Anthropic Files API — full content available as attached documents)
 
-Use tables for: ward comparisons, voter counts, religion breakdowns, scheme beneficiary lists,
-booth-wise data, any multi-column data, metrics, rankings, before/after comparisons.
-NEVER present structured data as raw pipe text without the separator (---|---) row.
+Each file is structured with per-sheet headers:
+  ## SHEET: <name>  ## DESCRIPTION: <meaning>  ## COLUMNS: ...  ## ROWS: N
 
-### Charts — include when a visual trend or distribution helps:
+| File | Election / Period | Key data |
+|---|---|---|
+| 2013_WARD_WISE_STATISTICAL_ANALYSIS.xlsx | 2013 Assembly | Booth-wise BJP/INC/JDS%, ward stats (mean/std dev), BJP/Congress win-loss |
+| 2013+_WARD_WISE_STATISTICAL_ANALYSIS.xlsx | 2013+ (Alliance) | Same for BJP+ alliance |
+| 2013_2013+_AND_2018_WARD_WISE_ANALYSIS.xlsx | 2013 vs 2013+ vs 2018 | 3-year ward comparison |
+| 2014_STATISTICAL_ANALYSIS.xlsx | 2014 (Lok Sabha) | Booth-wise BJP/INC/BSP/CPIM/AAP% |
+| 2014_WARD_WISE_ANALYSIS.xlsx | 2014 vs 2018 | Ward margin comparison across years |
+| 2014_AND_2018_WARD_WISE_STATISTICAL_ANALYSIS.xlsx | 2014 + 2018 | Dual year booth + ward stats |
+| 2018_WARD_WISE_STATISTICAL_ANALYSIS.xlsx | 2018 Assembly | Booth: male/female voters, BJP/INC/JDS/CPI% |
+| 2019_full_data4.xlsx | 2019 Lok Sabha | Booth: Ward, Total Polled, BJP%, INC%, OTH% |
+| 2023p.xlsx | 2023 Assembly | Per-booth candidate votes (Lobo vs Kamath), ward summary, 2023 vs 2018 per-ward sheets |
+| BJP_Boothwise_CasteReligion_Turnout_Strategy.xlsx | 2025 strategy | 249 booths × caste × religion × turnout, booth priority, community ranking |
+| BJP_Political_Intelligence_System.xlsx | Strategic intel | Ward Strength Index, root cause analysis, historical 2013–2023 trend, 5-pillar strategy, WSI scores |
+| Mangaluru_Election_Strategy_Report.xlsx | Campaign strategy | 244 booths STRONG/MEDIUM/WEAK, 2023 vs 2018, 90-day plan, SIR voter status |
+| Mangaluru_FULLSCALE_Analysis_v2.xlsx | Full analysis | Caste turnout matrix, non-polled opportunity, gender analysis, flip targets, 100-day plan |
+
+### Query routing — use these files for:
+- 2023 election results / candidate votes → **2023p.xlsx** (BOOTHWISE or WARD-BOOTH sheet)
+- 2018 results → **2018_WARD_WISE** or ward-specific sheets inside 2023p.xlsx
+- 2019 Lok Sabha → **2019_full_data4.xlsx**
+- 2014 results → **2014_STATISTICAL_ANALYSIS.xlsx**
+- 2013 / 2013+ results → **2013_WARD_WISE** / **2013+_WARD_WISE**
+- Historical trend 2013–2023 → **BJP_Political_Intelligence_System.xlsx** (HISTORICAL TREND sheet)
+- Booth priority / intervention → **Mangaluru_Election_Strategy_Report.xlsx** (BOOTH INTERVENTION) or **BJP_Boothwise**
+- Caste/community turnout → **BJP_Boothwise** (COMMUNITY ANALYSIS) or **Mangaluru_FULLSCALE** (CASTE TURNOUT MATRIX)
+- Ward strength (STRONG/MEDIUM/WEAK) → **BJP_Political_Intelligence_System.xlsx** (WSI SCORE) or **Mangaluru_Election_Strategy_Report**
+- Non-polled voter mobilization → **Mangaluru_FULLSCALE** (NON-POLLED OPPORTUNITY)
+- Gender analysis → **Mangaluru_FULLSCALE** or **Mangaluru_Election_Strategy_Report** (GENDER ANALYSIS)
+- 90-day/100-day action plan → **Mangaluru_Election_Strategy_Report** (90-DAY) or **Mangaluru_FULLSCALE** (100-DAY)
+- SIR / BLO mapping % → **Mangaluru_Election_Strategy_Report** (SIR & VOTER STATUS sheet)
+- Ward Strength Index / WSI → **BJP_Political_Intelligence_System** (WSI SCORE sheet)
+- Flip targets → **Mangaluru_FULLSCALE** (FLIP TARGETS sheet)
+
+## Output Formats
+
+### Tables — ALWAYS use GFM markdown pipe tables for tabular/comparative data.
+| Ward | BJP% | INC% | Margin | Status |
+|------|------|------|--------|--------|
+| Padavu | 62.3 | 35.1 | 27.2 | STRONG |
+
+Use for: ward comparisons, election results, caste breakdowns, booth rankings, multi-year comparisons.
+NEVER present structured data as plain text without the separator row.
+
+### Charts — include when visual trends add value:
 ```chartspec
 {"type":"bar","title":"...","labels":[...],"datasets":[{"label":"...","data":[...]}]}
 ```
-Supported types: bar, line, pie, doughnut, radar, stackedBar
+Supported: bar, line, pie, doughnut, radar, stackedBar
 
-### Exports — include when user asks for a downloadable file:
+### Exports — when user asks for download:
 ```exportspec
 {"format":"csv","filename":"analysis.csv","columns":["Col1","Col2"],"rows":[{"Col1":"v1","Col2":"v2"}]}
 ```
 Formats: csv, xlsx, pdf
 
-## Ward reference (21–60):
-21=PADAVU, 24=DEREBAIL SOUTH, 25=DEREBAIL WEST, 26=DEREBAIL SOUTH WEST, 27=BOLOOR, 28=MANNAGUDDA, 29=KAMBLA, 30=KODIALBAIL, 31=BEJAI, 32=KADRI NORTH, 33=KADRI SOUTH, 34=SHIVBHAG, 35=PADAVU CENTRAL, 36=PADAVU POORVA, 37=MAROLI, 38=BENDUR, 39=FALNIR, 40=COURT, 41=CENTRAL, 42=DONGERKERY, 43=KUDROLI, 44=NAVAYATH, 45=PORT, 46=CANTONMENT, 47=MILAGRIS, 48=VALENCIA, 49=KANKANADY, 50=ALAPE DAKSHINA, 51=ALAPE UTTARA, 52=KANNUR, 53=BAJAL, 54=JEPPINAMUGER, 55=ATTAVARA, 56=MANGALADEVI, 57=HOIGE BAZAR, 58=BOLAR, 59=JEPPU, 60=BENGRE.
+## Ward Reference (21–60)
+21=PADAVU, 24=DEREBAIL SOUTH, 25=DEREBAIL WEST, 26=DEREBAIL SOUTH WEST,
+27=BOLOOR, 28=MANNAGUDDA, 29=KAMBLA, 30=KODIALBAIL, 31=BEJAI,
+32=KADRI NORTH, 33=KADRI SOUTH, 34=SHIVBHAG, 35=PADAVU CENTRAL,
+36=PADAVU POORVA, 37=MAROLI, 38=BENDUR, 39=FALNIR, 40=COURT,
+41=CENTRAL, 42=DONGERKERY, 43=KUDROLI, 44=NAVAYATH, 45=PORT,
+46=CANTONMENT, 47=MILAGRIS, 48=VALENCIA, 49=KANKANADY,
+50=ALAPE DAKSHINA, 51=ALAPE UTTARA, 52=KANNUR, 53=BAJAL,
+54=JEPPINAMUGER, 55=ATTAVARA, 56=MANGALADEVI, 57=HOIGE BAZAR,
+58=BOLAR, 59=JEPPU, 60=BENGRE.
 Religion: H=Hindu, M=Muslim, C=Christian.
 
 ## LIVE MONGODB DATA:
@@ -6286,17 +6725,20 @@ Religion: H=Hindu, M=Muslim, C=Christian.
 """
 
 
-# ── Export helper ─────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════════
+# EXPORT HELPER
+# ════════════════════════════════════════════════════════════════════════════════
 
 def _ai_make_export(spec, fmt):
     columns = spec.get('columns', [])
     rows    = spec.get('rows', [])
     fname   = spec.get('filename', f'export_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
-    df = pd.DataFrame(rows, columns=columns) if columns else pd.DataFrame(rows)
+    df      = pd.DataFrame(rows, columns=columns) if columns else pd.DataFrame(rows)
 
     if fmt == 'csv':
-        buf = _io.BytesIO(); df.to_csv(buf, index=False)
-        return buf.getvalue(), 'text/csv', fname if fname.endswith('.csv') else fname+'.csv'
+        buf = _io.BytesIO()
+        df.to_csv(buf, index=False)
+        return buf.getvalue(), 'text/csv', fname if fname.endswith('.csv') else fname + '.csv'
 
     if fmt in ('xlsx', 'excel'):
         buf = _io.BytesIO()
@@ -6304,7 +6746,7 @@ def _ai_make_export(spec, fmt):
             df.to_excel(w, index=False, sheet_name='Data')
         return (buf.getvalue(),
                 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                fname if fname.endswith('.xlsx') else fname+'.xlsx')
+                fname if fname.endswith('.xlsx') else fname + '.xlsx')
 
     try:
         from reportlab.lib.pagesizes import A4
@@ -6313,34 +6755,31 @@ def _ai_make_export(spec, fmt):
         from reportlab.lib.styles import getSampleStyleSheet
         buf  = _io.BytesIO()
         doc  = SimpleDocTemplate(buf, pagesize=A4)
-        data = [columns] + [[str(r.get(c,'')) for c in columns] for r in rows]
+        data = [columns] + [[str(r.get(c, '')) for c in columns] for r in rows]
         tbl  = Table(data)
         tbl.setStyle(TableStyle([
-            ('BACKGROUND',(0,0),(-1,0),_rlc.HexColor('#1a237e')),
-            ('TEXTCOLOR',(0,0),(-1,0),_rlc.white),
-            ('ROWBACKGROUNDS',(0,1),(-1,-1),[_rlc.white,_rlc.HexColor('#f5f5f5')]),
-            ('GRID',(0,0),(-1,-1),0.5,_rlc.grey),
+            ('BACKGROUND', (0, 0), (-1, 0), _rlc.HexColor('#1a237e')),
+            ('TEXTCOLOR',  (0, 0), (-1, 0), _rlc.white),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [_rlc.white, _rlc.HexColor('#f5f5f5')]),
+            ('GRID', (0, 0), (-1, -1), 0.5, _rlc.grey),
         ]))
         doc.build([Paragraph(fname, getSampleStyleSheet()['Title']), tbl])
-        return buf.getvalue(),'application/pdf', fname if fname.endswith('.pdf') else fname+'.pdf'
+        return (buf.getvalue(), 'application/pdf',
+                fname if fname.endswith('.pdf') else fname + '.pdf')
     except ImportError:
-        buf = _io.BytesIO(); df.to_csv(buf, index=False)
-        return buf.getvalue(),'text/csv', fname.replace('.pdf','.csv')
+        buf = _io.BytesIO()
+        df.to_csv(buf, index=False)
+        return buf.getvalue(), 'text/csv', fname.replace('.pdf', '.csv')
 
 
-# ── Views ─────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════════
+# VIEWS
+# ════════════════════════════════════════════════════════════════════════════════
 
 @csrf_exempt
 @require_http_methods(["POST", "OPTIONS"])
 def api_swot_overview(request):
-    """
-    POST /api/ai/swot-overview/
-    Body: { "tab": "swot"|"wards"|"demographic"|"election", "tabData": "<serialised tab data>" }
-
-    The frontend serialises the exact data arrays shown in that tab and sends it here.
-    Claude analyses that data directly — no MongoDB lookup needed.
-    """
-    # Handle CORS preflight
+    """POST /api/ai/swot-overview/"""
     if request.method == 'OPTIONS':
         return _ai_cors(request, JsonResponse({}))
 
@@ -6378,7 +6817,7 @@ def api_swot_overview(request):
         ),
         "wards": (
             "Analyse ward-by-ward electoral strength for Mangaluru City South. "
-            "Focus on: strong vs narrow vs lost ward patterns, turnout performance (STRONG vs AVG polling), "
+            "Focus on: strong vs narrow vs lost ward patterns, turnout performance, "
             "which wards are most at risk, which need turnout push, and the overall distribution. "
             "Cite specific ward names, BJP%, turnout figures from the data."
         ),
@@ -6392,7 +6831,7 @@ def api_swot_overview(request):
         "election": (
             "Analyse the 5-election historical trend for Mangaluru City South (2013-2023). "
             "Focus on: which wards are structurally BJP vs structurally Congress across elections, "
-            "which wards showed dangerous swings (Bengre, Bajal), booth flip patterns, "
+            "which wards showed dangerous swings, booth flip patterns, "
             "vote leakage via 3rd parties, variance/stability scores, and 2028 outlook. "
             "Cite specific elections, ward names, swing percentages, and booth numbers from the data."
         ),
@@ -6403,7 +6842,7 @@ def api_swot_overview(request):
         "Constituency 175, Mangaluru City Municipal Corporation — 38 wards, 2023 election data.\n\n"
         f"TASK: {TAB_FOCUS.get(tab, TAB_FOCUS['swot'])}\n\n"
         "The user has provided the exact data from the tab they are viewing. "
-        "Analyse only what is in the data. Do not invent numbers or reference data not provided.\n\n"
+        "Analyse only what is in the data. Do not invent numbers.\n\n"
         "Return ONLY a valid JSON object — no markdown fences, no preamble, no trailing text.\n"
         "Schema (all fields required, every field must contain real data from the input):\n"
         '{\n'
@@ -6425,33 +6864,27 @@ def api_swot_overview(request):
 
     user_prompt = (
         f"Tab: {TAB_TITLES.get(tab, tab)}\n\n"
-        f"=== TAB DATA (exact data shown in this tab) ===\n{tab_data}"
+        f"=== TAB DATA ===\n{tab_data}"
     )
 
     try:
-        client = _get_anthropic()
+        client  = _get_anthropic()
         message = client.messages.create(
             model      = "claude-haiku-4-5-20251001",
-            max_tokens = 1500,           # raised: 900 was causing JSON truncation mid-response
+            max_tokens = 1500,
             system     = system_prompt,
             messages   = [{"role": "user", "content": user_prompt}],
         )
         raw = "".join(b.text for b in message.content if hasattr(b, "text")).strip()
-
-        # ── Strip markdown fences properly (lstrip/rstrip work on char sets, not substrings) ──
-        raw = re.sub(r'^```(?:json)?\s*', '', raw)   # leading ```json or ```
-        raw = re.sub(r'\s*```$',          '', raw)   # trailing ```
+        raw = _re2.sub(r'^```(?:json)?\s*', '', raw)
+        raw = _re2.sub(r'\s*```$', '',          raw)
         raw = raw.strip()
-
-        # ── If model added preamble/postamble, extract the JSON object ──
-        m = re.search(r'\{[\s\S]*\}', raw)
+        m   = _re2.search(r'\{[\s\S]*\}', raw)
         if m:
             raw = m.group(0)
-
         try:
             overview = json.loads(raw)
         except json.JSONDecodeError:
-            # Last-resort: return a clean error object (no raw JSON leaked into fields)
             overview = {
                 "headline": f"{TAB_TITLES.get(tab, tab)} — Analysis",
                 "summary":  "The AI response could not be parsed. Please regenerate.",
@@ -6463,16 +6896,11 @@ def api_swot_overview(request):
         traceback.print_exc()
         return _ai_cors(request, JsonResponse({"error": str(exc)}, status=500))
 
+
 @csrf_exempt
 @require_http_methods(['POST', 'GET', 'OPTIONS'])
 def api_ai_chat(request):
-    """
-    POST /api/ai/chat/
-
-    Data files in backend/data/ are uploaded to Anthropic Files API once
-    and referenced by file_id on every subsequent request — no text injection,
-    no context-window waste, full file content always available to the model.
-    """
+    """POST /api/ai/chat/"""
     if request.method == 'OPTIONS':
         return _ai_cors(request, JsonResponse({}))
 
@@ -6490,17 +6918,16 @@ def api_ai_chat(request):
     except Exception:
         return _ai_err(request, 'Invalid JSON body.', 400)
 
-    message      = (body.get('message') or '').strip()
-    history      = body.get('history', [])
+    message = (body.get('message') or '').strip()
+    history = body.get('history', [])
     if not message:
         return _ai_err(request, 'message field is required.', 400)
 
-    # Get Anthropic client
     client, err = _ai_get_client()
     if not client:
         return _ai_err(request, err, 500)
 
-    # ── Simple/conversational message — skip all data loading ───────────────
+    # ── Simple / conversational — skip data loading ───────────────────────────
     if _is_simple_message(message):
         _simple_system = (
             "You are a friendly assistant for Mangaluru South Constituency Connect. "
@@ -6509,8 +6936,8 @@ def api_ai_chat(request):
         )
         msgs = []
         for h in history[-10:]:
-            r, c = h.get('role','user'), h.get('content','')
-            if r in ('user','assistant') and c:
+            r, c = h.get('role', 'user'), h.get('content', '')
+            if r in ('user', 'assistant') and c:
                 msgs.append({'role': r, 'content': c})
         msgs.append({'role': 'user', 'content': message})
         try:
@@ -6518,7 +6945,7 @@ def api_ai_chat(request):
                 model='claude-haiku-4-5-20251001', max_tokens=256,
                 system=_simple_system, messages=msgs,
             )
-            reply_text = ''.join(b.text for b in response.content if hasattr(b,'text'))
+            reply_text = ''.join(b.text for b in response.content if hasattr(b, 'text'))
         except Exception as e:
             traceback.print_exc()
             return _ai_err(request, f'Anthropic API error: {e}', 500)
@@ -6527,13 +6954,12 @@ def api_ai_chat(request):
             'chartSpec': None, 'exportSpec': None, 'filesUsed': [],
         }))
 
-    # ── Data question — load MongoDB context + Files API documents ───────────
+    # ── Data question — load everything in parallel ───────────────────────────
     mongo_ctx    = ''
     all_sources  = []
     doc_blocks   = []
     fallback_txt = ''
 
-    # Always load MongoDB context + Files API documents
     try:
         mongo_ctx, mongo_sources = _ai_load_mongo_context()
         all_sources.extend(mongo_sources)
@@ -6547,31 +6973,22 @@ def api_ai_chat(request):
         print(f'[Files API] Error in _ai_load_files_api: {e}')
         fallback_txt = f'[Files API error: {e}]'
 
-    # Build system prompt (no FILE_CONTEXT placeholder — files go as doc blocks)
     system_prompt = _AI_CHAT_SYSTEM.replace('{MONGO_CONTEXT}', mongo_ctx)
 
-    # Append inline fallback text to system prompt if any files couldn't be uploaded
     if fallback_txt:
         system_prompt += f'\n\n## INLINE FILE CONTEXT (Files API fallback):\n{fallback_txt}'
 
-    # ── Build messages — history + document blocks + current question ────────
+    # ── Build messages ────────────────────────────────────────────────────────
     messages = []
-
-    # Conversation history (plain text only, no doc blocks in history)
     for h in history[-20:]:
-        r, c = h.get('role','user'), h.get('content','')
-        if r in ('user','assistant') and c:
+        r, c = h.get('role', 'user'), h.get('content', '')
+        if r in ('user', 'assistant') and c:
             messages.append({'role': r, 'content': c})
 
-    # Current user turn: prepend file document blocks before the question
-    if doc_blocks:
-        user_content = doc_blocks + [{'type': 'text', 'text': message}]
-    else:
-        user_content = message
-
+    user_content = (doc_blocks + [{'type': 'text', 'text': message}]) if doc_blocks else message
     messages.append({'role': 'user', 'content': user_content})
 
-    # ── Call Anthropic (claude-sonnet — Files API requires betas header) ─────
+    # ── Call Anthropic ────────────────────────────────────────────────────────
     try:
         kwargs = dict(
             model      = 'claude-sonnet-4-20250514',
@@ -6579,7 +6996,6 @@ def api_ai_chat(request):
             system     = system_prompt,
             messages   = messages,
         )
-        # Files API requires beta client — betas param only works on client.beta.messages.create()
         if doc_blocks:
             response = client.beta.messages.create(
                 **kwargs,
@@ -6587,46 +7003,57 @@ def api_ai_chat(request):
             )
         else:
             response = client.messages.create(**kwargs)
-        reply_text = ''.join(b.text for b in response.content if hasattr(b,'text'))
+
+        reply_text = ''.join(b.text for b in response.content if hasattr(b, 'text'))
     except Exception as e:
         traceback.print_exc()
         return _ai_err(request, f'Anthropic API error: {e}', 500)
 
-    # Parse embedded chart / export specs
+    # ── Parse embedded specs ──────────────────────────────────────────────────
     chart_spec = export_spec = None
     try:
-        m = re.search(r'```chartspec\s*(\{.*?\})\s*```', reply_text, re.DOTALL)
-        if m: chart_spec = json.loads(m.group(1))
-    except Exception: pass
+        m = _re2.search(r'```chartspec\s*(\{.*?\})\s*```', reply_text, _re2.DOTALL)
+        if m:
+            chart_spec = json.loads(m.group(1))
+    except Exception:
+        pass
     try:
-        m = re.search(r'```exportspec\s*(\{.*?\})\s*```', reply_text, re.DOTALL)
-        if m: export_spec = json.loads(m.group(1))
-    except Exception: pass
+        m = _re2.search(r'```exportspec\s*(\{.*?\})\s*```', reply_text, _re2.DOTALL)
+        if m:
+            export_spec = json.loads(m.group(1))
+    except Exception:
+        pass
 
-    clean = re.sub(r'```(chartspec|exportspec).*?```','', reply_text, flags=re.DOTALL).strip()
+    clean = _re2.sub(r'```(chartspec|exportspec).*?```', '', reply_text,
+                     flags=_re2.DOTALL).strip()
 
     return _ai_cors(request, JsonResponse({
-        'success': True, 'reply': clean,
-        'chartSpec': chart_spec, 'exportSpec': export_spec,
-        'filesUsed': all_sources,
+        'success'   : True,
+        'reply'     : clean,
+        'chartSpec' : chart_spec,
+        'exportSpec': export_spec,
+        'filesUsed' : all_sources,
     }))
 
 
 @csrf_exempt
 @require_http_methods(['POST', 'OPTIONS'])
 def api_ai_chat_export(request):
+    """POST /api/ai/chat/export/"""
     if request.method == 'OPTIONS':
         return _ai_cors(request, JsonResponse({}))
     try:
         user = _user_from_request(request)
     except Exception as e:
         return _ai_err(request, f'Auth error: {e}', 500)
-    if not user:   return _ai_err(request, 'Authentication required.', 401)
-    if not _is_approved(user): return _ai_err(request, 'Account pending approval.', 403)
+    if not user:
+        return _ai_err(request, 'Authentication required.', 401)
+    if not _is_approved(user):
+        return _ai_err(request, 'Account pending approval.', 403)
     try:
         body = json.loads(request.body)
         spec = body.get('exportSpec', {})
-        fmt  = spec.get('format','csv').lower()
+        fmt  = spec.get('format', 'csv').lower()
     except Exception:
         return _ai_err(request, 'Invalid request body.', 400)
     try:
@@ -6643,75 +7070,95 @@ def api_ai_chat_export(request):
 @csrf_exempt
 @require_http_methods(['GET', 'OPTIONS'])
 def api_ai_data_files(request):
+    """GET /api/ai/data-files/ — list all data sources with counts."""
     if request.method == 'OPTIONS':
         return _ai_cors(request, JsonResponse({}))
     try:
         user = _user_from_request(request)
     except Exception as e:
         return _ai_err(request, f'Auth error: {e}', 500)
-    if not user:   return _ai_err(request, 'Authentication required.', 401)
-    if not _is_approved(user): return _ai_err(request, 'Account pending approval.', 403)
+    if not user:
+        return _ai_err(request, 'Authentication required.', 401)
+    if not _is_approved(user):
+        return _ai_err(request, 'Account pending approval.', 403)
 
     # MongoDB collection counts
     mongo_sources = []
     try:
-        db1 = get_db(); db2 = get_survey_db()
+        db1 = get_db()
+        db2 = get_survey_db()
         mongo_sources = [
-            {'name':'2025 Voter Roll',   'ext':'mongodb','type':'collection',
+            {'name': '2025 Voter Roll',              'ext': 'mongodb', 'type': 'collection',
              'size': db1['2025'].estimated_document_count()},
-            {'name':'Survey Records',    'ext':'mongodb','type':'collection',
+            {'name': 'Survey Records',               'ext': 'mongodb', 'type': 'collection',
              'size': db2['SurveyRecords'].estimated_document_count()},
-            {'name':'2023 Polling Data', 'ext':'mongodb','type':'collection',
+            {'name': '2023 Polling Data',            'ext': 'mongodb', 'type': 'collection',
              'size': db2['2023_polled_notpolled'].estimated_document_count()},
-            {'name':'2002 Voter Roll',   'ext':'mongodb','type':'collection',
+            {'name': '2002 Voter Roll',              'ext': 'mongodb', 'type': 'collection',
              'size': db2['2002'].estimated_document_count()},
-            {'name':'Future Voters',     'ext':'mongodb','type':'collection',
+            {'name': 'Future Voters',                'ext': 'mongodb', 'type': 'collection',
              'size': db2['FutureVoters'].estimated_document_count()},
-            {'name':'Deceased Records',  'ext':'mongodb','type':'collection',
+            {'name': 'Deceased Records',             'ext': 'mongodb', 'type': 'collection',
              'size': db2['Deceased'].estimated_document_count()},
+            {'name': 'Community/Caste Count 2023',   'ext': 'mongodb', 'type': 'collection',
+             'size': db2['Community_caste_based_count_2023'].estimated_document_count()},
+            {'name': 'Polled/NotPolled Caste 2023',  'ext': 'mongodb', 'type': 'collection',
+             'size': db2['Polled_NotPolled_caste_2023'].estimated_document_count()},
+            {'name': 'SIR New Additions',            'ext': 'mongodb', 'type': 'collection',
+             'size': db2['SIR_NewAdditions'].estimated_document_count()},
+            {'name': 'SIR Not Found',                'ext': 'mongodb', 'type': 'collection',
+             'size': db2['SIR_NotFound'].estimated_document_count()},
+            {'name': 'SIR Suspicious',               'ext': 'mongodb', 'type': 'collection',
+             'size': db2['SIR_Suspicious'].estimated_document_count()},
+            {'name': 'Genuine Voters',               'ext': 'mongodb', 'type': 'collection',
+             'size': db2['genuine_voters'].estimated_document_count()},
+            {'name': 'NotFoundRecordSurvey',         'ext': 'mongodb', 'type': 'collection',
+             'size': db2['NotFoundRecordSurvey'].estimated_document_count()},
+            {'name': 'Coastal Caste Reference',      'ext': 'mongodb', 'type': 'collection',
+             'size': db2['coastal_karnataka_all_references_castes'].estimated_document_count()},
+            {'name': 'Ward Info 2026',               'ext': 'mongodb', 'type': 'collection',
+             'size': db2['ward-booth-2026'].estimated_document_count()},
+            {'name': 'Booth Details',                'ext': 'mongodb', 'type': 'collection',
+             'size': db2['ward-booth-details'].estimated_document_count()},
         ]
     except Exception as e:
-        mongo_sources = [{'name':f'MongoDB error: {e}','ext':'error','size':0,'type':'error'}]
+        mongo_sources = [{'name': f'MongoDB error: {e}', 'ext': 'error', 'size': 0, 'type': 'error'}]
 
-    # Local files — show size + Files API upload status
+    # Local files
     local_files = []
     try:
         if _os2.path.isdir(_AI_DATA_DIR):
             for fname in sorted(_os2.listdir(_AI_DATA_DIR)):
                 ext = _os2.path.splitext(fname)[1].lower()
-                if ext not in _AI_SUPPORTED_EXTS: continue
-                path    = _os2.path.join(_AI_DATA_DIR, fname)
-                size_b  = _os2.path.getsize(path)
-                size_mb = size_b / (1024 * 1024)
-                # Check Files API cache
+                if ext not in _AI_SUPPORTED_EXTS:
+                    continue
+                path   = _os2.path.join(_AI_DATA_DIR, fname)
+                size_b = _os2.path.getsize(path)
                 try:
                     stat      = _os2.stat(path)
                     cache_key = (fname, int(stat.st_mtime), stat.st_size)
                     file_id   = _AI_FILE_ID_CACHE.get(cache_key)
                 except Exception:
                     file_id = None
-
                 local_files.append({
-                    'name':       fname,
-                    'ext':        ext.lstrip('.'),
-                    'size':       size_b,
-                    'size_mb':    round(size_mb, 1),
-                    'type':       'file',
-                    'file_id':    file_id,          # None = not yet uploaded
-                    'via_files_api': bool(file_id), # True = cached & ready
+                    'name'         : fname,
+                    'ext'          : ext.lstrip('.'),
+                    'size'         : size_b,
+                    'size_mb'      : round(size_b / (1024 * 1024), 1),
+                    'type'         : 'file',
+                    'file_id'      : file_id,
+                    'via_files_api': bool(file_id),
                 })
     except Exception as e:
-        local_files = [{'name':f'File error: {e}','ext':'error','size':0,'type':'error'}]
+        local_files = [{'name': f'File error: {e}', 'ext': 'error', 'size': 0, 'type': 'error'}]
 
     cached_count = sum(1 for f in local_files if f.get('via_files_api'))
 
     return _ai_cors(request, JsonResponse({
-        'success':          True,
-        'files':            mongo_sources + local_files,
-        'mongo_count':      len(mongo_sources),
-        'file_count':       len(local_files),
+        'success'         : True,
+        'files'           : mongo_sources + local_files,
+        'mongo_count'     : len(mongo_sources),
+        'file_count'      : len(local_files),
         'files_api_cached': cached_count,
-        'limits': {
-            'max_files': _AI_MAX_FILES,
-        },
+        'limits'          : {'max_files': _AI_MAX_FILES},
     }))
