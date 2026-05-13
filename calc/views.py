@@ -6338,7 +6338,19 @@ def _xlsx_to_csv_bytes(path: str) -> bytes:
 
     try:
         import openpyxl as _opxl
-        wb  = _opxl.load_workbook(path, data_only=True)
+        # First attempt: normal load.
+        # Some xlsx files have corrupt merged-cell ranges that make openpyxl
+        # crash deep inside bind_merged_cells(), raising SystemExit via gunicorn's
+        # SIGKILL handler — which bypasses a plain `except Exception`.
+        # Fallback: read_only=True skips merge-cell processing entirely.
+        try:
+            wb = _opxl.load_workbook(path, data_only=True)
+        except BaseException as _wb_err:
+            print(f'[xlsx loader] Normal load failed for {path}: {_wb_err!r} — retrying read_only')
+            try:
+                wb = _opxl.load_workbook(path, data_only=True, read_only=True)
+            except BaseException as _wb_err2:
+                raise RuntimeError(f'openpyxl failed (normal + read_only): {_wb_err2}') from _wb_err2
         buf = _io.StringIO()
 
         fname = path.split('/')[-1]
@@ -6422,7 +6434,10 @@ def _xlsx_to_csv_bytes(path: str) -> bytes:
         wb.close()
         return buf.getvalue().encode('utf-8')
 
-    except Exception as e:
+    except BaseException as e:
+        # BaseException (not just Exception) is required here because openpyxl can
+        # trigger gunicorn's signal handler mid-stack, raising SystemExit, which
+        # is NOT a subclass of Exception and would otherwise escape this handler.
         return f'[Excel conversion error for {path}: {e}]'.encode('utf-8')
 
 
@@ -6448,7 +6463,15 @@ def _get_or_upload_file(client, fname: str, path: str) -> tuple:
 
     try:
         if ext in _FILES_API_CONVERT:
-            file_bytes  = _xlsx_to_csv_bytes(path)   # ← smart chunker
+            try:
+                file_bytes = _xlsx_to_csv_bytes(path)   # ← smart chunker
+            except BaseException as _conv_err:
+                # Corrupt xlsx can raise SystemExit (gunicorn SIGKILL) which
+                # escapes a plain `except Exception`. Catch it here so one bad
+                # file never brings down the whole request worker.
+                print(f'[Files API] xlsx conversion raised {type(_conv_err).__name__} '
+                      f'for {fname}: {_conv_err!r} — skipping file')
+                return None, fname, None
             upload_name = fname.rsplit('.', 1)[0] + '.txt'
             mime        = 'text/plain'
         elif ext in _FILES_API_MIME:
@@ -6477,7 +6500,7 @@ def _get_or_upload_file(client, fname: str, path: str) -> tuple:
 
         return fid, fname, mime
 
-    except Exception as e:
+    except BaseException as e:
         print(f'[Files API] Upload failed for {fname}: {e}')
         return None, fname, None
 
@@ -6580,7 +6603,7 @@ def _ai_load_files_api(client, message: str = '') -> tuple:
                 excerpt = raw[:_AI_CHARS_PER_FILE]
                 fallback_parts.append(f'===== FILE: {fname} =====\n{excerpt}')
                 files_used.append(fname + ' (inline)')
-            except Exception as e:
+            except BaseException as e:
                 print(f'[Files API] Inline fallback also failed for {fname}: {e}')
 
     fallback_text = '\n\n'.join(fallback_parts)
