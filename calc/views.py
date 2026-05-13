@@ -4813,7 +4813,7 @@ def _get_anthropic():
 
 
 @csrf_exempt
-@require_http_methods(["POST"])
+@require_http_methods(["POST", "OPTIONS"])
 def api_ai_query_insight(request):
     """
     POST /api/ai/query-insight/
@@ -4840,14 +4840,18 @@ def api_ai_query_insight(request):
         "riskColor": str
     }
     """
+    # ── Handle CORS preflight ──────────────────────────────────────────────────
+    if request.method == "OPTIONS":
+        return _ai_cors(request, JsonResponse({}))
+
     user = _user_from_request(request)
     if not user:
-        return JsonResponse({"error": "Unauthorized"}, status=401)
+        return _ai_cors(request, JsonResponse({"error": "Unauthorized"}, status=401))
 
     try:
         body = json.loads(request.body)
     except Exception:
-        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+        return _ai_cors(request, JsonResponse({"error": "Invalid JSON body."}, status=400))
 
     query_obj    = body.get("query", {})
     columns      = body.get("columns", [])
@@ -4906,11 +4910,13 @@ def api_ai_query_insight(request):
 
     try:
         client = _get_anthropic()
+        # timeout=25 ensures we fail cleanly before Gunicorn's worker timeout kills the process
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1200,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
+            timeout=25.0,
         )
         raw = "".join(b.text for b in message.content if hasattr(b, "text")).strip()
         # Strip markdown fences if present
@@ -4919,9 +4925,9 @@ def api_ai_query_insight(request):
             insight = json.loads(raw)
         except json.JSONDecodeError:
             insight = {"_raw": raw}
-        return JsonResponse({"success": True, "insight": insight})
+        return _ai_cors(request, JsonResponse({"success": True, "insight": insight}))
     except Exception as exc:
-        return JsonResponse({"error": str(exc)}, status=500)
+        return _ai_cors(request, JsonResponse({"error": str(exc)}, status=500))
 
 
 @csrf_exempt
