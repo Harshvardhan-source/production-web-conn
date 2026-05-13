@@ -4887,8 +4887,8 @@ def api_ai_query_insight(request):
         '{"ctx":"Health","signal":"S/W/O/T/N","color":"#22d3ee","note":"1 line"},'
         '{"ctx":"Political","signal":"S/W/O/T/N","color":"#f59e0b","note":"1 line"}]},'
         '"suggestedSchemes":['
-        '{"name":"Scheme name (central or state)","ministry":"Ministry/Department","relevance":"Why it applies to this voter segment","impact":"High/Medium/Low"},'
-        '{"name":"Another applicable scheme","ministry":"Ministry/Department","relevance":"Why it applies","impact":"High/Medium/Low"}'
+        '{"name":"Scheme name (central or state)","ministry":"Ministry/Department","relevance":"Why it applies to this voter segment","impact":"High/Medium/Low","url":"https://official-portal.gov.in"},'
+        '{"name":"Another applicable scheme","ministry":"Ministry/Department","relevance":"Why it applies","impact":"High/Medium/Low","url":"https://official-portal.gov.in"}'
         '],'
         '"recommendation":"One specific actionable recommendation for 2028",'
         '"riskLevel":"Low/Medium/High/Critical",'
@@ -4896,10 +4896,24 @@ def api_ai_query_insight(request):
         "For suggestedSchemes: include 2-4 real central/state government schemes (Karnataka or India) "
         "that are most applicable to this voter segment based on their demographic filters "
         "(economic status, employment, health, education, religion, community). "
-        "Examples: PM-KISAN for farmers, Ayushman Bharat for health, PM Awas Yojana for housing, "
-        "Skill India for unemployed youth, PM Ujjwala for BPL women, MGNREGS for rural labour, "
-        "Karnataka Rajiv Gandhi Housing Corp schemes, Devaraj Urs BC Corporation loans, etc. "
-        "Only suggest schemes genuinely relevant to the segment's filters."
+        "For the url field use the REAL official government portal. Verified URLs: "
+        "PM-KISAN farmers: https://pmkisan.gov.in | "
+        "Ayushman Bharat health: https://pmjay.gov.in | "
+        "PM Awas Yojana Urban housing: https://pmaymis.gov.in | "
+        "PM Awas Yojana Gramin housing: https://pmayg.nic.in | "
+        "Skill India PMKVY unemployed youth: https://www.skillindia.gov.in | "
+        "PM Ujjwala BPL women LPG: https://www.pmuy.gov.in | "
+        "MGNREGS rural labour: https://nrega.nic.in | "
+        "PM Mudra loans small business: https://www.mudra.org.in | "
+        "National Scholarships students: https://scholarships.gov.in | "
+        "eShram unorganised workers: https://eshram.gov.in | "
+        "PM SVANidhi street vendors: https://pmsvanidhi.mohua.gov.in | "
+        "Swachh Bharat sanitation: https://swachhbharatmission.gov.in | "
+        "Karnataka Seva Sindhu (Gruha Lakshmi/Yuva Nidhi/Anna Bhagya): https://sevasindhu.karnataka.gov.in | "
+        "Karnataka Rajiv Gandhi Housing: https://www.rajivgruhakalpa.kar.nic.in | "
+        "Devaraj Urs BC Corporation loans OBC: https://www.dbcck.karnataka.gov.in. "
+        "Only suggest schemes genuinely relevant to the segment's filters. "
+        "Always use a real .gov.in URL from the list above — never invent a URL."
     )
 
     try:
