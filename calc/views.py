@@ -7162,3 +7162,217 @@ def api_ai_data_files(request):
         'files_api_cached': cached_count,
         'limits'          : {'max_files': _AI_MAX_FILES},
     }))
+    
+    
+_PLACE_ALLOWED_TYPES = {'club', 'temple', 'church', 'mosque'}
+
+
+def _places_cors(request, response):
+    origin = request.META.get('HTTP_ORIGIN', '')
+    if origin:
+        response['Access-Control-Allow-Origin']      = origin
+        response['Access-Control-Allow-Credentials'] = 'true'
+        response['Access-Control-Allow-Methods']     = 'GET, POST, DELETE, OPTIONS'
+        response['Access-Control-Allow-Headers']     = (
+            'Content-Type, Authorization, X-CSRFToken'
+        )
+    return response
+
+
+@csrf_exempt
+@require_http_methods(['GET', 'POST', 'DELETE', 'OPTIONS'])
+def api_ward_places(request):
+    """GET/POST/DELETE /api/ward-places/"""
+
+    if request.method == 'OPTIONS':
+        return _places_cors(request, JsonResponse({}))
+
+    # ── Auth ─────────────────────────────────────────────────────────────────
+    try:
+        user = _user_from_request(request)
+    except Exception as e:
+        return _places_cors(request, JsonResponse({'success': False, 'message': f'Auth error: {e}'}, status=500))
+    if not user:
+        return _places_cors(request, JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401))
+    if not _is_approved(user):
+        return _places_cors(request, JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403))
+
+    coll = get_survey_db()['WardData']
+
+    # ── GET — list all places for a ward ──────────────────────────────────────
+    if request.method == 'GET':
+        ward = request.GET.get('ward', '').strip()
+        if not ward:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'ward param required.'}, status=400))
+        try:
+            ward_int = int(ward)
+        except ValueError:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'ward must be a number.'}, status=400))
+
+        docs = list(coll.find(
+            {'ward': ward_int, 'record_type': 'local_place'},
+            {'_id': 1, 'type': 1, 'name': 1, 'address': 1, 'createdAt': 1, 'createdBy': 1}
+        ).sort('createdAt', 1))
+
+        for d in docs:
+            d['_id'] = str(d['_id'])
+            if isinstance(d.get('createdAt'), datetime):
+                d['createdAt'] = d['createdAt'].isoformat()
+
+        return _places_cors(request, JsonResponse({'success': True, 'places': docs}))
+
+    # ── POST — add a new place ────────────────────────────────────────────────
+    if request.method == 'POST':
+        try:
+            body = json.loads(request.body)
+        except Exception:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'Invalid JSON.'}, status=400))
+
+        ward      = body.get('ward')
+        ward_name = (body.get('wardName') or '').strip()
+        ptype     = (body.get('type') or '').strip().lower()
+        name      = (body.get('name') or '').strip()
+        address   = (body.get('address') or '').strip()
+
+        if not ward:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'ward is required.'}, status=400))
+        if ptype not in _PLACE_ALLOWED_TYPES:
+            return _places_cors(request, JsonResponse({'success': False, 'message': f'type must be one of {_PLACE_ALLOWED_TYPES}.'}, status=400))
+        if not name:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'name is required.'}, status=400))
+
+        try:
+            ward_int = int(ward)
+        except (ValueError, TypeError):
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'ward must be a number.'}, status=400))
+
+        doc = {
+            'record_type': 'local_place',
+            'ward':        ward_int,
+            'wardName':    ward_name,
+            'type':        ptype,
+            'name':        name,
+            'address':     address,
+            'createdAt':   datetime.now(timezone.utc),
+            'createdBy':   user.get('username') or user.get('email') or 'unknown',
+        }
+
+        try:
+            result = coll.insert_one(doc)
+        except Exception as e:
+            return _places_cors(request, JsonResponse({'success': False, 'message': f'DB error: {e}'}, status=500))
+
+        return _places_cors(request, JsonResponse({
+            'success': True,
+            'place': {
+                '_id':      str(result.inserted_id),
+                'type':     ptype,
+                'name':     name,
+                'address':  address,
+                'createdAt': doc['createdAt'].isoformat(),
+            },
+        }))
+
+    # ── DELETE — remove a place by _id ────────────────────────────────────────
+    if request.method == 'DELETE':
+        try:
+            body     = json.loads(request.body)
+            place_id = body.get('id', '').strip()
+        except Exception:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'Invalid JSON.'}, status=400))
+
+        if not place_id:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'id is required.'}, status=400))
+
+        try:
+            result = coll.delete_one({'_id': ObjectId(place_id), 'record_type': 'local_place'})
+        except Exception as e:
+            return _places_cors(request, JsonResponse({'success': False, 'message': f'DB error: {e}'}, status=500))
+
+        if result.deleted_count == 0:
+            return _places_cors(request, JsonResponse({'success': False, 'message': 'Place not found.'}, status=404))
+
+        return _places_cors(request, JsonResponse({'success': True}))
+
+    return _places_cors(request, JsonResponse({'success': False, 'message': 'Method not allowed.'}, status=405))
+
+
+@csrf_exempt
+@require_http_methods(['GET', 'OPTIONS'])
+def api_local_places_summary(request):
+    """
+    GET /api/local-places-summary/
+    Returns constituency-wide counts + full list of all local places,
+    grouped by type and ward, for the Dashboard overview panel.
+
+    Response:
+    {
+      "success": true,
+      "total": 42,
+      "counts": { "club": 10, "temple": 18, "church": 8, "mosque": 6 },
+      "byWard": [
+        { "ward": 28, "wardName": "MANNAGUDDA",
+          "places": [{"_id":"..","type":"club","name":"..","address":".."},...],
+          "counts": { "club":1, "temple":2, "church":0, "mosque":0 } },
+        ...
+      ]
+    }
+    """
+    if request.method == 'OPTIONS':
+        resp = JsonResponse({})
+        origin = request.META.get('HTTP_ORIGIN', '')
+        if origin:
+            resp['Access-Control-Allow-Origin']      = origin
+            resp['Access-Control-Allow-Credentials'] = 'true'
+            resp['Access-Control-Allow-Methods']     = 'GET, OPTIONS'
+            resp['Access-Control-Allow-Headers']     = 'Content-Type, Authorization, X-CSRFToken'
+        return resp
+
+    try:
+        user = _user_from_request(request)
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Auth error: {e}'}, status=500)
+    if not user:
+        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+    if not _is_approved(user):
+        return JsonResponse({'success': False, 'message': 'Account pending approval.'}, status=403)
+
+    try:
+        coll = get_survey_db()['WardData']
+        docs = list(coll.find(
+            {'record_type': 'local_place'},
+            {'_id': 1, 'ward': 1, 'wardName': 1, 'type': 1, 'name': 1, 'address': 1}
+        ).sort([('ward', 1), ('type', 1), ('name', 1)]))
+
+        for d in docs:
+            d['_id'] = str(d['_id'])
+
+        type_counts = {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0}
+        for d in docs:
+            t = d.get('type', '')
+            if t in type_counts:
+                type_counts[t] += 1
+
+        ward_map = {}
+        for d in docs:
+            ward  = d.get('ward', 0)
+            wname = d.get('wardName', f'Ward {ward}')
+            if ward not in ward_map:
+                ward_map[ward] = {
+                    'ward': ward, 'wardName': wname, 'places': [],
+                    'counts': {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0},
+                }
+            ward_map[ward]['places'].append(d)
+            t = d.get('type', '')
+            if t in ward_map[ward]['counts']:
+                ward_map[ward]['counts'][t] += 1
+
+        by_ward = sorted(ward_map.values(), key=lambda w: w['ward'])
+
+        return JsonResponse({
+            'success': True, 'total': len(docs),
+            'counts': type_counts, 'byWard': by_ward,
+        })
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': str(e)}, status=500)
+
