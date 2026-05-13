@@ -8276,3 +8276,82 @@ def api_local_places_summary(request):
         })
     except Exception as e:
         return JsonResponse({'success': False, 'message': str(e)}, status=500)
+
+# ── Beneficiary List for SWOT Query ──────────────────────────────────────────
+@csrf_exempt
+def api_beneficiary_list(request):
+    """
+    POST /api/swot/beneficiaries/
+    Body: {
+        "query":   {"economicStatus": "APL", "religion": "Buddhist", ...},
+        "page":    1,        # 1-based
+        "limit":   50        # max 100
+    }
+    Queries the 'Data' collection on _SURVEY_URL and returns matching voters.
+    """
+    if request.method == "OPTIONS":
+        return _ai_cors(request, JsonResponse({}))
+
+    user = _user_from_request(request)
+    if not user:
+        return _ai_cors(request, JsonResponse({"error": "Unauthorized"}, status=401))
+
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        return _ai_cors(request, JsonResponse({"error": "Invalid JSON"}, status=400))
+
+    raw_query = body.get("query", {})
+    page      = max(1, int(body.get("page", 1)))
+    limit     = min(100, max(1, int(body.get("limit", 50))))
+    skip      = (page - 1) * limit
+
+    # Build MongoDB filter — only include non-empty, non-"Unknown" values
+    mongo_filter = {}
+    for k, v in raw_query.items():
+        if v and v not in ("Unknown", "", None):
+            mongo_filter[k] = v
+
+    try:
+        coll  = get_survey_db()['Data']
+        total = coll.count_documents(mongo_filter)
+
+        projection = {
+            '_id': 0,
+            'firstName': 1, 'middleName': 1, 'lastName': 1,
+            'voterid': 1, 'age': 1, 'gender': 1,
+            'wardNumber': 1, 'boothNo': 1, 'houseNumber': 1,
+            'address': 1, 'economicStatus': 1, 'religion': 1,
+            'education': 1, 'employmentStatus': 1, 'healthStatus': 1,
+            'diseaseType': 1, 'diseaseName': 1, 'minority': 1,
+            'differentlyAbled': 1, 'annualIncome': 1, 'familyIncome': 1,
+            'maritalStatus': 1, 'homeType': 1, 'contactNumber': 1,
+            'schemesUsed': 1, 'pollingStation': 1,
+        }
+
+        docs = list(coll.find(mongo_filter, projection).skip(skip).limit(limit))
+
+        # Serialize: convert any non-serialisable types
+        voters = []
+        for d in docs:
+            voter = {}
+            for k, v in d.items():
+                if hasattr(v, 'item'):          # numpy int/float
+                    voter[k] = v.item()
+                elif isinstance(v, list):
+                    voter[k] = [str(i) if not isinstance(i, (str, int, float, bool, type(None))) else i for i in v]
+                else:
+                    voter[k] = v
+            voters.append(voter)
+
+        return _ai_cors(request, JsonResponse({
+            'success': True,
+            'total':   total,
+            'page':    page,
+            'limit':   limit,
+            'pages':   (total + limit - 1) // limit,
+            'voters':  voters,
+        }))
+
+    except Exception as e:
+        return _ai_cors(request, JsonResponse({'success': False, 'error': str(e)}, status=500))
