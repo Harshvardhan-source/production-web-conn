@@ -6160,13 +6160,274 @@ def _ai_ctx_genuine_voters():
         return f'[genuine_voters error: {e}]'
 
 
+# ── Builder 16: Socio-Economic Data (SurveyDataBase.Data) ────────────────────
+#
+# Document schema (confirmed from sample doc):
+#   wardNumber (int), boothNo (str "21-Apr"), houseNumber, address
+#   firstName, middleName, lastName, voterid, gender, age, dob, maritalStatus
+#   religion, predictedReligion, minority ("Yes"/"No"), community, subcategory
+#   economicStatus ("APL"/"BPL"…), annualIncome (int), familyIncome (int)
+#   education, educationtype, employmentStatus, employmentType
+#   healthStatus, diseaseType, diseaseName, differentlyAbled ("Yes"/"No")
+#   homeType, currentHomeType, areaType, currentAreaType
+#   schemesUsed (array of str), outstationResident ("Yes"/"No"), outstationCity/State
+#   partyMember ("Yes"/"No"), student ("Yes"/"No"), isHeadOfHouse ("Yes"/"No")
+#   sir_category (str), sir_suspicious (bool), Time_stamp (date)
+
+def _ai_ctx_socio_economic_data():
+    """
+    Loads socio-economic household data from the 'Data' collection in
+    SurveyDataBase (_SURVEY_URL cluster). Single $facet aggregation covers all
+    major dimensions so the AI can answer income/employment/health/housing/
+    scheme questions ward-by-ward.
+    """
+    try:
+        db    = get_survey_db()
+        coll  = db['Data']
+        total = _safe_count(coll)
+        if not total:
+            return '[Socio-Economic Data: collection empty or not found]'
+
+        agg = list(coll.aggregate([{'$facet': {
+
+            # ── Ward distribution (wardNumber is int) ─────────────────────────
+            'by_ward': [
+                {'$group': {'_id': '$wardNumber', 'n': {'$sum': 1}}},
+                {'$sort': {'_id': 1}},
+            ],
+
+            # ── Gender & marital status ───────────────────────────────────────
+            'by_gender': [
+                {'$group': {'_id': '$gender', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+            'by_marital': [
+                {'$group': {'_id': '$maritalStatus', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+
+            # ── Religion & community ──────────────────────────────────────────
+            'by_religion': [
+                {'$group': {'_id': '$religion', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+            'by_community': [
+                {'$match': {'community': {'$exists': True, '$ne': None, '$ne': ''}}},
+                {'$group': {'_id': '$community', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}}, {'$limit': 15},
+            ],
+
+            # ── Economic status ───────────────────────────────────────────────
+            'by_economic': [
+                {'$group': {'_id': '$economicStatus', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+
+            # ── Income buckets (annualIncome is numeric int/long) ─────────────
+            'income_buckets': [
+                {'$match': {'annualIncome': {'$type': ['int', 'long', 'double', 'decimal']}}},
+                {'$bucket': {
+                    'groupBy'   : '$annualIncome',
+                    'boundaries': [0, 50000, 100000, 200000, 300000, 500000, 1000000, 9999999999],
+                    'default'   : 'Other',
+                    'output'    : {'n': {'$sum': 1}, 'avg': {'$avg': '$annualIncome'}},
+                }},
+            ],
+            'avg_income': [
+                {'$match': {'annualIncome': {'$type': ['int', 'long', 'double', 'decimal']}}},
+                {'$group': {'_id': None, 'avg': {'$avg': '$annualIncome'}}},
+            ],
+
+            # ── Employment ───────────────────────────────────────────────────
+            'by_employment': [
+                {'$group': {'_id': '$employmentStatus', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+            'by_emp_type': [
+                {'$match': {'employmentType': {'$exists': True, '$ne': None, '$ne': ''}}},
+                {'$group': {'_id': '$employmentType', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}}, {'$limit': 12},
+            ],
+
+            # ── Education ────────────────────────────────────────────────────
+            'by_education': [
+                {'$group': {'_id': '$education', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+            'by_edu_type': [
+                {'$match': {'educationtype': {'$exists': True, '$ne': None, '$ne': ''}}},
+                {'$group': {'_id': '$educationtype', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}}, {'$limit': 12},
+            ],
+
+            # ── Health ───────────────────────────────────────────────────────
+            'by_health': [
+                {'$group': {'_id': '$healthStatus', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+            'by_disease_type': [
+                {'$match': {'diseaseType': {'$exists': True, '$ne': None, '$ne': ''}}},
+                {'$group': {'_id': '$diseaseType', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+            'by_disease_name': [
+                {'$match': {'diseaseName': {'$exists': True, '$ne': None, '$ne': ''}}},
+                {'$group': {'_id': '$diseaseName', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}}, {'$limit': 15},
+            ],
+
+            # ── Housing ──────────────────────────────────────────────────────
+            'by_home_type': [                        # permanent home ownership
+                {'$group': {'_id': '$homeType', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+            'by_current_home': [                     # current living arrangement
+                {'$match': {'currentHomeType': {'$exists': True, '$ne': None, '$ne': ''}}},
+                {'$group': {'_id': '$currentHomeType', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+            'by_area_type': [
+                {'$group': {'_id': '$areaType', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+
+            # ── Special flags (stored as "Yes"/"No" strings) ──────────────────
+            'diff_abled'    : [{'$match': {'differentlyAbled'  : 'Yes'}}, {'$count': 'n'}],
+            'outstation'    : [{'$match': {'outstationResident': 'Yes'}}, {'$count': 'n'}],
+            'party_members' : [{'$match': {'partyMember'       : 'Yes'}}, {'$count': 'n'}],
+            'students'      : [{'$match': {'student'           : 'Yes'}}, {'$count': 'n'}],
+            'minorities'    : [{'$match': {'minority'          : 'Yes'}}, {'$count': 'n'}],
+            'head_of_house' : [{'$match': {'isHeadOfHouse'     : 'Yes'}}, {'$count': 'n'}],
+            # sir_suspicious is a boolean true/false
+            'sir_suspicious': [{'$match': {'sir_suspicious': True}}, {'$count': 'n'}],
+
+            # ── Top outstation cities ─────────────────────────────────────────
+            'outstation_cities': [
+                {'$match': {'outstationResident': 'Yes',
+                            'outstationCity': {'$exists': True, '$ne': None, '$ne': ''}}},
+                {'$group': {'_id': '$outstationCity', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}}, {'$limit': 10},
+            ],
+
+            # ── SIR categories ────────────────────────────────────────────────
+            'by_sir_category': [
+                {'$match': {'sir_category': {'$exists': True, '$ne': None, '$ne': ''}}},
+                {'$group': {'_id': '$sir_category', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+
+            # ── Schemes used (array field, must $unwind first) ────────────────
+            'by_scheme': [
+                {'$unwind': '$schemesUsed'},
+                {'$group': {'_id': '$schemesUsed', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}}, {'$limit': 20},
+            ],
+
+        }}]))[0]
+
+        wmap = {str(k): v['name'] for k, v in WARD_FULL_DATA.items()}
+        lines = [
+            '=== Socio-Economic Data (SurveyDataBase.Data) ===',
+            f'Total records: {total:,}',
+        ]
+
+        def _pct(n):
+            return f" ({round(n / total * 100, 1)}%)" if total else ''
+
+        def _sec(title, items, key='_id', val='n'):
+            if not items:
+                return
+            lines.append(f'\n{title}:')
+            for r in items:
+                lbl = str(r.get(key)) if r.get(key) not in (None, '') else 'Unknown'
+                lines.append(f"  {lbl:<32}: {r[val]:,}{_pct(r[val])}")
+
+        # Ward breakdown
+        lines.append('\nWard-wise Record Count:')
+        for w in agg.get('by_ward', []):
+            wid   = str(w['_id']) if w['_id'] is not None else '?'
+            wname = wmap.get(wid, wid)
+            lines.append(f"  Ward {wid:>3} ({wname:<22}): {w['n']:,}")
+
+        _sec('Gender',                    agg.get('by_gender', []))
+        _sec('Marital Status',            agg.get('by_marital', []))
+        _sec('Religion',                  agg.get('by_religion', []))
+        _sec('Community / Category',      agg.get('by_community', []))
+        _sec('Economic Status',           agg.get('by_economic', []))
+
+        # Income buckets with ₹ labels
+        bucket_labels = {
+            0:         '₹0 – 50,000',
+            50000:     '₹50k – 1L',
+            100000:    '₹1L – 2L',
+            200000:    '₹2L – 3L',
+            300000:    '₹3L – 5L',
+            500000:    '₹5L – 10L',
+            1000000:   '₹10L+',
+            'Other':   'Non-numeric / missing',
+        }
+        income_bkts = agg.get('income_buckets', [])
+        if income_bkts:
+            lines.append('\nAnnual Income Distribution:')
+            for b in income_bkts:
+                lbl = bucket_labels.get(b['_id'], str(b['_id']))
+                avg = f"  (avg ₹{b['avg']:,.0f})" if b.get('avg') else ''
+                lines.append(f"  {lbl:<22}: {b['n']:,}{_pct(b['n'])}{avg}")
+        if agg.get('avg_income'):
+            lines.append(f"  Overall avg annual income: ₹{agg['avg_income'][0].get('avg', 0):,.0f}")
+
+        _sec('Employment Status',         agg.get('by_employment', []))
+        _sec('Employment Type',           agg.get('by_emp_type', []))
+        _sec('Education Level',           agg.get('by_education', []))
+        _sec('Education Type (detail)',   agg.get('by_edu_type', []))
+        _sec('Health Status',             agg.get('by_health', []))
+        _sec('Disease Type',              agg.get('by_disease_type', []))
+        _sec('Disease Name (top 15)',     agg.get('by_disease_name', []))
+        _sec('Home Ownership Type',       agg.get('by_home_type', []))
+        _sec('Current Living Arrangement',agg.get('by_current_home', []))
+        _sec('Permanent Area Type',       agg.get('by_area_type', []))
+
+        # Scalar flags
+        da_n  = agg['diff_abled'][0]['n']    if agg.get('diff_abled')    else 0
+        out_n = agg['outstation'][0]['n']    if agg.get('outstation')    else 0
+        pm_n  = agg['party_members'][0]['n'] if agg.get('party_members') else 0
+        st_n  = agg['students'][0]['n']      if agg.get('students')      else 0
+        mn_n  = agg['minorities'][0]['n']    if agg.get('minorities')    else 0
+        hh_n  = agg['head_of_house'][0]['n'] if agg.get('head_of_house') else 0
+        sus_n = agg['sir_suspicious'][0]['n']if agg.get('sir_suspicious')else 0
+
+        lines += [
+            '',
+            f'Differently Abled      : {da_n:,}{_pct(da_n)}',
+            f'Outstation Residents   : {out_n:,}{_pct(out_n)}',
+            f'BJP Party Members      : {pm_n:,}{_pct(pm_n)}',
+            f'Students               : {st_n:,}{_pct(st_n)}',
+            f'Minority (Yes)         : {mn_n:,}{_pct(mn_n)}',
+            f'Head of Household      : {hh_n:,}{_pct(hh_n)}',
+            f'SIR Suspicious Flag    : {sus_n:,}{_pct(sus_n)}',
+        ]
+
+        _sec('Outstation Cities (top 10)', agg.get('outstation_cities', []))
+        _sec('SIR Category',               agg.get('by_sir_category', []))
+
+        if agg.get('by_scheme'):
+            lines.append('\nTop Government Schemes Used:')
+            for s in agg['by_scheme']:
+                if s['_id']:
+                    lines.append(f"  {str(s['_id']):<45}: {s['n']:,}")
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[Socio-Economic Data error: {e}]'
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # PARALLEL MONGO CONTEXT LOADER
 # ════════════════════════════════════════════════════════════════════════════════
 
 def _ai_load_mongo_context():
     """
-    Run all 15 MongoDB context builders in parallel.
+    Run all 16 MongoDB context builders in parallel.
     Returns (combined_text: str, sources: list[str]).
     Total latency ≈ slowest single builder (~1-2 s), not sum of all.
     """
@@ -6186,6 +6447,7 @@ def _ai_load_mongo_context():
         ('SWOT Query Stack (NewQueryStack1)',      _ai_ctx_swot_stack),
         ('2002 Voter Roll',                       _ai_ctx_voter_roll_2002),
         ('Genuine Voters (SIR Verified)',         _ai_ctx_genuine_voters),
+        ('Socio-Economic Data (Data collection)', _ai_ctx_socio_economic_data),
     ]
 
     results = [None] * len(builders)
