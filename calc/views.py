@@ -6425,6 +6425,595 @@ def _ai_ctx_socio_economic_data():
 # PARALLEL MONGO CONTEXT LOADER
 # ════════════════════════════════════════════════════════════════════════════════
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# RAG — Smart Query-Aware File Chunking
+# Each function loads only the relevant portion of a file based on the question.
+# ════════════════════════════════════════════════════════════════════════════════
+
+# 2023p.xlsx: ward name → sheet names (current 2023 + comparison 2018)
+_2023P_WARD_SHEETS = {
+    'ATTAVARA':           ['ATTAVARA',        'ATTAVARA-18'],
+    'ALAPE DAKSHINA':     ['ALAPE-S',         'ALAPE-S18'],
+    'ALAPE UTTARA':       [' ALAPE-N',        'ALAPE-N18'],
+    'BAJAL':              ['BAJAL',           'BAJAL-18'],
+    'BEJAI':              ['BEJAI',           'BEJAI-18'],
+    'BENDUR':             ['BENDUR',          'BENDR-18'],
+    'BENGRE':             ['BENGRE',          'BENGRE-18'],
+    'BOLAR':              ['BOLAR',           'BOLAR-18'],
+    'BOLOOR':             ['BOLOOR',          'BOLOOR-18'],
+    'NAVAYATH':           ['BUNDER',          'BNDER-18'],
+    'CENTRAL':            ['CENTRAL',         'CENTRAL-18'],
+    'CANTONMENT':         ['CONTONMENT',      'CONTONMENT-18'],
+    'COURT':              ['COURT',           'CORT-18'],
+    'DEREBAIL SOUTH WEST':['DEREBAIL NAIRTHYA','DEREBAILNAIRTYHYA18'],
+    'DEREBAIL SOUTH':     ['DEREBAIL SOUTH',  'DEREBAIL SOTH18'],
+    'DEREBAIL WEST':      ['DEREBAIL WEST',   'DEREBAIL WEST18'],
+    'DONGERKERY':         ['DONGARAKERI',     'DONGARKERI-18'],
+    'FALNIR':             ['FALNIR',          'FALNIR-18'],
+    'HOIGE BAZAR':        ['HOIGE BAZAR',     'HOIGE BAZAR-18'],
+    'JEPPINAMUGER':       ['JEPPINAMOGAR',    'JEPPINAMOGAR-18'],
+    'JEPPU':              ['JEPPU',           'JEPPU-18'],
+    'KADRI NORTH':        ['KADRI NORTH',     'KADRI-18'],
+    'KADRI SOUTH':        ['KADRI SOUTH',     'KADRI(S)-18'],
+    'KAMBLA':             ['KAMBALA',         'KAMBALA-18'],
+    'KANKANADY':          ['KANKANADY',       'KANKANADY-18'],
+    'KANNUR':             ['KANNUR',          'KANNUR-18'],
+    'KODIALBAIL':         ['KODIALBAIL',      'KODIALBAIL-18'],
+    'KUDROLI':            ['KUDROLI',         'KUDROLI-18'],
+    'MANNAGUDDA':         ['MANNAGUDA',       'MANNAGDA-18'],
+    'MAROLI':             ['MAROLI',          'MAROLI-18'],
+    'MILAGRIS':           ['MILAGRESS',       'MILAGRESS-18'],
+    'PADAVU CENTRAL':     ['PADAV CENTRAL',   'PADAV CENTRAL-18'],
+    'PADAVU POORVA':      ['PADAV EAST',      'PADAV EAST-18'],
+    'PADAVU':             ['PADAV WEST',      'PADAV WEST-18'],
+    'PORT':               ['PORT',            'PORT-18'],
+    'SHIVBHAG':           ['SHIVABAGH',       'SHIVABAGH-18'],
+    'VALENCIA':           ['VALENCIA',        'VALENCIA-18'],
+}
+
+_2023P_CANDIDATE_MARKERS = ['LOBO', 'KAMATH', 'VEDAVYASA', 'SANTHOSH',
+                             'DHARMENDRA', 'WINNY', 'K.S.PAI']
+
+
+def _rag_extract_2023p_ward_sheet(ws) -> str:
+    """Extract one ward sheet from 2023p.xlsx into a clean table."""
+    from openpyxl import load_workbook as _lw  # already imported at top
+    ward_name  = ''
+    candidates = []
+    data_rows  = []
+    total_row  = None
+    for row in ws.iter_rows(values_only=True):
+        vals = [v for v in row if v is not None]
+        if not vals:
+            continue
+        row_str = str(vals)
+        # Candidate name row
+        if any(m in row_str for m in _2023P_CANDIDATE_MARKERS):
+            candidates = [str(v) for v in row if v is not None]
+            continue
+        # Data rows: col[1] is booth number (int < 1000)
+        if len(row) >= 4 and isinstance(row[1], (int, float)) and row[1] and row[1] < 1000:
+            if not ward_name and row[0]:
+                ward_name = str(row[0])
+            booth  = int(row[1])
+            total  = row[2] or 0
+            votes  = [row[i] or 0 for i in range(3, min(3 + len(candidates), len(row)))]
+            data_rows.append((booth, int(total), votes))
+        # Total row: col[1] is None, col[2] is large number
+        elif (not row[1] and row[2] and isinstance(row[2], (int, float))
+              and row[2] > 500 and data_rows):
+            total_row = row
+
+    if not data_rows:
+        return ''
+
+    # Shorten candidate names to first 10 chars
+    cands_short = [c[:10] for c in (candidates or [])]
+    lines = [f'Ward: {ward_name}']
+    if cands_short:
+        hdr = f"{'Booth':>5}  {'Voters':>6}  " + '  '.join(f'{c:>10}' for c in cands_short)
+        lines.append(hdr)
+        lines.append('-' * (14 + 13 * len(cands_short)))
+    for booth, total, votes in data_rows:
+        vstr = '  '.join(f'{v:>10}' for v in votes)
+        lines.append(f'{booth:>5}  {total:>6}  {vstr}')
+    if total_row:
+        tvotes = [total_row[i] or 0 for i in range(3, min(3 + len(candidates), len(total_row)))]
+        vstr = '  '.join(f'{v:>10}' for v in tvotes)
+        lines.append(f'{"TOTAL":>5}  {int(total_row[2] or 0):>6}  {vstr}')
+    return '\n'.join(lines)
+
+
+def _rag_load_2023p(message: str) -> str:
+    """
+    Ward-aware extraction from 2023p.xlsx.
+    Specific ward mentioned → load those 2 sheets (2023 + 2018 comparison).
+    No ward → load MAIN WARD + WARD-BOOTH summary sheets only.
+    """
+    try:
+        from openpyxl import load_workbook as _lw
+    except ImportError:
+        return '[openpyxl not available]'
+
+    path = _os2.path.join(_AI_DATA_DIR, '2023p.xlsx')
+    if not _os2.path.exists(path):
+        # fuzzy find
+        for f in _os2.listdir(_AI_DATA_DIR):
+            if '2023p' in f.lower():
+                path = _os2.path.join(_AI_DATA_DIR, f)
+                break
+        else:
+            return '[2023p.xlsx not found]'
+
+    msg_upper     = message.upper()
+    matched_wards = []
+    for wnum, wdata in WARD_FULL_DATA.items():
+        wname = wdata['name'].upper()
+        if str(wnum) in message or wname in msg_upper or wname.split()[0] in msg_upper:
+            matched_wards.append(wname)
+
+    try:
+        wb = _lw(path, read_only=True, data_only=True)
+    except Exception as e:
+        return f'[2023p.xlsx load error: {e}]'
+
+    sections = []
+    if matched_wards:
+        for ward_key in matched_wards:
+            for sname in _2023P_WARD_SHEETS.get(ward_key, []):
+                actual = next((s for s in wb.sheetnames
+                               if s.strip().upper() == sname.strip().upper()), None)
+                if actual:
+                    text = _rag_extract_2023p_ward_sheet(wb[actual])
+                    if text:
+                        yr = '2018' if actual.strip().endswith('-18') else '2023'
+                        sections.append(f'=== 2023p | {ward_key} ({yr}) ===\n{text}')
+    else:
+        # Summary sheets
+        for sname in ['MAIN WARD', 'WARD-BOOTH', 'BOOTHWISE']:
+            if sname in wb.sheetnames:
+                ws    = wb[sname]
+                lines = []
+                for i, row in enumerate(ws.iter_rows(values_only=True)):
+                    vals = [v for v in row if v is not None]
+                    if vals:
+                        lines.append(','.join(str(v) for v in row if v is not None))
+                    if i > 100:
+                        break
+                if lines:
+                    sections.append(f'=== 2023p | {sname} ===\n' + '\n'.join(lines))
+
+    wb.close()
+    result = '\n\n'.join(sections)
+    print(f'[RAG File] 2023p: {len(result):,} chars (~{len(result)//4:,} tokens) | '
+          f'wards: {matched_wards or "summary"}')
+    return result or '[2023p: no matching data]'
+
+
+def _rag_load_xlsx_smart(fname: str, message: str,
+                          priority_sheets: list = None,
+                          keyword_sheet_map: dict = None,
+                          max_chars: int = 60_000) -> str:
+    """
+    Generic smart xlsx loader.
+    priority_sheets: always load these sheets
+    keyword_sheet_map: {keyword: [sheet_names]} — load sheet if keyword in message
+    max_chars: hard cap on output
+    """
+    try:
+        from openpyxl import load_workbook as _lw
+    except ImportError:
+        return '[openpyxl not available]'
+
+    path = _os2.path.join(_AI_DATA_DIR, fname)
+    if not _os2.path.exists(path):
+        for f in _os2.listdir(_AI_DATA_DIR):
+            if fname[:12].upper() in f.upper():
+                path = _os2.path.join(_AI_DATA_DIR, f)
+                fname = f
+                break
+        else:
+            return f'[{fname}: not found]'
+
+    try:
+        wb = _lw(path, read_only=True, data_only=True)
+    except Exception as e:
+        return f'[{fname} load error: {e}]'
+
+    msg_lower    = message.lower()
+    sheets_todo  = list(priority_sheets or [])
+
+    if keyword_sheet_map:
+        for kw, snames in keyword_sheet_map.items():
+            if kw in msg_lower:
+                sheets_todo.extend(snames)
+
+    # Dedupe while preserving order
+    seen = set()
+    sheets_todo = [s for s in sheets_todo if not (s in seen or seen.add(s))]
+
+    # If nothing matched keywords, load first 3 sheets
+    if not sheets_todo:
+        sheets_todo = wb.sheetnames[:3]
+
+    # Ward/booth filter from message
+    ward_filter = []
+    for wnum, wdata in WARD_FULL_DATA.items():
+        wname = wdata['name'].upper()
+        if str(wnum) in message or wname in message.upper() or wname.split()[0] in message.upper():
+            ward_filter.append(wname)
+
+    sections    = []
+    total_chars = 0
+
+    for sname in sheets_todo:
+        if sname not in wb.sheetnames or total_chars >= max_chars:
+            break
+        ws    = wb[sname]
+        lines = []
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            vals = [v for v in row if v is not None]
+            if not vals:
+                continue
+            row_str = ','.join(str(v) for v in row if v is not None)
+            # Apply ward filter only after header rows
+            if ward_filter and i > 5:
+                row_upper = row_str.upper()
+                if not any(wf in row_upper or wf.split()[0] in row_upper
+                           for wf in ward_filter):
+                    continue
+            lines.append(row_str)
+            if len(lines) > 150:
+                break
+        if len(lines) > 2:
+            chunk = f'=== {fname} | {sname} ===\n' + '\n'.join(lines)
+            sections.append(chunk)
+            total_chars += len(chunk)
+
+    wb.close()
+    result = '\n\n'.join(sections)
+    print(f'[RAG File] {fname}: {len(result):,} chars | wards: {ward_filter or "all"}')
+    return result or f'[{fname}: no data extracted]'
+
+
+def _rag_load_file(fkey: str, message: str) -> str:
+    """
+    Dispatch file loading based on file key prefix.
+    fkey is a prefix/keyword used to find the file in _AI_DATA_DIR.
+    """
+    if not _os2.path.isdir(_AI_DATA_DIR):
+        return '[data directory not found]'
+
+    fkey_upper = fkey.upper()
+
+    # ── 2023p — ward-aware sheet extraction ──────────────────────────────────
+    if '2023P' in fkey_upper:
+        return _rag_load_2023p(message)
+
+    # Find actual filename
+    fname = next((f for f in _os2.listdir(_AI_DATA_DIR)
+                  if fkey_upper in f.upper()), None)
+    if not fname:
+        return f'[File matching "{fkey}" not found in data/]'
+
+    fup = fname.upper()
+
+    # ── BJP Boothwise ─────────────────────────────────────────────────────────
+    if 'BJP_BOOTHWISE' in fup or 'BJP_B' in fup[:10]:
+        return _rag_load_xlsx_smart(fname, message,
+            priority_sheets=['📍 BOOTHWISE MASTER', '📊 WARD CONSOLIDATED'],
+            keyword_sheet_map={
+                'caste':      ['🕉 COMMUNITY ANALYSIS', '⚧ RELIGION × GENDER'],
+                'religion':   ['🕉 COMMUNITY ANALYSIS', '⚧ RELIGION × GENDER'],
+                'priority':   ['🎯 BOOTH PRIORITY LIST', '📈 TURNOUT STRATEGY'],
+                'turnout':    ['🎯 BOOTH PRIORITY LIST', '📈 TURNOUT STRATEGY'],
+                'strategy':   ['🎯 BOOTH PRIORITY LIST', '📈 TURNOUT STRATEGY'],
+            }, max_chars=60_000)
+
+    # ── BJP Political Intelligence ────────────────────────────────────────────
+    if 'BJP_POLITICAL' in fup or 'BJP_P' in fup[:10]:
+        return _rag_load_xlsx_smart(fname, message,
+            priority_sheets=['📊 EXECUTIVE DASHBOARD'],
+            keyword_sheet_map={
+                'strategy':   ['🎯 STRATEGY GAMEPLAN'],
+                'gameplan':   ['🎯 STRATEGY GAMEPLAN'],
+                'action':     ['✅ WARD ACTION TRACKER', '📅 CAMPAIGN CALENDAR'],
+                'caste':      ['🕉 CASTE-RELIGION MATRIX'],
+                'religion':   ['🕉 CASTE-RELIGION MATRIX'],
+                'history':    ['📅 HISTORICAL TREND 2013-23'],
+                'trend':      ['📅 HISTORICAL TREND 2013-23'],
+                'wsi':        ['🏆 WSI SCORE + SUMMARY'],
+                'score':      ['🏆 WSI SCORE + SUMMARY'],
+                'math':       ['🧮 MATH FORMULA & EQUATIONS'],
+                'formula':    ['🧮 MATH FORMULA & EQUATIONS'],
+                'manifesto':  ['📋 POLICY & MANIFESTO'],
+                'policy':     ['📋 POLICY & MANIFESTO'],
+                'weak':       ['🔍 WHY STRONG-MEDIUM-WEAK'],
+                'strong':     ['🔍 WHY STRONG-MEDIUM-WEAK'],
+            }, max_chars=55_000)
+
+    # ── Mangaluru Election Strategy ───────────────────────────────────────────
+    if 'MANGALURU_ELECTION' in fup:
+        return _rag_load_xlsx_smart(fname, message,
+            priority_sheets=['📊 EXECUTIVE DASHBOARD'],
+            keyword_sheet_map={
+                'ward':       ['🏛️ WARD DEEP ANALYSIS'],
+                'booth':      ['🗳️ BOOTH ANALYSIS (244)'],
+                'caste':      ['🕌 CASTE & RELIGION'],
+                'religion':   ['🕌 CASTE & RELIGION'],
+                'gender':     ['👩 GENDER ANALYSIS'],
+                'women':      ['👩 GENDER ANALYSIS'],
+                'weak':       ['🔴 WEAK→MEDIUM PLAN'],
+                'medium':     ['🟡 MEDIUM→STRONG PLAN'],
+                'action':     ['📅 90-DAY ACTION PLAN'],
+                '90':         ['📅 90-DAY ACTION PLAN'],
+                'intervention':['🚨 BOOTH INTERVENTION LIST'],
+                'sir':        ['📋 SIR & VOTER STATUS'],
+            }, max_chars=60_000)
+
+    # ── Mangaluru FULLSCALE ───────────────────────────────────────────────────
+    if 'MANGALURU_FULLSCALE' in fup or 'FULLSCALE' in fup:
+        return _rag_load_xlsx_smart(fname, message,
+            priority_sheets=['📊 MASTER DASHBOARD'],
+            keyword_sheet_map={
+                'ward':       ['🏛️ WARD ANALYSIS (FULL)'],
+                'booth':      ['🗳️ BOOTH ANALYSIS (244)'],
+                'caste':      ['🕌 CASTE TURNOUT MATRIX'],
+                'religion':   ['🕌 CASTE TURNOUT MATRIX'],
+                'non polled': ['⚡ NON-POLLED OPPORTUNITY'],
+                'nonpolled':  ['⚡ NON-POLLED OPPORTUNITY'],
+                'opportunity':['⚡ NON-POLLED OPPORTUNITY'],
+                'gender':     ['👩 GENDER ANALYSIS'],
+                'flip':       ['🎯 FLIP TARGETS'],
+                'target':     ['🎯 FLIP TARGETS'],
+                'strong':     ['🟢 STRONG WARD GAMEPLAN'],
+                'medium':     ['🟡 MEDIUM→STRONG PLAN'],
+                'weak':       ['🔴 WEAK→MEDIUM PLAN'],
+                '100':        ['📅 100-DAY GAMEPLAN'],
+                'gameplan':   ['📅 100-DAY GAMEPLAN'],
+            }, max_chars=60_000)
+
+    # ── Historical election files (2013/2014/2018/2019) ───────────────────────
+    if any(yr in fup for yr in ['2013', '2014', '2018', '2019']):
+        # Determine priority sheets based on year
+        priority = []
+        msg_lower = message.lower()
+        if '2019' in fup:
+            priority = ['Sheet1']
+        elif '2018' in fup and '2014' in fup:
+            priority = ['2014 AND 2018 SATATISTICAL ANLY', 'BJP WIN OR LOSS']
+        elif '2018' in fup:
+            priority = ['WARDWISE ANALYISIS', 'BJP WIN OR LOSS']
+        elif '2014' in fup:
+            priority = ['WARD WISE ANALYSIS', 'BJP WIN OR LOSS']
+        elif '2013' in fup:
+            priority = ['WARD WISE ANALYSIS', '3 YEAR WARD WISE ANALYSIS', 'BJP WIN OR LOSS']
+        return _rag_load_xlsx_smart(fname, message,
+            priority_sheets=priority,
+            keyword_sheet_map={
+                'bjp':        ['BJP', 'BJP WIN OR LOSS'],
+                'congress':   ['CONGRESS', 'BJP WIN OR LOSS'],
+                'booth':      ['2013 BOOTH WISE', '2013+  BOOTH WISE ANALYSIS',
+                               '2014 BOOTH WISE', '2018 BOOTHWISE', 'BOOTH WISE'],
+            }, max_chars=55_000)
+
+    # ── Generic fallback ──────────────────────────────────────────────────────
+    path = _os2.path.join(_AI_DATA_DIR, fname)
+    ext  = _os2.path.splitext(fname)[1].lower()
+    try:
+        if ext in ('.xlsx', '.xls'):
+            raw = _ai_read_excel_stream(path)
+        elif ext == '.csv':
+            raw = _ai_read_csv_stream(path)
+        else:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as _f:
+                raw = _f.read()
+        return raw[:30_000]
+    except Exception as e:
+        return f'[{fname} read error: {e}]'
+
+
+# ── Intent map: message keywords → which mongo builders + file keys ───────────
+_RAG_INTENT_MAP = {
+    'voter_roll': {
+        'kw': ['voter', 'elector', 'registered', '2025', '2024', '2002',
+               'gender', 'male', 'female', 'total voters'],
+        'mongo': ['2025 Voter Roll (Ward Summary)', 'Booth-wise Counts'],
+        'files': [],
+    },
+    'caste_community': {
+        'kw': ['caste', 'community', 'bunt', 'billava', 'brahmin', 'muslim',
+               'christian', 'hindu', 'minority', 'obc', 'sc', 'st', 'tulu',
+               'konkani', 'beary', 'surname', 'religion'],
+        'mongo': ['Community/Caste Count 2023', 'Coastal Karnataka Caste Reference'],
+        'files': [],
+    },
+    'polling_2023': {
+        'kw': ['2023', 'polled', 'not polled', 'polling', 'turnout', 'voted',
+               'non polled', 'election result', 'win', 'lost', 'victory',
+               'margin', 'vote share', 'bjp', 'congress', 'inc',
+               'lobo', 'kamath', 'candidate'],
+        'mongo': ['2023 Polling Data', 'Polled/NotPolled with Caste 2023'],
+        'files': ['2023p'],
+    },
+    'bjp_strategy': {
+        'kw': ['bjp strategy', 'booth strategy', 'political intelligence',
+               'wsi', 'gameplan', 'manifesto', 'action plan', 'priority booth',
+               'strong medium weak', '5 pillar', 'ward action', 'campaign calendar'],
+        'mongo': [],
+        'files': ['BJP_Boothwise', 'BJP_Political'],
+    },
+    'ward_booth_info': {
+        'kw': ['blo', 'supervisor', 'mapped', 'cutoff', 'progeny',
+               'electors mapped', 'ward info', 'booth info', 'booth detail'],
+        'mongo': ['Ward Information (2026)', 'Booth Details'],
+        'files': [],
+    },
+    'survey': {
+        'kw': ['survey', 'socio', 'economic', 'employment', 'health',
+               'education', 'scheme', 'outstation', 'differently abled',
+               'family survey', 'not found survey', 'nonpolled survey'],
+        'mongo': ['Survey Records', 'NotFoundRecordSurvey', 'Socio-Economic Data (Data collection)'],
+        'files': [],
+    },
+    'sir': {
+        'kw': ['sir', 'revision', 'new addition', 'deleted', 'suspicious',
+               'not found', 'genuine', 'bogus', 'dead voter', 'ghost voter',
+               'phantom', 'duplicate'],
+        'mongo': ['SIR Analysis (2002 vs 2025)', 'Genuine Voters (SIR Verified)', '2002 Voter Roll'],
+        'files': [],
+    },
+    'deceased_future': {
+        'kw': ['deceased', 'dead', 'death', 'future voter', 'youth',
+               'eligible', '2028', 'new voter', 'young voter'],
+        'mongo': ['Future Voters & Deceased'],
+        'files': [],
+    },
+    'election_2019': {
+        'kw': ['2019'],
+        'mongo': [],
+        'files': ['2019_full'],
+    },
+    'election_2018': {
+        'kw': ['2018'],
+        'mongo': [],
+        'files': ['2018_WARD_WISE', '2014_AND_2018'],
+    },
+    'election_2014': {
+        'kw': ['2014'],
+        'mongo': [],
+        'files': ['2014_STATISTICAL', '2014_AND_2018'],
+    },
+    'election_2013': {
+        'kw': ['2013'],
+        'mongo': [],
+        'files': ['2013_WARD_WISE', '2013__WARD_WISE', '2013__2013__AND'],
+    },
+    'history': {
+        'kw': ['historical', 'history', 'past election', 'previous election',
+               'trend', 'across years', 'all elections', 'compare elections',
+               '5 election', 'five election', 'decade', 'decadal'],
+        'mongo': [],
+        'files': ['2013__2013__AND', '2014_WARD_WISE', '2019_full'],
+    },
+    'analysis': {
+        'kw': ['analyse', 'analysis', 'compare', 'comparison', 'priority ward',
+               'strategic', 'report', 'fullscale', 'flip', 'target ward',
+               'non polled opportunity', 'weak to medium', 'medium to strong',
+               '90 day', '100 day', 'booth intervention', 'deep analysis'],
+        'mongo': ['2023 Polling Data'],
+        'files': ['Mangaluru_Election', 'Mangaluru_FULLSCALE'],
+    },
+    'swot': {
+        'kw': ['swot', 'strength', 'weakness', 'opportunity', 'threat',
+               'strengths', 'weaknesses', 'opportunities', 'threats'],
+        'mongo': ['SWOT Query Stack (NewQueryStack1)', '2023 Polling Data'],
+        'files': [],
+    },
+}
+
+# All existing mongo context builder labels → callable map
+_RAG_MONGO_ALL = {
+    '2025 Voter Roll (Ward Summary)':         _ai_ctx_voter_roll_summary,
+    'Survey Records':                          _ai_ctx_survey_summary,
+    '2023 Polling Data':                       _ai_ctx_polling_summary,
+    'SIR Analysis (2002 vs 2025)':             _ai_ctx_sir_summary,
+    'Booth-wise Counts':                       _ai_ctx_booth_summary,
+    'Future Voters & Deceased':                _ai_ctx_future_deceased,
+    'Community/Caste Count 2023':              _ai_ctx_caste_count_2023,
+    'Polled/NotPolled with Caste 2023':        _ai_ctx_polled_notpolled_caste,
+    'Ward Information (2026)':                 _ai_ctx_ward_booth_2026,
+    'Booth Details':                           _ai_ctx_ward_booth_details,
+    'NotFoundRecordSurvey':                    _ai_ctx_not_found_survey,
+    'Coastal Karnataka Caste Reference':       _ai_ctx_coastal_caste_reference,
+    'SWOT Query Stack (NewQueryStack1)':       _ai_ctx_swot_stack,
+    '2002 Voter Roll':                         _ai_ctx_voter_roll_2002,
+    'Genuine Voters (SIR Verified)':           _ai_ctx_genuine_voters,
+    'Socio-Economic Data (Data collection)':   _ai_ctx_socio_economic_data,
+}
+
+
+def _rag_fetch_context(message: str) -> tuple:
+    """
+    Main RAG entry point.
+    Classifies message → runs only needed MongoDB builders + smart file chunks.
+    Returns (context_text, sources_list).
+    """
+    msg_lower      = message.lower()
+    needed_mongo   = []   # ordered, deduped labels
+    needed_files   = []   # ordered, deduped file keys
+    matched_intents = []
+
+    for intent, cfg in _RAG_INTENT_MAP.items():
+        if any(kw in msg_lower for kw in cfg['kw']):
+            matched_intents.append(intent)
+            for lbl in cfg['mongo']:
+                if lbl not in needed_mongo:
+                    needed_mongo.append(lbl)
+            for fk in cfg['files']:
+                if fk not in needed_files:
+                    needed_files.append(fk)
+
+    # Default: voter roll + polling for general questions
+    if not matched_intents:
+        needed_mongo = ['2025 Voter Roll (Ward Summary)', '2023 Polling Data']
+
+    print(f'[RAG] Intents: {matched_intents} | Mongo: {needed_mongo} | Files: {needed_files}')
+
+    sections = []
+    sources  = []
+
+    # ── MongoDB (parallel) ────────────────────────────────────────────────────
+    mongo_results = {}
+    def _run_mongo(label):
+        fn = _RAG_MONGO_ALL.get(label)
+        if not fn:
+            return label, f'[{label}: not found]'
+        try:
+            return label, fn()
+        except Exception as e:
+            return label, f'[{label} error: {e}]'
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(_run_mongo, lbl): lbl for lbl in needed_mongo}
+        for future in as_completed(futures):
+            lbl, text = future.result()
+            mongo_results[lbl] = text
+
+    # Preserve order
+    for lbl in needed_mongo:
+        text = mongo_results.get(lbl, '')
+        if text:
+            sections.append(text)
+            sources.append(f'MongoDB:{lbl}')
+
+    # ── Files (smart chunked) ─────────────────────────────────────────────────
+    FILE_CHAR_BUDGET = 120_000   # ~30k tokens max across all files
+    total_file_chars = 0
+
+    for fkey in needed_files:
+        if total_file_chars >= FILE_CHAR_BUDGET:
+            print(f'[RAG] File budget reached, skipping: {fkey}')
+            break
+        try:
+            text = _rag_load_file(fkey, message)
+            if text and not text.startswith('['):
+                remaining = FILE_CHAR_BUDGET - total_file_chars
+                text = text[:remaining]
+                sections.append(text)
+                sources.append(f'File:{fkey}')
+                total_file_chars += len(text)
+        except Exception as e:
+            print(f'[RAG] File load error {fkey}: {e}')
+
+    context_text = '\n\n'.join(sections)
+    total_chars  = len(context_text)
+    print(f'[RAG] Total: {total_chars:,} chars (~{total_chars//4:,} tokens) | '
+          f'Sources: {len(sources)} | {sources}')
+    return context_text, sources
+
+
 def _ai_load_mongo_context():
     """
     Run all 16 MongoDB context builders in parallel.
@@ -7278,29 +7867,16 @@ def api_ai_chat(request):
             'chartSpec': None, 'exportSpec': None, 'filesUsed': [],
         }))
 
-    # ── Data question — load everything in parallel ───────────────────────────
-    mongo_ctx    = ''
-    all_sources  = []
-    doc_blocks   = []
-    fallback_txt = ''
-
+    # ── RAG: fetch only relevant context for this message ───────────────────
+    all_sources = []
     try:
-        mongo_ctx, mongo_sources = _ai_load_mongo_context()
-        all_sources.extend(mongo_sources)
+        rag_context, rag_sources = _rag_fetch_context(message)
+        all_sources.extend(rag_sources)
     except Exception as e:
-        mongo_ctx = f'MongoDB error: {e}'
+        rag_context = f'[RAG error: {e}]'
+        traceback.print_exc()
 
-    try:
-        doc_blocks, file_sources, fallback_txt = _ai_load_files_api(client, message)
-        all_sources.extend(file_sources)
-    except Exception as e:
-        print(f'[Files API] Error in _ai_load_files_api: {e}')
-        fallback_txt = f'[Files API error: {e}]'
-
-    system_prompt = _AI_CHAT_SYSTEM.replace('{MONGO_CONTEXT}', mongo_ctx)
-
-    if fallback_txt:
-        system_prompt += f'\n\n## INLINE FILE CONTEXT (Files API fallback):\n{fallback_txt}'
+    system_prompt = _AI_CHAT_SYSTEM.replace('{MONGO_CONTEXT}', rag_context)
 
     # ── Build messages ────────────────────────────────────────────────────────
     messages = []
@@ -7308,26 +7884,16 @@ def api_ai_chat(request):
         r, c = h.get('role', 'user'), h.get('content', '')
         if r in ('user', 'assistant') and c:
             messages.append({'role': r, 'content': c})
-
-    user_content = (doc_blocks + [{'type': 'text', 'text': message}]) if doc_blocks else message
-    messages.append({'role': 'user', 'content': user_content})
+    messages.append({'role': 'user', 'content': message})
 
     # ── Call Anthropic ────────────────────────────────────────────────────────
     try:
-        kwargs = dict(
+        response = client.messages.create(
             model      = 'claude-sonnet-4-20250514',
             max_tokens = 4096,
             system     = system_prompt,
             messages   = messages,
         )
-        if doc_blocks:
-            response = client.beta.messages.create(
-                **kwargs,
-                betas=['files-api-2025-04-14'],
-            )
-        else:
-            response = client.messages.create(**kwargs)
-
         reply_text = ''.join(b.text for b in response.content if hasattr(b, 'text'))
     except Exception as e:
         traceback.print_exc()
