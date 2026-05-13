@@ -8,9 +8,8 @@ RENDER_HOST = os.environ.get('RENDER_EXTERNAL_HOSTNAME', '')
 
 ALLOWED_HOSTS = [
     RENDER_HOST,
-    'production-web-conn-e2h8.onrender.com',
+    'production-web-conn-2.onrender.com',
     'production-web-conn.onrender.com',
-    'production-web-conn-1-82wl.onrender.com'
 ]
 
 SECRET_KEY = os.getenv("SECRET_KEY")
@@ -18,9 +17,9 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 # ── CSRF ──────────────────────────────────────────────────────────────────────
 CSRF_TRUSTED_ORIGINS = [
     f"https://{RENDER_HOST}",
-    "https://production-web-conn-e2h8.onrender.com",
+    "https://production-web-conn-2.onrender.com",
     "https://production-web-conn.onrender.com",
-    "https://frontend-production-web-ulhf.onrender.com",
+    "https://frontend-production-web-ux7k.onrender.com",
 ]
 
 CSRF_COOKIE_SAMESITE  = 'None'
@@ -35,8 +34,8 @@ SESSION_COOKIE_SECURE   = True
 # The _ai_cors() helper in views.py additionally handles OPTIONS preflight
 # for the AI chat endpoints specifically.
 CORS_ALLOWED_ORIGINS = [
-    "https://frontend-production-web-ulhf.onrender.com",
-    "https://production-web-conn-1-82wl.onrender.com",
+    "https://frontend-production-web-ux7k.onrender.com",
+    "https://production-web-conn-1-qoya.onrender.com",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
