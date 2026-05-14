@@ -4711,20 +4711,6 @@ CONSTITUENCY_NAME   = "Mangalore South"
 CONSTITUENCY_NUMBER = 175
 ML_CHUNK_SIZE       = 500   # must match predict_query_stack.py
 
-# ── Process-level cache for constituency SWOT data ────────────────────────────
-# _reassemble_chunks + _sanitise_queries reads thousands of MongoDB records and
-# can take 5-15 s on a cold Render worker — enough to trigger SIGKILL.
-# After the first request succeeds we cache the serialised list in memory.
-# The cache lives as long as the Gunicorn worker process (typically hours).
-# A hard browser reload or server restart clears it automatically.
-# Set _ML_CACHE_TTL_SECONDS = 0 to disable caching during development.
-import time as _cache_time_mod
-_ML_CONSTITUENCY_CACHE: dict = {
-    "data":    None,   # serialised list[dict] ready to return
-    "loaded_at": 0.0,  # epoch timestamp of last successful load
-}
-_ML_CACHE_TTL_SECONDS = 3600   # 1 hour — refresh if worker stays alive that long
-
 def _get_ml_db():
     """Return SurveyDataBase from the survey cluster (same cluster as NewQueryStack1)."""
     return _get_survey_client()["SurveyDataBase"]
@@ -4770,53 +4756,22 @@ def api_ml_constituency_swot(request):
     """
     GET /api/ml/constituency-swot/
     Returns all predicted queries for Mangalore South from NewQueryStack1.
-
-    Results are cached in _ML_CONSTITUENCY_CACHE for _ML_CACHE_TTL_SECONDS to
-    prevent repeated heavy MongoDB reads from timing out Gunicorn workers.
-    The cache is invalidated when the worker restarts or when TTL expires.
-    Pass ?refresh=1 to force a fresh read (admin use only).
+    NewQueryStack1 stores all constituency records across chunked documents;
+    no constituencyNumber/Name filter — fetch all chunks and return flat list.
     """
     user = _user_from_request(request)
     if not user:
         return JsonResponse({"error": "Unauthorized"}, status=401)
-
-    force_refresh = request.GET.get("refresh", "") == "1"
-    now           = _cache_time_mod.time()
-    cache_age     = now - _ML_CONSTITUENCY_CACHE["loaded_at"]
-    cache_valid   = (
-        not force_refresh
-        and _ML_CONSTITUENCY_CACHE["data"] is not None
-        and (_ML_CACHE_TTL_SECONDS == 0 or cache_age < _ML_CACHE_TTL_SECONDS)
-    )
-
-    if cache_valid:
-        cached = _ML_CONSTITUENCY_CACHE["data"]
-        return JsonResponse({
-            "scope":              "constituency",
-            "constituencyName":   CONSTITUENCY_NAME,
-            "constituencyNumber": CONSTITUENCY_NUMBER,
-            "totalQueries":       cached["totalQueries"],
-            "queries":            cached["queries"],
-            "cached":             True,
-        })
-
     try:
-        db         = _get_ml_db()
-        col        = db["NewQueryStack1"]
-        queries    = _reassemble_chunks(col, {})   # no filter — all chunks belong to this constituency
-        sanitised  = _sanitise_queries(queries)
-
-        # Store in process-level cache
-        _ML_CONSTITUENCY_CACHE["data"]      = {"totalQueries": len(queries), "queries": sanitised}
-        _ML_CONSTITUENCY_CACHE["loaded_at"] = _cache_time_mod.time()
-
+        db      = _get_ml_db()
+        col     = db["NewQueryStack1"]
+        queries = _reassemble_chunks(col, {})   # no filter — all chunks belong to this constituency
         return JsonResponse({
-            "scope":              "constituency",
-            "constituencyName":   CONSTITUENCY_NAME,
-            "constituencyNumber": CONSTITUENCY_NUMBER,
-            "totalQueries":       len(queries),
-            "queries":            sanitised,
-            "cached":             False,
+            "scope":               "constituency",
+            "constituencyName":    CONSTITUENCY_NAME,
+            "constituencyNumber":  CONSTITUENCY_NUMBER,
+            "totalQueries":        len(queries),
+            "queries":             _sanitise_queries(queries),
         })
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)
