@@ -4829,22 +4829,6 @@ def api_ai_query_insight(request):
         "keyFigures": [...],
         "barChart": {...},
         "swotBreakdown": {...},
-        "suggestedSchemes": [
-            {
-                "name": str,
-                "ministry": str,
-                "relevance": str,
-                "impact": "High/Medium/Low",
-                "url": str,
-                "perBeneficiaryCost": int,       # INR per voter per year
-                "budgetBreakdown": str            # e.g. "₹5,000 × 3,950 = ₹1.97 Cr"
-            }
-        ],
-        "budgetRequired": {
-            "totalINR": int,                     # sum of all scheme × beneficiary costs
-            "displayLabel": str,                 # e.g. "₹2.4 Cr"
-            "note": str                          # explanatory note
-        },
         "recommendation": str,
         "riskLevel": str,
         "riskColor": str
@@ -4903,38 +4887,118 @@ def api_ai_query_insight(request):
         '{"ctx":"Health","signal":"S/W/O/T/N","color":"#22d3ee","note":"1 line"},'
         '{"ctx":"Political","signal":"S/W/O/T/N","color":"#f59e0b","note":"1 line"}]},'
         '"suggestedSchemes":['
-        '{"name":"Scheme name (central or state)","ministry":"Ministry/Department","relevance":"Why it applies to this voter segment","impact":"High/Medium/Low","url":"https://official-portal.gov.in","perBeneficiaryCost":<integer INR per beneficiary per year>,"budgetBreakdown":"e.g. ₹5,000 × 3,950 beneficiaries = ₹1.97 Cr"},'
-        '{"name":"Another applicable scheme","ministry":"Ministry/Department","relevance":"Why it applies","impact":"High/Medium/Low","url":"https://official-portal.gov.in","perBeneficiaryCost":<integer INR>,"budgetBreakdown":"e.g. ₹2,000 × 3,950 = ₹79 L"}'
+        '{"name":"Exact scheme name from catalogue","ministry":"Ministry name","relevance":"Why this segment qualifies","impact":"High/Medium/Low","url":"exact myscheme.gov.in URL from catalogue","perBeneficiaryCost":<integer from cost table>,"budgetBreakdown":"e.g. Rs6,000 x 3,956 beneficiaries = Rs23.7 L"}'
         '],'
-        '"budgetRequired":{"totalINR":<total integer INR across all schemes × beneficiary count>,"displayLabel":"e.g. ₹2.4 Cr","note":"Estimated annual outlay for this voter segment across all applicable schemes"},'
+        '"budgetRequired":{"totalINR":<sum of all perBeneficiaryCost x beneficiary count>,"displayLabel":"RsX.X Cr or RsX.X L","note":"Estimated annual government outlay for this voter segment"},'
         '"recommendation":"One specific actionable recommendation for 2028",'
         '"riskLevel":"Low/Medium/High/Critical",'
         '"riskColor":"#10b981 or #f59e0b or #fb923c or #f87171"}\n\n'
-        "For suggestedSchemes: include 2-4 real central/state government schemes (Karnataka or India) "
-        "that are most applicable to this voter segment based on their demographic filters "
-        "(economic status, employment, health, education, religion, community). "
-        "For perBeneficiaryCost: use the REAL annual benefit amount per person that the scheme provides "
-        "(e.g. Ayushman Bharat = 500000 per family/year, PM-KISAN = 6000/year, Gruha Lakshmi = 24000/year). "
-        "Multiply perBeneficiaryCost by the segment voter count to get the scheme budget. "
-        "Sum all scheme budgets to compute budgetRequired.totalINR. "
-        "For the url field use the REAL official government portal. Verified URLs: "
-        "PM-KISAN farmers: https://pmkisan.gov.in | "
-        "Ayushman Bharat health: https://pmjay.gov.in | "
-        "PM Awas Yojana Urban housing: https://pmaymis.gov.in | "
-        "PM Awas Yojana Gramin housing: https://pmayg.nic.in | "
-        "Skill India PMKVY unemployed youth: https://www.skillindia.gov.in | "
-        "PM Ujjwala BPL women LPG: https://www.pmuy.gov.in | "
-        "MGNREGS rural labour: https://nrega.nic.in | "
-        "PM Mudra loans small business: https://www.mudra.org.in | "
-        "National Scholarships students: https://scholarships.gov.in | "
-        "eShram unorganised workers: https://eshram.gov.in | "
-        "PM SVANidhi street vendors: https://pmsvanidhi.mohua.gov.in | "
-        "Swachh Bharat sanitation: https://swachhbharatmission.gov.in | "
-        "Karnataka Seva Sindhu (Gruha Lakshmi/Yuva Nidhi/Anna Bhagya): https://sevasindhu.karnataka.gov.in | "
-        "Karnataka Rajiv Gandhi Housing: https://www.rajivgruhakalpa.kar.nic.in | "
-        "Devaraj Urs BC Corporation loans OBC: https://www.dbcck.karnataka.gov.in. "
-        "Only suggest schemes genuinely relevant to the segment's filters. "
-        "Always use a real .gov.in URL from the list above — never invent a URL."
+
+        "SCHEME CATALOGUE — 85 verified schemes from system database. "
+        "Pick 2-4 that match the segment filters exactly. Use exact Name + URL below.\n\n"
+
+        "AGRICULTURE/FARMER:\n"
+        "Pradhan Mantri Kisan Samman Nidhi | APL+BPL farmers, all religions | perBeneficiaryCost=6000 (Rs2000x3 fixed) | https://www.myscheme.gov.in/schemes/pm-kisan\n"
+        "Pradhan Mantri Fasal Bima Yojna | BPL farmers, all religions | perBeneficiaryCost=4500 (avg premium subsidy/farmer/season) | https://www.myscheme.gov.in/schemes/pmfby\n"
+        "Krushy Aranya Protsaha Yojane | APL+BPL SC/ST/OBC farmers | perBeneficiaryCost=5000 (agroforestry incentive) | https://www.myscheme.gov.in/schemes/kapy\n"
+        "Pradhan Mantri Matsya Sampada Yojana | BPL fisherfolk, all religions | perBeneficiaryCost=20000 (avg subsidy for equipment) | https://www.myscheme.gov.in/schemes/pmmsy\n"
+        "Livestock Health and Diseases Control | APL+BPL livestock holders | perBeneficiaryCost=2000 (vaccination+treatment/household/yr) | https://www.myscheme.gov.in/schemes/lhadc\n"
+        "Nekar Samman Yojana | BPL weavers, all religions | perBeneficiaryCost=6000 (Rs500/month x 12) | https://www.myscheme.gov.in/schemes/nsy\n\n"
+
+        "HOUSING:\n"
+        "Pradhan Mantri Awas Yojana - Urban | BPL only, renting/no own home, all religions | perBeneficiaryCost=150000 (avg central+state subsidy — NOT full cost) | https://www.myscheme.gov.in/schemes/pmay-u\n\n"
+
+        "HEALTH/INSURANCE:\n"
+        "Niramaya Health Insurance Scheme | APL+BPL DifferentlyAbled=Yes, Diseased | perBeneficiaryCost=500 (annual premium subsidy) | https://www.myscheme.gov.in/schemes/nhis\n"
+        "Pradhan Mantri Jeevan Jyoti Bima Yojana | BPL age 18+, all religions | perBeneficiaryCost=436 (annual premium fully subsidised) | https://www.myscheme.gov.in/schemes/pmjjby\n"
+        "Pradhan Mantri Suraksha Bima Yojana | BPL Diseased age 18+, all religions | perBeneficiaryCost=20 (annual premium Rs20 govt bears) | https://www.myscheme.gov.in/schemes/pmsby\n"
+        "Pradhan Mantri Garib Kalyan Anna Yojana | APL+BPL Diseased, all religions | perBeneficiaryCost=3600 (5kg grain/month x Rs60 x 12) | https://www.myscheme.gov.in/schemes/pm-gkay\n\n"
+
+        "WOMEN & CHILD:\n"
+        "Pradhan Mantri Matru Vandana Yojana | BPL pregnant/lactating women, all religions | perBeneficiaryCost=5000 (one-time maternity benefit fixed) | https://www.myscheme.gov.in/schemes/pmmvy\n"
+        "Thayi Bhagya Scheme | BPL women Karnataka | perBeneficiaryCost=5000 (institutional delivery incentive) | https://www.myscheme.gov.in/schemes/thayi-bhagya\n"
+        "Bhagyalaxmi Scheme | BPL girl child at birth Karnataka | perBeneficiaryCost=19300 (annualised Rs19,300 bond value) | https://www.myscheme.gov.in/schemes/bys\n"
+        "Scheme For Adolescent Girls | BPL girls age 11-18, all religions | perBeneficiaryCost=4500 (nutrition+IFA+health per girl/yr) | https://www.myscheme.gov.in/schemes/sag\n"
+        "Indira Gandhi National Widow Pension Scheme | BPL widows, all religions | perBeneficiaryCost=3600 (Rs300/month x 12 central share) | https://www.myscheme.gov.in/schemes/ignwps\n"
+        "One Stop Centre | APL+BPL women in distress, all religions | perBeneficiaryCost=2000 (avg service cost/beneficiary) | https://www.myscheme.gov.in/schemes/osc\n"
+        "Incentive For The Sc Widow Remarriage | BPL SC widow women, Hindu | perBeneficiaryCost=50000 (one-time on remarriage) | https://www.myscheme.gov.in/schemes/iscwr\n"
+        "Incentive For The Simple Marriage | BPL SC Hindu | perBeneficiaryCost=25000 (one-time inter-caste marriage incentive) | https://www.myscheme.gov.in/schemes/iftsm\n\n"
+
+        "EMPLOYMENT/ENTREPRENEURSHIP:\n"
+        "PM Street Vendors AtmaNirbhar Nidhi (PM SVANidhi) | BPL urban street vendors, all religions | perBeneficiaryCost=10000 (first tranche working capital) | https://www.myscheme.gov.in/schemes/pm-svanidhi\n"
+        "Prime Minister's Employment Generation Programme | APL+BPL unemployed educated, all religions | perBeneficiaryCost=90000 (avg 15-35% subsidy on Rs3L avg project) | https://www.myscheme.gov.in/schemes/pmegp\n"
+        "PM Vishwakarma | APL+BPL traditional artisans OBC Hindu | perBeneficiaryCost=15000 (toolkit Rs15,000 + skill stipend) | https://www.myscheme.gov.in/schemes/pmv\n"
+        "Self Employment Scheme | APL+BPL Muslim/Christian/Jain/Buddhist/Sikh ONLY | perBeneficiaryCost=50000 (avg loan per minority beneficiary) | https://www.myscheme.gov.in/schemes/ses\n"
+        "Udyogini Scheme | BPL women entrepreneurs, all religions | perBeneficiaryCost=30000 (avg subsidy/grant per woman) | https://www.myscheme.gov.in/schemes/us\n"
+        "Shrama Shakthi Scheme | APL+BPL employed Muslim/Christian/Jain/Buddhist/Sikh | perBeneficiaryCost=12000 (avg annual welfare benefit/worker) | https://www.myscheme.gov.in/schemes/sss\n"
+        "Airavata Scheme | APL+BPL SC/ST Hindu | perBeneficiaryCost=40000 (avg subsidy on vehicle/equipment loan) | https://www.myscheme.gov.in/schemes/airavata\n"
+        "Subsidy Scheme For Purchase Of Taxi/Goods Vehicle | APL+BPL ST community | perBeneficiaryCost=50000 (avg vehicle subsidy) | https://www.myscheme.gov.in/schemes/subsidy-scheme-for-taxi\n"
+        "Prerana (micro Credit Finance) Scheme | APL+BPL micro-entrepreneurs, all religions | perBeneficiaryCost=25000 (avg micro-credit loan) | https://www.myscheme.gov.in/schemes/prerana\n"
+        "Direct Loans For Business Enterprise | APL+BPL Muslim/Christian/Jain/Buddhist/Sikh ONLY | perBeneficiaryCost=100000 (avg loan) | https://www.myscheme.gov.in/schemes/dlbe\n"
+        "Samruddhi Scheme | BPL SC/ST educated women | perBeneficiaryCost=20000 (avg grant+training) | https://www.myscheme.gov.in/schemes/samruddhischeme\n"
+        "Unnati Scheme | APL+BPL all religions | perBeneficiaryCost=8000 (avg skill training cost) | https://www.myscheme.gov.in/schemes/unnati\n"
+        "Ganga Kalyana Scheme | BPL Muslim/Christian/Jain/Buddhist/Sikh farmers ONLY | perBeneficiaryCost=75000 (avg borewell/pump subsidy) | https://www.myscheme.gov.in/schemes/gks\n\n"
+
+        "SKILL DEVELOPMENT:\n"
+        "Pradhan Mantri Kaushal Vikas Yojana - Short Term Training | APL+BPL unemployed, all religions | perBeneficiaryCost=8000 (avg govt training cost/candidate) | https://www.myscheme.gov.in/schemes/pmkvy-stt\n"
+        "Entrepreneurship and Skill Development Programme | BPL employed/retired, all religions | perBeneficiaryCost=6000 (avg MSME skill training cost) | https://www.myscheme.gov.in/schemes/esdp\n\n"
+
+        "EDUCATION/SCHOLARSHIP:\n"
+        "Pre Matric Scholarship For Scheduled Tribe Students | BPL SC/ST students age <18 | perBeneficiaryCost=7000 (avg annual scholarship) | https://www.myscheme.gov.in/schemes/pre-st\n"
+        "Post-Matric Scholarship for SC students | BPL SC students, all religions | perBeneficiaryCost=12000 (avg annual scholarship) | https://www.myscheme.gov.in/schemes/pmsfss\n"
+        "Centrally Sponsored Scheme of Post-Matric Scholarship for OBC Students | APL+BPL OBC female students | perBeneficiaryCost=10000 (avg annual OBC scholarship) | https://www.myscheme.gov.in/schemes/csspostmsossi\n"
+        "Pre Matric Scholarship For Students With Disabilities | APL+BPL DifferentlyAbled=Yes students | perBeneficiaryCost=9000 (avg annual scholarship) | https://www.myscheme.gov.in/schemes/pre-dis\n"
+        "Top Class Education For Students With Disabilities | APL+BPL DifferentlyAbled=Yes | perBeneficiaryCost=75000 (fees+allowances top institution) | https://www.myscheme.gov.in/schemes/tce-swd\n"
+        "Post Graduate Indira Gandhi Scholarship For Single Girl Child | APL+BPL single girl PG | perBeneficiaryCost=36200 (Rs3,100/month x 12) | https://www.myscheme.gov.in/schemes/pg-igssgc\n"
+        "Pragati Scholarship Scheme For Girl Students (Technical Diploma) | APL+BPL girl students tech diploma | perBeneficiaryCost=30000 (Rs30,000/year fixed) | https://www.myscheme.gov.in/schemes/psgs-dip\n"
+        "Vidyasiri food And Accommodation Scholarship Scheme | BPL SC/ST/OBC students Hindu | perBeneficiaryCost=18000 (food+accommodation/student/yr) | https://www.myscheme.gov.in/schemes/vfas\n"
+        "Free Coaching Scheme for SC and OBC Students | APL+BPL SC/OBC students | perBeneficiaryCost=45000 (avg coaching+stipend/student/yr) | https://www.myscheme.gov.in/schemes/fcssos\n"
+        "Padho Pardesh | APL+BPL OBC minority students overseas | perBeneficiaryCost=200000 (avg interest subsidy on education loan) | https://www.myscheme.gov.in/schemes/ppma\n"
+        "National Talent Scholarship Undergraduate | BPL merit students, all religions | perBeneficiaryCost=12000 (Rs1,000/month x 12) | https://www.myscheme.gov.in/schemes/nts-ug\n"
+        "National Scholarship For Post Graduate Studies | APL ONLY, all religions | perBeneficiaryCost=24000 (Rs2,000/month x 12) | https://www.myscheme.gov.in/schemes/nsfpgs\n"
+        "Rajiv Gandhi National Fellowship For Scheduled Caste Candidates | APL+BPL SC research students | perBeneficiaryCost=312000 (JRF Rs31,000/month+HRA avg 2 yrs) | https://www.myscheme.gov.in/schemes/rgnfscc\n"
+        "Prabhuddha Overseas Scholarship | APL+BPL SC/ST educated | perBeneficiaryCost=1000000 (overseas tuition+living) | https://www.myscheme.gov.in/schemes/pdos\n"
+        "Savitribai Jyotirao Phule Fellowship For Single Girl Child | APL+BPL single girl OBC MPhil/PhD | perBeneficiaryCost=84000 (Rs7,000/month x 12) | https://www.myscheme.gov.in/schemes/sjpfsgc\n"
+        "National Scheme Of Incentive To Girls For Secondary Education | BPL girls class 8, all religions | perBeneficiaryCost=3000 (one-time FD at class 8) | https://www.myscheme.gov.in/schemes/nsigse\n"
+        "Pre-Matric Scholarships Scheme for Scheduled Castes & Others | APL+BPL SC/OBC students class 9-10 | perBeneficiaryCost=5250 (avg day-scholar scholarship/yr) | https://www.myscheme.gov.in/schemes/pmsssc\n"
+        "Education Loan Scheme | APL+BPL OBC/SC/ST students | perBeneficiaryCost=150000 (avg loan — flag as loan) | https://www.myscheme.gov.in/schemes/els\n\n"
+
+        "PENSION/SOCIAL SECURITY:\n"
+        "Atal Pension Yojana | BPL unorganised workers educated age 18+, all religions | perBeneficiaryCost=1000 (avg govt co-contribution/yr) | https://www.myscheme.gov.in/schemes/apy\n"
+        "Indira Gandhi National Disability Pension Scheme | BPL DifferentlyAbled=Yes, all religions | perBeneficiaryCost=3600 (Rs300/month x 12 central share) | https://www.myscheme.gov.in/schemes/igndps\n"
+        "National Family Benefit Scheme | APL+BPL DifferentlyAbled on breadwinner death | perBeneficiaryCost=20000 (one-time lump sum) | https://www.myscheme.gov.in/schemes/nfbs\n"
+        "National Pension Scheme For Traders And Self Employed Persons | APL+BPL self-employed SC traders | perBeneficiaryCost=1500 (avg govt co-contribution/yr) | https://www.myscheme.gov.in/schemes/nps-tsep\n\n"
+
+        "DIFFERENTLY ABLED (DifferentlyAbled=Yes ONLY):\n"
+        "National Action Plan for Skill Development of Persons with Disabilities | APL+BPL DiffAbled=Yes, all religions | perBeneficiaryCost=10000 (skill training+placement) | https://www.myscheme.gov.in/schemes/nap-sdp\n"
+        "Deen Dayal Disabled Rehabilitation Scheme | APL+BPL SC/ST DiffAbled | perBeneficiaryCost=8000 (avg rehab grant/yr) | https://www.myscheme.gov.in/schemes/dddrs\n"
+        "Vikaas-Day Care Scheme For Person with Disability Children | APL+BPL OBC/SC DiffAbled children | perBeneficiaryCost=12000 (day-care cost/child/yr) | https://www.myscheme.gov.in/schemes/vdcspds\n\n"
+
+        "ENERGY:\n"
+        "PM Surya Ghar: Muft Bijli Yojana | APL+BPL SC community own home | perBeneficiaryCost=78000 (avg central subsidy 2kW rooftop solar) | https://www.myscheme.gov.in/schemes/pmsgmb\n"
+        "Pradhan Mantri Ujjwala Yojana | BPL women all religions NEW connection only | perBeneficiaryCost=1600 (one-time cylinder+regulator) | https://www.myscheme.gov.in/schemes/pmuy\n\n"
+
+        "FINANCIAL INCLUSION:\n"
+        "Pradhan Mantri Jan Dhan Yojana | APL+BPL ST community | perBeneficiaryCost=2000 (overdraft+RuPay insurance value) | https://www.myscheme.gov.in/schemes/pmjdy\n"
+        "Stand-Up India | BPL SC/ST women entrepreneurs | perBeneficiaryCost=1000000 (avg loan Rs10L-1Cr — flag as loan) | https://www.myscheme.gov.in/schemes/sui\n\n"
+
+        "SELECTION RULES — follow strictly:\n"
+        "1. Match ALL segment filters before selecting: economicStatus, religion, community, healthStatus, gender, homeType, employmentStatus, differentlyAbled.\n"
+        "2. NEVER suggest PMAY-Urban if homeType includes Own (voter already owns home).\n"
+        "3. NEVER suggest PM-KISAN unless the segment filters include farmer/agriculture employment.\n"
+        "4. NEVER suggest PM SVANidhi unless explicitly urban street vendors.\n"
+        "5. NEVER suggest schemes marked Muslim/Christian/Jain/Buddhist/Sikh ONLY for Hindu segments.\n"
+        "6. NEVER suggest religion-neutral schemes for segments where the scheme has a religion restriction.\n"
+        "7. NEVER suggest disability schemes if DifferentlyAbled=No.\n"
+        "8. Select max 4 schemes; prefer highest perBeneficiaryCost that genuinely applies.\n\n"
+
+        "BUDGET FORMAT:\n"
+        "budgetBreakdown: 'Rs<cost with commas> x <N> beneficiaries = Rs<total>'\n"
+        "  Use RsX.X L for total < 1,00,00,000; RsX.X Cr for total >= 1,00,00,000. Round to 1 decimal.\n"
+        "  Example: Rs6,000 x 3,956 beneficiaries = Rs23.7 L\n"
+        "budgetRequired.totalINR = exact integer sum of all (perBeneficiaryCost x count).\n"
+        "budgetRequired.displayLabel = 'RsX.X Cr' if total >= 1,00,00,000 else 'RsX.X L'.\n"
+        "budgetRequired.note = 'Estimated annual government outlay for this voter segment across applicable schemes'."
     )
 
     try:
@@ -4942,10 +5006,10 @@ def api_ai_query_insight(request):
         # timeout=25 ensures we fail cleanly before Gunicorn's worker timeout kills the process
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1600,
+            max_tokens=1800,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
-            timeout=30.0,
+            timeout=35.0,
         )
         raw = "".join(b.text for b in message.content if hasattr(b, "text")).strip()
         # Strip markdown fences if present
