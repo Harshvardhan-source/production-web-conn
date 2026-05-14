@@ -4829,6 +4829,22 @@ def api_ai_query_insight(request):
         "keyFigures": [...],
         "barChart": {...},
         "swotBreakdown": {...},
+        "suggestedSchemes": [
+            {
+                "name": str,
+                "ministry": str,
+                "relevance": str,
+                "impact": "High/Medium/Low",
+                "url": str,
+                "perBeneficiaryCost": int,       # INR per voter per year
+                "budgetBreakdown": str            # e.g. "₹5,000 × 3,950 = ₹1.97 Cr"
+            }
+        ],
+        "budgetRequired": {
+            "totalINR": int,                     # sum of all scheme × beneficiary costs
+            "displayLabel": str,                 # e.g. "₹2.4 Cr"
+            "note": str                          # explanatory note
+        },
         "recommendation": str,
         "riskLevel": str,
         "riskColor": str
@@ -4887,15 +4903,20 @@ def api_ai_query_insight(request):
         '{"ctx":"Health","signal":"S/W/O/T/N","color":"#22d3ee","note":"1 line"},'
         '{"ctx":"Political","signal":"S/W/O/T/N","color":"#f59e0b","note":"1 line"}]},'
         '"suggestedSchemes":['
-        '{"name":"Scheme name (central or state)","ministry":"Ministry/Department","relevance":"Why it applies to this voter segment","impact":"High/Medium/Low","url":"https://official-portal.gov.in"},'
-        '{"name":"Another applicable scheme","ministry":"Ministry/Department","relevance":"Why it applies","impact":"High/Medium/Low","url":"https://official-portal.gov.in"}'
+        '{"name":"Scheme name (central or state)","ministry":"Ministry/Department","relevance":"Why it applies to this voter segment","impact":"High/Medium/Low","url":"https://official-portal.gov.in","perBeneficiaryCost":<integer INR per beneficiary per year>,"budgetBreakdown":"e.g. ₹5,000 × 3,950 beneficiaries = ₹1.97 Cr"},'
+        '{"name":"Another applicable scheme","ministry":"Ministry/Department","relevance":"Why it applies","impact":"High/Medium/Low","url":"https://official-portal.gov.in","perBeneficiaryCost":<integer INR>,"budgetBreakdown":"e.g. ₹2,000 × 3,950 = ₹79 L"}'
         '],'
+        '"budgetRequired":{"totalINR":<total integer INR across all schemes × beneficiary count>,"displayLabel":"e.g. ₹2.4 Cr","note":"Estimated annual outlay for this voter segment across all applicable schemes"},'
         '"recommendation":"One specific actionable recommendation for 2028",'
         '"riskLevel":"Low/Medium/High/Critical",'
         '"riskColor":"#10b981 or #f59e0b or #fb923c or #f87171"}\n\n'
         "For suggestedSchemes: include 2-4 real central/state government schemes (Karnataka or India) "
         "that are most applicable to this voter segment based on their demographic filters "
         "(economic status, employment, health, education, religion, community). "
+        "For perBeneficiaryCost: use the REAL annual benefit amount per person that the scheme provides "
+        "(e.g. Ayushman Bharat = 500000 per family/year, PM-KISAN = 6000/year, Gruha Lakshmi = 24000/year). "
+        "Multiply perBeneficiaryCost by the segment voter count to get the scheme budget. "
+        "Sum all scheme budgets to compute budgetRequired.totalINR. "
         "For the url field use the REAL official government portal. Verified URLs: "
         "PM-KISAN farmers: https://pmkisan.gov.in | "
         "Ayushman Bharat health: https://pmjay.gov.in | "
@@ -4921,10 +4942,10 @@ def api_ai_query_insight(request):
         # timeout=25 ensures we fail cleanly before Gunicorn's worker timeout kills the process
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1200,
+            max_tokens=1600,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
-            timeout=25.0,
+            timeout=30.0,
         )
         raw = "".join(b.text for b in message.content if hasattr(b, "text")).strip()
         # Strip markdown fences if present
