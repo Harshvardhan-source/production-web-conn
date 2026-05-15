@@ -7789,148 +7789,88 @@ def _ai_make_export(spec, fmt):
 @csrf_exempt
 @require_http_methods(["POST", "OPTIONS"])
 def api_intel_birdseye(request):
-    """
-    POST /api/ai/intel-birdseye/
-    Body: { "tabs": [...tab data strings...], "tabLabels": [...] }
-
-    Generates a comprehensive AI Birds Eye View across ALL tabs of the
-    BJP Political Intelligence System. Returns pin-to-pin analysis.
-    """
+    """POST /api/ai/intel-birdseye/ — AI Birds Eye View across all 11 intel tabs"""
     if request.method == 'OPTIONS':
         return _ai_cors(request, JsonResponse({}))
-
     try:
         user = _user_from_request(request)
     except Exception as e:
         return _ai_cors(request, JsonResponse({"error": f"Auth error: {e}"}, status=500))
     if not user:
         return _ai_cors(request, JsonResponse({"error": "Unauthorized"}, status=401))
-
     try:
         body = json.loads(request.body)
     except Exception:
         return _ai_cors(request, JsonResponse({"error": "Invalid JSON"}, status=400))
 
-    tab_data_map = body.get("tabData", {})   # { tabId: "serialised data string" }
-    if not tab_data_map:
+    tab_data = body.get("tabData", {})
+    if not tab_data:
         return _ai_cors(request, JsonResponse({"error": "tabData is required"}, status=400))
 
-    # Build the combined context string (cap at 6000 chars total to avoid 502)
     TAB_TITLES = {
-        "heatmap":   "Ward Heatmap & SIR Data",
-        "why":       "Why Stronghold/Medium/Weak",
-        "wsi":       "WSI Scores",
-        "community": "Community Composition",
-        "history":   "Election History 2013-2023",
-        "math":      "Electoral Math",
-        "strategy":  "Strategy Pillars",
-        "policy":    "Policy Actions",
-        "tracker":   "Execution Tracker",
-        "calendar":  "Election Calendar",
-        "insights":  "Top Intelligence Insights",
+        "heatmap": "Ward Heatmap", "why": "Why S/M/W", "wsi": "WSI Scores",
+        "community": "Community", "history": "Election History", "math": "Electoral Math",
+        "strategy": "Strategy", "policy": "Policy", "tracker": "Tracker",
+        "calendar": "Calendar", "insights": "Key Insights",
     }
-
-    combined = []
-    budget = 5800
-    for tab_id, title in TAB_TITLES.items():
-        snippet = (tab_data_map.get(tab_id) or "").strip()
+    budget = 5500
+    parts = []
+    for tid, title in TAB_TITLES.items():
+        snippet = (tab_data.get(tid) or "").strip()
         if not snippet:
             continue
         chunk = f"\n=== {title} ===\n{snippet}"
-        if budget - len(chunk) < 0:
-            combined.append(f"\n=== {title} ===\n[truncated — {len(snippet)} chars]")
+        if len(chunk) > budget:
+            parts.append(f"\n=== {title} ===\n[{len(snippet)} chars — truncated]")
         else:
-            combined.append(chunk)
+            parts.append(chunk)
             budget -= len(chunk)
-
-    context_str = "".join(combined)
+    context = "".join(parts)
 
     system_prompt = (
-        "You are a senior political strategist and election intelligence officer for the BJP in "
-        "Mangaluru City South constituency (Constituency 175, Karnataka, India). "
-        "You have access to 11 intelligence modules: Heatmap, Ward Why, WSI Scores, "
-        "Community, History, Math, Strategy, Policy, Tracker, Calendar, and Insights.\n\n"
-        "Deliver a COMPREHENSIVE, pin-to-pin Birds Eye View that synthesises ALL modules.\n"
-        "Every claim must cite a specific ward name, booth number, percentage, or vote count.\n"
-        "Return ONLY valid JSON — no markdown, no preamble.\n\n"
-        "Schema:\n"
+        "You are a senior BJP political strategist for Mangaluru City South (Constituency 175, Karnataka). "
+        "38 wards, 246,960 electors, decadal analysis 2013-2025.\n\n"
+        "Generate a COMPREHENSIVE pin-to-pin Birds Eye View across ALL 11 intelligence modules. "
+        "Every insight must cite a specific ward, booth, %, or vote count from the data.\n"
+        "Return ONLY valid JSON — no markdown fences, no preamble.\n\n"
+        "REQUIRED schema:\n"
         "{\n"
-        '  "headline": "15-20 word master strategic headline with a real number",\n'
-        '  "executiveSummary": "4-5 sentence comprehensive overview citing wards and numbers",\n'
-        '  "moduleInsights": [\n'
-        "    {\n"
-        '      "tab": "Tab name",\n'
-        '      "icon": "emoji",\n'
-        '      "verdict": "3-6 word verdict",\n'
-        '      "finding": "1-2 sentence key finding with real data",\n'
-        '      "action": "Specific actionable next step",\n'
-        '      "urgency": "CRITICAL|HIGH|MEDIUM|NORMAL"\n'
-        "    }\n"
-        "  ],\n"
-        '  "criticalRisks": [\n'
-        "    {\n"
-        '      "n": 1,\n'
-        '      "title": "Risk title",\n'
-        '      "detail": "Specific detail with ward name / number",\n'
-        '      "mitigation": "Action to take",\n'
-        '      "sev": "🔴|🟠|🟡"\n'
-        "    }\n"
-        "  ],\n"
-        '  "topOpportunities": [\n'
-        "    {\n"
-        '      "title": "Opportunity",\n'
-        '      "votes": "+N votes potential",\n'
-        '      "how": "How to capture it"\n'
-        "    }\n"
-        "  ],\n"
-        '  "wardWatchlist": [\n'
-        "    {\n"
-        '      "ward": "Ward name",\n'
-        '      "wardNum": 28,\n'
-        '      "status": "status tag",\n'
-        '      "color": "#hexcolor",\n'
-        '      "reason": "Why it is on the watchlist"\n'
-        "    }\n"
-        "  ],\n"
-        '  "winProbability": 58,\n'
-        '  "probabilityBreakdown": "2-3 sentence probability justification with numbers",\n'
-        '  "topPriorityAction": "Single most important action to take in next 30 days",\n'
-        '  "confidenceNote": "Data confidence level and basis"\n'
+        ' "headline": "15-20 word strategic headline with a real number",\n'
+        ' "executiveSummary": "4-5 sentences citing wards and vote counts",\n'
+        ' "moduleInsights": [{"tab":"name","icon":"emoji","verdict":"3-5 words","finding":"1-2 sentences with data","action":"specific next step","urgency":"CRITICAL|HIGH|MEDIUM|NORMAL"}],\n'
+        ' "criticalRisks": [{"n":1,"title":"risk","detail":"ward/% specific","mitigation":"action","sev":"🔴|🟠|🟡"}],\n'
+        ' "topOpportunities": [{"title":"opp","votes":"+N votes","how":"how to capture"}],\n'
+        ' "wardWatchlist": [{"ward":"name","wardNum":28,"status":"tag","color":"#hex","reason":"why"}],\n'
+        ' "winProbability": 58,\n'
+        ' "probabilityBreakdown": "2-3 sentences with ward counts",\n'
+        ' "topPriorityAction": "single most important action next 30 days",\n'
+        ' "confidenceNote": "data confidence sentence"\n'
         "}"
     )
-
     user_prompt = (
-        "Mangaluru City South — BJP Political Intelligence System\n"
-        "38 wards · 246,960 electors · Decadal analysis 2013-2025\n"
-        "Generate the comprehensive Birds Eye View.\n\n"
-        f"=== INTELLIGENCE DATA FROM ALL MODULES ===\n{context_str}"
+        f"Mangaluru City South — 38 wards · 246,960 electors · 2013-2025\n\n"
+        f"=== INTELLIGENCE DATA ===\n{context}"
     )
 
     try:
         client = _get_anthropic()
-        message = client.messages.create(
-            model      = "claude-sonnet-4-20250514",
-            max_tokens = 3000,
-            system     = system_prompt,
-            messages   = [{"role": "user", "content": user_prompt}],
+        msg = client.messages.create(
+            model="claude-sonnet-4-20250514", max_tokens=3000,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
         )
-        raw = "".join(b.text for b in message.content if hasattr(b, "text")).strip()
+        raw = "".join(b.text for b in msg.content if hasattr(b, "text")).strip()
         raw = _re2.sub(r'^```(?:json)?\s*', '', raw)
-        raw = _re2.sub(r'\s*```$',          '', raw)
-        raw = raw.strip()
-        m   = _re2.search(r'\{[\s\S]*\}', raw)
+        raw = _re2.sub(r'\s*```$', '', raw).strip()
+        m = _re2.search(r'\{[\s\S]*\}', raw)
         if m:
             raw = m.group(0)
         try:
             result = json.loads(raw)
         except json.JSONDecodeError:
-            result = {
-                "headline": "BJP Political Intelligence — Full System Analysis",
-                "executiveSummary": "Analysis could not be parsed. Please regenerate.",
-                "moduleInsights": [], "criticalRisks": [], "topOpportunities": [],
-                "wardWatchlist": [], "winProbability": 58,
-                "probabilityBreakdown": "", "topPriorityAction": "", "confidenceNote": "",
-            }
+            result = {"headline":"Analysis Error","executiveSummary":"Could not parse AI response. Please regenerate.",
+                      "moduleInsights":[],"criticalRisks":[],"topOpportunities":[],"wardWatchlist":[],
+                      "winProbability":58,"probabilityBreakdown":"","topPriorityAction":"","confidenceNote":""}
         return _ai_cors(request, JsonResponse({"success": True, "overview": result}))
     except Exception as exc:
         traceback.print_exc()
