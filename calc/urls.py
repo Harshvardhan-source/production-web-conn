@@ -89,4 +89,5 @@ urlpatterns = [
     path('ward-places/',             views.api_ward_places,              name='api_ward_places'),
     path('local-places-summary/',    views.api_local_places_summary,     name='api_local_places_summary'),
     path('swot/beneficiaries/',      views.api_beneficiary_list,         name='api_beneficiary_list'),
+    path('ai/intel-birdseye/',          views.api_intel_birdseye,           name='api_intel_birdseye'),
 ]
