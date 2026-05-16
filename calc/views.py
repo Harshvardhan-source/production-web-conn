@@ -3367,21 +3367,14 @@ def api_check_sir(request):
     # Relation-only: only relation provided, nothing else — confirmed-match lookups
     # can't pin a single voter, so skip them and rely on similarity scoring instead.
     _relation_only_search = bool(relation and not name   and not voterid and not house)
-    # EPIC-only: only voter ID provided — do exact Tier-1 lookup ONLY, skip all fuzzy phases.
-    # Showing fuzzy suggestions when the user typed a specific EPIC is misleading.
-    _epic_only_search     = bool(voterid  and not name   and not house   and not relation)
 
     _res = [None, None]
     def _t25(): _res[0] = (None if (_name_only_search or _relation_only_search) else _find_voter_in_2025(col_2025, voterid, name, house, relation))
     def _t02(): _res[1] = (None if (_name_only_search or _relation_only_search) else _find_voter_in_2002(col_2002, voterid, name, house, relation))
 
     # ── Phase 3: fetch ALL 2002 candidates – token-aware contains + intersection ────────
-    # Skip entirely for EPIC-only searches — the Tier-1 exact lookup in _t02() is
-    # definitive; showing fuzzy suggestions alongside an EPIC search is misleading.
     _raw02 = []
     def _t_sugg02():
-        if _epic_only_search:
-            return
         try:
             seen = set()
             def _add(cur):
@@ -3441,11 +3434,8 @@ def api_check_sir(request):
             pass
 
     # ── Phase 4: fetch ALL 2025 similar candidates – token-aware contains + intersection ────
-    # Skip entirely for EPIC-only searches — same reason as Phase 3.
     _raw25 = []
     def _t_sim25():
-        if _epic_only_search:
-            return
         try:
             seen = set()
             def _add(cur):
@@ -3609,13 +3599,42 @@ def api_check_sir(request):
         h_ok = (flat['house'].upper() == house.upper()) if has_house else False
         e_ok = bool(has_epic and flat['voterid'] and flat['voterid'].upper() == voterid.upper())
 
-        # Token coverage: how many search tokens appear in the candidate name
-        cov02 = _token_coverage(_name_tokens_list, flat['name']) if (_name_tokens_list and has_name) else 0
+        # ── Token coverage: how many search tokens appear as substrings in candidate name ──
+        cov02        = _token_coverage(_name_tokens_list, flat['name']) if (_name_tokens_list and has_name) else 0
         total_toks02 = len(_name_tokens_list)
-        full_cov02 = (total_toks02 > 0 and cov02 == total_toks02)
-        coverage_bonus02 = 15.0 if (total_toks02 > 1 and full_cov02) else 0.0
+        full_cov02   = (total_toks02 > 0 and cov02 == total_toks02)
 
-        # Composite relevance score
+        # ── First-word prefix bonus ────────────────────────────────────────────────
+        # "VEDA VYASA KAMATH" → first word "VEDA" starts with query "VEDA" → bonus.
+        # "SHRIMATHI VEDA VATHI" → first word "SHRIMATHI" ≠ "VEDA" → NO bonus.
+        # This correctly separates records where the query matches the primary name token
+        # from records where the query appears as a secondary/middle word.
+        _cand_words02 = flat['name'].upper().split() if flat['name'] else []
+        # Leading-word check: ALL query tokens must be prefixes of the corresponding
+        # positional word in the candidate (query token 0 → candidate word 0, etc.)
+        _first_word_pfx02 = bool(
+            _name_tokens_list and _cand_words02 and
+            _cand_words02[0].startswith(_name_tokens_list[0].upper())
+        )
+        # Fallback any-word prefix (weaker — any word in candidate starts with token)
+        _any_word_pfx02 = bool(_name_tokens_list and any(
+            w.startswith(_name_tokens_list[0].upper()) for w in _cand_words02
+        ))
+        _full_pfx02 = _first_word_pfx02   # used for bonus — only reward leading match
+
+        # Bonus: first word of candidate starts with query's first token → strong signal.
+        # Multi-token full substring coverage keeps 15 pt bonus unchanged.
+        coverage_bonus02 = (15.0 if (total_toks02 > 1 and full_cov02)  else
+                            10.0 if _first_word_pfx02                   else
+                             4.0 if _any_word_pfx02                     else 0.0)
+
+        # ── Relation quality score — used as a fine-grained tiebreaker ────────────
+        # When multiple records tie on flag count + prefix rank, the one whose relation
+        # most closely matches the query floats to the top.
+        # Scale: 0 at r_sc=60 threshold, up to 10 pts at r_sc=100.
+        _rel_quality02 = max(0.0, (r_sc - 60) / 4.0) if (has_rel and r_sc >= 60) else 0.0
+
+        # ── Composite relevance score ─────────────────────────────────────────────
         if has_name and has_house and has_rel:
             comp = 0.55*n_sc + 0.25*r_sc + 0.20*(100.0 if h_ok else 0.0) + coverage_bonus02
         elif has_name and has_house:
@@ -3639,16 +3658,22 @@ def api_check_sir(request):
         if has_rel and not has_name and r_sc < _rel_gate and not e_ok: continue
 
         matched_by = []
-        if e_ok:                                          matched_by.append('voterid')
-        if has_name and (n_sc >= 60 or full_cov02):       matched_by.append('name')
-        elif has_name and cov02 > 0:                      matched_by.append('partial')
-        if has_house and h_ok:                            matched_by.append('house')
-        # For relation-only lower the threshold so results surface even for transliteration variants
+        if e_ok:                                                        matched_by.append('voterid')
+        # 'name' flag: good fuzzy score, full substring coverage, or full prefix coverage
+        if has_name and (n_sc >= 60 or full_cov02 or _full_pfx02):     matched_by.append('name')
+        elif has_name and cov02 > 0:                                     matched_by.append('partial')
+        if has_house and h_ok:                                           matched_by.append('house')
         _rel_match_threshold = 35 if _relation_only_search else 60
-        if has_rel   and r_sc >= _rel_match_threshold:    matched_by.append('relation')
+        if has_rel   and r_sc >= _rel_match_threshold:                   matched_by.append('relation')
 
         _scored02.append({
-            'comp': comp, 'flat': flat, 'doc': doc,
+            'comp':        comp,
+            'flat':        flat,
+            'doc':         doc,
+            # prefix_rank: 2=first-word prefix, 1=any-word prefix, 0=no prefix
+            # Used as sort tiebreaker between records with same flag count + comp score.
+            'prefix_rank':   2 if _first_word_pfx02 else (1 if _any_word_pfx02 else 0),
+            'rel_quality':   _rel_quality02,
             'field_scores': {
                 'name':     round(n_sc) if has_name  else 0,
                 'relation': round(r_sc) if has_rel   else 0,
@@ -3658,7 +3683,13 @@ def api_check_sir(request):
             'matched_by': matched_by,
         })
 
-    _scored02.sort(key=lambda x: (-len([f for f in x['matched_by'] if f != 'partial']), -x['comp']))
+    # Sort: (1) most matched fields, (2) first-word prefix rank, (3) relation quality, (4) composite score
+    _scored02.sort(key=lambda x: (
+        -len([f for f in x['matched_by'] if f != 'partial']),
+        -x['prefix_rank'],
+        -x['rel_quality'],
+        -x['comp'],
+    ))
     _seen_sigs02 = set()
     for item in _scored02[:300]:
         f   = item['flat']
@@ -3679,9 +3710,16 @@ def api_check_sir(request):
             'source':       'mongodb',
             'field_scores': item['field_scores'],
             'matched_by':   item['matched_by'],
+            'prefix_rank':  item['prefix_rank'],
+            'rel_quality':  item['rel_quality'],
         })
 
-    suggestions_2002.sort(key=lambda x: (-len([f for f in x.get('matched_by',[]) if f != 'partial']), -x['score']))
+    suggestions_2002.sort(key=lambda x: (
+        -len([f for f in x.get('matched_by',[]) if f != 'partial']),
+        -x.get('prefix_rank', 0),
+        -x.get('rel_quality', 0),
+        -x['score'],
+    ))
     suggestions_2002 = suggestions_2002[:300]
 
     # ── Score similar_2025 from pre-fetched _raw25 ────────────────────────────────────
@@ -3766,7 +3804,6 @@ def api_check_sir(request):
         'stored':     False,
         'in_2025':    in_2025,
         'in_2002':    in_2002,
-        'epic_only':  _epic_only_search,
         'similar_2025': similar_2025,
         'suggestions_2002': suggestions_2002,
         'record_2002': {
