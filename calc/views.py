@@ -3367,14 +3367,21 @@ def api_check_sir(request):
     # Relation-only: only relation provided, nothing else — confirmed-match lookups
     # can't pin a single voter, so skip them and rely on similarity scoring instead.
     _relation_only_search = bool(relation and not name   and not voterid and not house)
+    # EPIC-only: only voter ID provided — do exact Tier-1 lookup ONLY, skip all fuzzy phases.
+    # Showing fuzzy suggestions when the user typed a specific EPIC is misleading.
+    _epic_only_search     = bool(voterid  and not name   and not house   and not relation)
 
     _res = [None, None]
     def _t25(): _res[0] = (None if (_name_only_search or _relation_only_search) else _find_voter_in_2025(col_2025, voterid, name, house, relation))
     def _t02(): _res[1] = (None if (_name_only_search or _relation_only_search) else _find_voter_in_2002(col_2002, voterid, name, house, relation))
 
     # ── Phase 3: fetch ALL 2002 candidates – token-aware contains + intersection ────────
+    # Skip entirely for EPIC-only searches — the Tier-1 exact lookup in _t02() is
+    # definitive; showing fuzzy suggestions alongside an EPIC search is misleading.
     _raw02 = []
     def _t_sugg02():
+        if _epic_only_search:
+            return
         try:
             seen = set()
             def _add(cur):
@@ -3434,8 +3441,11 @@ def api_check_sir(request):
             pass
 
     # ── Phase 4: fetch ALL 2025 similar candidates – token-aware contains + intersection ────
+    # Skip entirely for EPIC-only searches — same reason as Phase 3.
     _raw25 = []
     def _t_sim25():
+        if _epic_only_search:
+            return
         try:
             seen = set()
             def _add(cur):
@@ -3756,6 +3766,7 @@ def api_check_sir(request):
         'stored':     False,
         'in_2025':    in_2025,
         'in_2002':    in_2002,
+        'epic_only':  _epic_only_search,
         'similar_2025': similar_2025,
         'suggestions_2002': suggestions_2002,
         'record_2002': {
