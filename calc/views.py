@@ -791,7 +791,7 @@ _WARD_CACHE_TTL  = 300  # 5 minutes
 # ── SIR Preview Cache — MongoDB-backed (survives server restarts/sleep) ────────
 # Falls back to an in-process dict when the DB is unreachable.
 _SIR_PREVIEW_CACHE     = {}   # in-process fallback
-_SIR_PREVIEW_CACHE_TTL = 900  # 15 minutes — repeated identical queries are instant
+_SIR_PREVIEW_CACHE_TTL = 300  # 5 minutes (raised from 2 min)
 
 def _sir_cache_get(key_tuple):
     """Try MongoDB first, fall back to in-process dict."""
@@ -3364,29 +3364,17 @@ def api_check_sir(request):
     # no relation). In that case there are too many candidates to pick one —
     # we return 100 similar records instead and let the user choose.
     _name_only_search     = bool(name     and not voterid and not house and not relation)
+    # Relation-only: only relation provided, nothing else — confirmed-match lookups
+    # can't pin a single voter, so skip them and rely on similarity scoring instead.
     _relation_only_search = bool(relation and not name   and not voterid and not house)
-    # EPIC-only: exact Tier-1 lookup is definitive — skip all fuzzy phases.
-    _epic_only_search     = bool(voterid  and not name   and not house   and not relation)
-
-    # ── Adaptive fetch limits ─────────────────────────────────────────────────
-    # When multiple fields are filled the intersection is much smaller, so we need
-    # fewer docs to surface the right match.  Larger limits only when name is the
-    # sole signal (name-only) because we need broad coverage to show the full list.
-    _fields_filled = sum(bool(x) for x in [name, voterid, house, relation])
-    _tok_lim   = 300 if _name_only_search else (150 if _fields_filled == 1 else 100)
-    _multi_lim = 300 if _name_only_search else 200   # multi-token AND — still needs breadth
-    _pfx_lim   = 200 if _name_only_search else 120   # phonetic prefix fallback
-    _rel_lim   = 300 if _relation_only_search else 60
 
     _res = [None, None]
     def _t25(): _res[0] = (None if (_name_only_search or _relation_only_search) else _find_voter_in_2025(col_2025, voterid, name, house, relation))
     def _t02(): _res[1] = (None if (_name_only_search or _relation_only_search) else _find_voter_in_2002(col_2002, voterid, name, house, relation))
 
-    # ── Phase 3: fetch 2002 candidates ───────────────────────────────────────
+    # ── Phase 3: fetch ALL 2002 candidates – token-aware contains + intersection ────────
     _raw02 = []
     def _t_sugg02():
-        if _epic_only_search:
-            return
         try:
             seen = set()
             def _add(cur):
@@ -3398,53 +3386,56 @@ def api_check_sir(request):
             if voterid:
                 _add(col_2002.find({'$or':[{'Voter ID / EPIC No':voterid},{'Epic NO':voterid}]}, _PROJ_02).limit(5))
 
-            # b) House exact + prefix (house pins well — tight limits are fine)
+            # b) House exact + prefix
             if house:
-                _add(col_2002.find({'$or':[{'House / Flat No':house},{'House No':house}]}, _PROJ_02).limit(50))
-                if not _raw02:  # only try prefix when exact finds nothing
-                    h_pfx = {'$regex':f'^{re.escape(house)}','$options':'i'}
-                    _add(col_2002.find({'$or':[{'House / Flat No':h_pfx},{'House No':h_pfx}]}, _PROJ_02).limit(50))
+                _add(col_2002.find({'$or':[{'House / Flat No':house},{'House No':house}]}, _PROJ_02).limit(60))
+                h_pfx = {'$regex':f'^{re.escape(house)}','$options':'i'}
+                _add(col_2002.find({'$or':[{'House / Flat No':h_pfx},{'House No':h_pfx}]}, _PROJ_02).limit(60))
 
             if _name_tokens_list:
-                # c) Contains each token anywhere in name
+                # c) Single-token search: contains each token anywhere in name
+                #    This catches "AKSHAYA RAJESH", "B RAJESH BALIGA" etc.
+                _tok_lim = 500 if _name_only_search else 200
                 for tok in _name_tokens_list:
                     rx = {'$regex': re.escape(tok), '$options': 'i'}
                     _add(col_2002.find({'$or':[{'Voter Name':rx},{'Name':rx}]}, _PROJ_02).limit(_tok_lim))
 
-                # d) Multi-token AND — only when ≥2 tokens (highest precision, run first-ish)
+                # d) Multi-token AND: all tokens must appear somewhere in the name
+                #    "RAJESH SHETTY" -> Name contains RAJESH AND Name contains SHETTY
+                #    Produces the most relevant results for multi-word queries
                 if len(_name_tokens_list) >= 2:
-                    and_clauses = [{'$or':[{'Voter Name':{'$regex':re.escape(t),'$options':'i'}},
-                                           {'Name':      {'$regex':re.escape(t),'$options':'i'}}]}
-                                   for t in _name_tokens_list]
-                    _add(col_2002.find({'$and': and_clauses}, _PROJ_02).limit(_multi_lim))
+                    and_clauses = []
+                    for tok in _name_tokens_list:
+                        rx = {'$regex': re.escape(tok), '$options': 'i'}
+                        and_clauses.append({'$or':[{'Voter Name':rx},{'Name':rx}]})
+                    _add(col_2002.find({'$and': and_clauses}, _PROJ_02).limit(500))
 
-                # e) Phonetic prefix variants — skip if house is set (house already narrows enough)
-                if _name_tok and not house:
+                # e) Phonetic prefix variants (original fallback for transliteration)
+                if _name_tok:
                     clauses = []
                     for p in _name_prefixes:
                         rx = {'$regex':f'^{re.escape(p)}','$options':'i'}
                         clauses.append({'Voter Name':rx}); clauses.append({'Name':rx})
-                    _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(_pfx_lim))
+                    _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(500))
 
-            # f) Relation prefix
+            # f) Relation prefix — greatly expanded for relation-only searches
             if relation and len(relation) >= 2:
                 frt = relation.split()[0]
                 rpfx = {'$regex':f'^{re.escape(frt[:min(5,len(frt))])}','$options':'i'}
+                _rel_lim = 500 if _relation_only_search else 100
                 _add(col_2002.find({'$or':[{'Relative Name':rpfx},{'Relation Name':rpfx}]}, _PROJ_02).limit(_rel_lim))
+                # For relation-only: also fetch all tokens of the relation name individually
                 if _relation_only_search:
                     for _rtok in relation.split():
                         if len(_rtok) >= 3:
                             _rx = {'$regex': re.escape(_rtok), '$options': 'i'}
-                            _add(col_2002.find({'$or':[{'Relative Name':_rx},{'Relation Name':_rx}]}, _PROJ_02).limit(150))
+                            _add(col_2002.find({'$or':[{'Relative Name':_rx},{'Relation Name':_rx}]}, _PROJ_02).limit(200))
         except Exception:
             pass
 
-    # ── Phase 4: fetch 2025 candidates + suspicious checks (parallel with Phase 3) ──
+    # ── Phase 4: fetch ALL 2025 similar candidates – token-aware contains + intersection ────
     _raw25 = []
-    _suspicious_flags = []   # populated here, merged into `suspicious` after join
     def _t_sim25():
-        if _epic_only_search:
-            return
         try:
             seen = set()
             def _add(cur):
@@ -3456,56 +3447,38 @@ def api_check_sir(request):
                 _add(col_2025.find({'Epic NO':voterid}, _PROJ_25).limit(5))
 
             if house:
-                _add(col_2025.find({'House No':house}, _PROJ_25).limit(50))
-                if not _raw25:
-                    h_pfx = {'$regex':f'^{re.escape(house)}','$options':'i'}
-                    _add(col_2025.find({'House No':h_pfx}, _PROJ_25).limit(50))
+                _add(col_2025.find({'House No':house}, _PROJ_25).limit(60))
+                h_pfx = {'$regex':f'^{re.escape(house)}','$options':'i'}
+                _add(col_2025.find({'House No':h_pfx}, _PROJ_25).limit(60))
 
             if _name_tokens_list:
+                # c) Contains search for each token — catches mid-name occurrences
+                _tok_lim25 = 500 if _name_only_search else 200
                 for tok in _name_tokens_list:
                     rx = {'$regex': re.escape(tok), '$options': 'i'}
-                    _add(col_2025.find({'Name': rx}, _PROJ_25).limit(_tok_lim))
+                    _add(col_2025.find({'Name': rx}, _PROJ_25).limit(_tok_lim25))
 
+                # d) Multi-token AND intersection — highest precision for multi-word queries
                 if len(_name_tokens_list) >= 2:
-                    and_clauses = [{'Name':{'$regex':re.escape(t),'$options':'i'}} for t in _name_tokens_list]
-                    _add(col_2025.find({'$and': and_clauses}, _PROJ_25).limit(_multi_lim))
+                    and_clauses = [{'Name':{'$regex':re.escape(tok),'$options':'i'}} for tok in _name_tokens_list]
+                    _add(col_2025.find({'$and': and_clauses}, _PROJ_25).limit(500))
 
-                if _name_tok and not house:
+                # e) Phonetic prefix variants fallback
+                if _name_tok:
                     clauses = [{'Name':{'$regex':f'^{re.escape(p)}','$options':'i'}} for p in _name_prefixes]
-                    _add(col_2025.find({'$or':clauses}, _PROJ_25).limit(_pfx_lim))
+                    _add(col_2025.find({'$or':clauses}, _PROJ_25).limit(500))
 
             if relation and len(relation) >= 3:
                 frt = relation.split()[0]
                 rpfx = {'$regex':f'^{re.escape(frt[:min(5,len(frt))])}','$options':'i'}
-                _add(col_2025.find({'Relation Name':rpfx}, _PROJ_25).limit(_rel_lim))
+                _rel_lim25 = 500 if _relation_only_search else 100
+                _add(col_2025.find({'Relation Name':rpfx}, _PROJ_25).limit(_rel_lim25))
+                # For relation-only: also fetch per-token contains matches
                 if _relation_only_search:
                     for _rtok in relation.split():
                         if len(_rtok) >= 3:
                             _rx = {'$regex': re.escape(_rtok), '$options': 'i'}
-                            _add(col_2025.find({'Relation Name': _rx}, _PROJ_25).limit(150))
-
-            # ── Suspicious checks — run here (parallel) instead of serially after join ──
-            try:
-                if voterid:
-                    dup = col_2025.count_documents({'Epic NO': voterid})
-                    if dup > 1:
-                        _suspicious_flags.append({
-                            'flag': 'DUPLICATE_EPIC', 'label': 'Duplicate EPIC',
-                            'detail': 'EPIC "{}" appears {} times in the 2025 roll.'.format(voterid, dup),
-                            'value': dup,
-                        })
-                if house:
-                    t25 = col_2025.count_documents({'House No': house})
-                    t02 = col_2002.count_documents({'House / Flat No': house})
-                    net = t25 - t02
-                    if net > 5:
-                        _suspicious_flags.append({
-                            'flag': 'HOUSE_FLOOD', 'label': 'House Overcrowding',
-                            'detail': 'House {}: 2002 had {}, 2025 has {} (+{} entries).'.format(house, t02, t25, net),
-                            'value': net,
-                        })
-            except Exception:
-                pass
+                            _add(col_2025.find({'Relation Name': _rx}, _PROJ_25).limit(200))
         except Exception:
             pass
 
@@ -3579,9 +3552,7 @@ def api_check_sir(request):
                             'detail': 'Voter not found in either roll. May be unregistered, new to the area, or try different spelling.'})
 
     # ── Anomaly flags ─────────────────────────────────────────────────────────
-    # DB-based checks (duplicate EPIC, house flood) were computed in parallel inside
-    # _t_sim25() above. Only the pure-Python out-of-state EPIC check runs here.
-    suspicious = list(_suspicious_flags)   # already populated by Phase 4 thread
+    suspicious = []
     if voterid:
         prefix = _epic_prefix(voterid)
         if prefix and prefix not in _KA_PREFIXES:
@@ -3589,6 +3560,23 @@ def api_check_sir(request):
                 'flag': 'OUT_OF_STATE_EPIC', 'label': 'Out-of-State EPIC',
                 'detail': 'Prefix "{}" is not a recognised Karnataka EPIC code.'.format(prefix),
                 'value': voterid,
+            })
+        dup = col_2025.count_documents({'Epic NO': voterid})
+        if dup > 1:
+            suspicious.append({
+                'flag': 'DUPLICATE_EPIC', 'label': 'Duplicate EPIC',
+                'detail': 'EPIC "{}" appears {} times in the 2025 roll.'.format(voterid, dup),
+                'value': dup,
+            })
+    if house:
+        t25 = col_2025.count_documents({'House No': house})
+        t02 = col_2002.count_documents({'House / Flat No': house})
+        net = t25 - t02
+        if net > 5:
+            suspicious.append({
+                'flag': 'HOUSE_FLOOD', 'label': 'House Overcrowding',
+                'detail': 'House {}: 2002 had {}, 2025 has {} (+{} entries).'.format(house, t02, t25, net),
+                'value': net,
             })
 
     def _token_coverage(tokens, candidate_name):
