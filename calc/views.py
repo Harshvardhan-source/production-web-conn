@@ -2937,7 +2937,110 @@ def _get_xlsx():
 
 
 # ── Pre-load Excel at Django startup — prevents gunicorn timeout on first request
-threading.Thread(target=_get_xlsx, daemon=True).start()   # ← ADD THIS LINE
+threading.Thread(target=_get_xlsx, daemon=True).start()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STARTUP INDEX CREATION
+# ───────────────────────────────────────────────────────────────────────────────
+# Runs once in a background thread when Django starts.
+# create_index() is idempotent — MongoDB silently skips indexes that already
+# exist, so this is safe to run on every deploy with zero overhead after the
+# first time.
+#
+# Why each index matters:
+#   Epic NO / Voter ID / EPIC No  → Tier-1 find_one by EPIC: O(1) instead of
+#                                    full collection scan (~1.8 L docs)
+#   House No / House / Flat No    → Tier-2/3 house-exact lookup + flood check:
+#                                    narrows 1.8 L → ~10 docs instantly
+#   Booth No / Part No            → ward-dashboard booth-wise queries
+#   Relation Name / Relative Name → relation-prefix fetch in Phase 3/4 uses
+#                                    anchored $regex ^prefix which CAN use index
+#
+# Name fields intentionally NOT indexed here — $regex contains (mid-word) cannot
+# use a B-tree index regardless. A text index is a future upgrade.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _ensure_indexes():
+    """Create all performance indexes on both voter-roll collections."""
+    try:
+        # ── 2025 collection (main cluster) ────────────────────────────────────
+        col25 = get_db()['2025']
+
+        # EPIC exact lookup — Tier 1 in _find_voter_in_2025 and duplicate check
+        col25.create_index([('Epic NO', 1)], background=True, name='idx_epic_no')
+
+        # House exact lookup — Tier 2/3 and house-flood count_documents
+        col25.create_index([('House No', 1)], background=True, name='idx_house_no')
+
+        # Booth No — ward dashboard aggregations
+        col25.create_index([('Booth No', 1)], background=True, name='idx_booth_no')
+
+        # Part No (ward number stored here in 2025)
+        col25.create_index([('Part No', 1)], background=True, name='idx_part_no')
+
+        # Relation Name prefix fetch (Phase 4) — anchored ^prefix regex uses this
+        col25.create_index([('Relation Name', 1)], background=True, name='idx_relation_name')
+
+        # Compound: House + Epic — covers Tier-2 name+house AND duplicate check
+        col25.create_index(
+            [('House No', 1), ('Epic NO', 1)],
+            background=True, name='idx_house_epic',
+        )
+
+        print('[indexes] 2025 collection: OK')
+
+    except Exception as e:
+        print(f'[indexes] 2025 collection error: {e}')
+
+    try:
+        # ── 2002 collection (survey cluster — dual field-name schema) ─────────
+        col02 = get_survey_db()['2002']
+
+        # EPIC — two possible field names (old + new schema)
+        col02.create_index([('Epic NO', 1)],            background=True, name='idx_epic_no')
+        col02.create_index([('Voter ID / EPIC No', 1)], background=True, name='idx_voter_id_epic')
+
+        # House — two possible field names
+        col02.create_index([('House No', 1)],           background=True, name='idx_house_no')
+        col02.create_index([('House / Flat No', 1)],    background=True, name='idx_house_flat_no')
+
+        # Booth / Part
+        col02.create_index([('Booth No', 1)],           background=True, name='idx_booth_no')
+        col02.create_index([('Part No', 1)],            background=True, name='idx_part_no')
+
+        # Relation prefix fetch (Phase 3) — anchored ^prefix regex uses this
+        col02.create_index([('Relative Name', 1)],      background=True, name='idx_relative_name')
+        col02.create_index([('Relation Name', 1)],      background=True, name='idx_relation_name')
+
+        print('[indexes] 2002 collection: OK')
+
+    except Exception as e:
+        print(f'[indexes] 2002 collection error: {e}')
+
+    try:
+        # ── SIR result collections (main cluster) ─────────────────────────────
+        # surveyed_at descending — records list page sorts by this field
+        sir_db = get_db()
+        for col_name in ['SIR_NewAdditions', 'SIR_Deleted', 'SIR_Modified',
+                         'SIR_Retained', 'SIR_NotFound', 'SIR_Suspicious']:
+            sir_db[col_name].create_index(
+                [('surveyed_at', -1)], background=True, name='idx_surveyed_at',
+            )
+            # survey_voterid — used by update_one upserts in _run_sir_analysis
+            sir_db[col_name].create_index(
+                [('survey_voterid', 1)], background=True, name='idx_survey_voterid',
+            )
+        print('[indexes] SIR collections: OK')
+
+    except Exception as e:
+        print(f'[indexes] SIR collections error: {e}')
+
+
+# Fire-and-forget: runs in background, never blocks any request.
+threading.Thread(target=_ensure_indexes, daemon=True).start()
+
+
 # ── Lookup helpers ────────────────────────────────────────────────────────────
 
 def _find_voter_in_2025(col, voterid, name, house, relation=''):
