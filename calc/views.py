@@ -4119,9 +4119,9 @@ def api_sir_confirm_match(request):
     try:
         survey_db = get_survey_db()
         if status == 'MATCHED':
-            get_db['SIR_ConfirmedMatches'].insert_one(doc)
+            survey_db['SIR_ConfirmedMatches'].insert_one(doc)
         else:
-            get_db['SIR_ConfirmedNotFound'].insert_one(doc)
+            survey_db['SIR_ConfirmedNotFound'].insert_one(doc)
         return JsonResponse({'success': True, 'status': status})
     except Exception as exc:
         traceback.print_exc()
