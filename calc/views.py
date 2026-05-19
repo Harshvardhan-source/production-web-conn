@@ -8198,7 +8198,7 @@ def api_ai_data_files(request):
     }))
     
     
-_PLACE_ALLOWED_TYPES = {'club', 'temple', 'church', 'mosque', 'gov_school', 'private_school', 'muslim_school', 'missionary_school', 'old_age_home', 'orphanage', 'college', 'shishu_mandir'}
+_PLACE_ALLOWED_TYPES = {'club', 'temple', 'church', 'mosque', 'gov_school', 'private_school', 'muslim_school', 'missionary_school', 'old_age_school'}
 
 
 def _places_cors(request, response):
@@ -8245,7 +8245,7 @@ def api_ward_places(request):
 
         docs = list(coll.find(
             {'ward': ward_int, 'record_type': 'local_place'},
-            {'_id': 1, 'type': 1, 'name': 1, 'address': 1, 'headName': 1, 'headPhone': 1, 'committeeMembers': 1, 'createdAt': 1, 'createdBy': 1}
+            {'_id': 1, 'type': 1, 'name': 1, 'address': 1, 'createdAt': 1, 'createdBy': 1}
         ).sort('createdAt', 1))
 
         for d in docs:
@@ -8267,17 +8267,6 @@ def api_ward_places(request):
         ptype     = (body.get('type') or '').strip().lower()
         name      = (body.get('name') or '').strip()
         address   = (body.get('address') or '').strip()
-        head_name = (body.get('headName') or '').strip()
-        head_phone = (body.get('headPhone') or '').strip()
-        committee_members = body.get('committeeMembers') or []
-        # Sanitise committee_members: must be list of {name, phone}
-        if not isinstance(committee_members, list):
-            committee_members = []
-        committee_members = [
-            {'name': str(m.get('name', '')).strip(), 'phone': str(m.get('phone', '')).strip()}
-            for m in committee_members
-            if isinstance(m, dict) and (str(m.get('name', '')).strip() or str(m.get('phone', '')).strip())
-        ]
 
         if not ward:
             return _places_cors(request, JsonResponse({'success': False, 'message': 'ward is required.'}, status=400))
@@ -8298,9 +8287,6 @@ def api_ward_places(request):
             'type':        ptype,
             'name':        name,
             'address':     address,
-            'headName':    head_name,
-            'headPhone':   head_phone,
-            'committeeMembers': committee_members,
             'createdAt':   datetime.now(timezone.utc),
             'createdBy':   user.get('username') or user.get('email') or 'unknown',
         }
@@ -8317,9 +8303,6 @@ def api_ward_places(request):
                 'type':     ptype,
                 'name':     name,
                 'address':  address,
-                'headName': head_name,
-                'headPhone': head_phone,
-                'committeeMembers': committee_members,
                 'createdAt': doc['createdAt'].isoformat(),
             },
         }))
@@ -8392,13 +8375,13 @@ def api_local_places_summary(request):
         coll = get_survey_db()['WardData']
         docs = list(coll.find(
             {'record_type': 'local_place'},
-            {'_id': 1, 'ward': 1, 'wardName': 1, 'type': 1, 'name': 1, 'address': 1, 'headName': 1, 'headPhone': 1, 'committeeMembers': 1}
+            {'_id': 1, 'ward': 1, 'wardName': 1, 'type': 1, 'name': 1, 'address': 1}
         ).sort([('ward', 1), ('type', 1), ('name', 1)]))
 
         for d in docs:
             d['_id'] = str(d['_id'])
 
-        type_counts = {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0, 'gov_school': 0, 'private_school': 0, 'muslim_school': 0, 'missionary_school': 0, 'old_age_home': 0, 'orphanage': 0, 'college': 0, 'shishu_mandir': 0}
+        type_counts = {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0, 'gov_school': 0, 'private_school': 0, 'muslim_school': 0, 'missionary_school': 0, 'old_age_school': 0}
         for d in docs:
             t = d.get('type', '')
             if t in type_counts:
@@ -8411,7 +8394,7 @@ def api_local_places_summary(request):
             if ward not in ward_map:
                 ward_map[ward] = {
                     'ward': ward, 'wardName': wname, 'places': [],
-                    'counts': {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0, 'gov_school': 0, 'private_school': 0, 'muslim_school': 0, 'missionary_school': 0, 'old_age_home': 0, 'orphanage': 0, 'college': 0, 'shishu_mandir': 0},
+                    'counts': {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0, 'gov_school': 0, 'private_school': 0, 'muslim_school': 0, 'missionary_school': 0, 'old_age_school': 0},
                 }
             ward_map[ward]['places'].append(d)
             t = d.get('type', '')
