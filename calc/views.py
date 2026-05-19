@@ -3835,45 +3835,6 @@ def api_check_sir(request):
         similar_2025.append(rec)
         if len(similar_2025) >= 300: break
 
-    # ── Check which EPICs from the result are already confirmed ──────────────
-    # Collect all EPICs appearing in the returned records (primary + similar rows)
-    _all_result_epics = set()
-    for _rec in [r25, r02]:
-        _e = (_rec or {}).get('voterid', '').strip().upper()
-        if _e:
-            _all_result_epics.add(_e)
-    for _row in similar_2025 + suggestions_2002:
-        _e = (_row or {}).get('voterid', '').strip().upper()
-        if _e:
-            _all_result_epics.add(_e)
-
-    already_confirmed_epics = set()
-    if _all_result_epics:
-        try:
-            _main_db = get_db()
-            _epic_filter = {'voterid': {'$in': list(_all_result_epics)}}
-            for _doc in _main_db['SIR_ConfirmedMatches'].find(_epic_filter, {'voterid': 1}):
-                _v = (_doc.get('voterid') or '').strip().upper()
-                if _v:
-                    already_confirmed_epics.add(_v)
-            for _doc in _main_db['SIR_ConfirmedNotFound'].find(_epic_filter, {'voterid': 1}):
-                _v = (_doc.get('voterid') or '').strip().upper()
-                if _v:
-                    already_confirmed_epics.add(_v)
-            # Also check nested record fields (record_2025.voterid / record_2002.voterid)
-            for _coll_name in ('SIR_ConfirmedMatches', 'SIR_ConfirmedNotFound'):
-                _coll = _main_db[_coll_name]
-                for _fld in ('record_2025.voterid', 'record_2002.voterid'):
-                    for _doc in _coll.find({_fld: {'$in': list(_all_result_epics)}}, {_fld: 1}):
-                        _nested = _doc
-                        for _part in _fld.split('.'):
-                            _nested = (_nested or {}).get(_part, {})
-                        _v = str(_nested or '').strip().upper()
-                        if _v:
-                            already_confirmed_epics.add(_v)
-        except Exception:
-            pass  # Non-fatal — UI degrades gracefully to selectable rows
-
     _response_data = {
         'success':    True,
         'results':    results,
@@ -3884,7 +3845,6 @@ def api_check_sir(request):
         'in_2002':    in_2002,
         'similar_2025': similar_2025,
         'suggestions_2002': suggestions_2002,
-        'already_confirmed_epics': list(already_confirmed_epics),
         'record_2002': {
             'name':     r02.get('name',     ''),
             'relation': r02.get('relation', ''),
