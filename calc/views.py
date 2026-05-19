@@ -4110,10 +4110,13 @@ def api_sir_confirm_match(request):
         'not_found_2002': nf02,
         'search_inputs':  search_inputs,
         'confirmed_at':   datetime.now(timezone.utc),
-        # Convenience top-level fields for easy querying
+        # Convenience top-level fields for easy querying.
+        # When both rolls are "not found", rec25 and rec02 are both None, so we
+        # fall back to whatever the user typed in the search inputs.
         'name':     (rec25 or rec02 or {}).get('name', '') or search_inputs.get('name', ''),
         'voterid':  (rec25 or rec02 or {}).get('voterid', '') or search_inputs.get('epic', ''),
         'house':    (rec25 or rec02 or {}).get('house', '') or search_inputs.get('house', ''),
+        'relation': (rec25 or rec02 or {}).get('relation', '') or search_inputs.get('relation', ''),
     }
 
     try:
