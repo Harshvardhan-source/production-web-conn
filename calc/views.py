@@ -4131,6 +4131,123 @@ def api_sir_confirm_match(request):
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
 
 
+# ─── ADD TO urls.py: path('api/sir/confirmed/', views.api_sir_confirmed_list) ──
+@csrf_exempt
+@require_http_methods(['GET', 'OPTIONS'])
+def api_sir_confirmed_list(request):
+    """
+    GET /api/sir/confirmed/?category=ALL&page=1&limit=20
+
+    Returns confirmed SIR decisions (matches + not-found) categorised by status.
+
+    category:
+      ALL             — most-recent records from both collections (default)
+      MATCHED         — voter confirmed in both 2002 & 2025 rolls
+      NOT_FOUND_2025  — voter absent from 2025 roll
+      NOT_FOUND_2002  — voter absent from 2002 roll
+      NOT_FOUND_BOTH  — voter absent from both rolls
+
+    Response:
+    {
+      success: true,
+      counts: { MATCHED, NOT_FOUND_2025, NOT_FOUND_2002, NOT_FOUND_BOTH, TOTAL },
+      records: [ { _id, status, name, voterid, house, relation,
+                   record_2025, record_2002,
+                   not_found_2025, not_found_2002, confirmed_at }, ... ],
+      total: <int for current category>,
+      page: <int>,
+    }
+    """
+    if request.method == 'OPTIONS':
+        resp = JsonResponse({})
+        origin = request.META.get('HTTP_ORIGIN', '')
+        if origin:
+            resp['Access-Control-Allow-Origin']      = origin
+            resp['Access-Control-Allow-Credentials'] = 'true'
+            resp['Access-Control-Allow-Methods']     = 'GET, OPTIONS'
+            resp['Access-Control-Allow-Headers']     = 'Content-Type, Authorization, X-CSRFToken'
+        return resp
+
+    user = _user_from_request(request)
+    if not user:
+        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+
+    category = request.GET.get('category', 'ALL').upper()
+    page     = max(1, int(request.GET.get('page', 1)))
+    limit    = min(50, max(1, int(request.GET.get('limit', 20))))
+    skip     = (page - 1) * limit
+
+    try:
+        db             = get_db()
+        matched_coll   = db['SIR_ConfirmedMatches']
+        notfound_coll  = db['SIR_ConfirmedNotFound']
+
+        # ── Counts (always returned, all categories) ──────────────────────────
+        counts = {
+            'MATCHED':        matched_coll.count_documents({}),
+            'NOT_FOUND_2025': notfound_coll.count_documents({'status': 'NOT_FOUND_2025'}),
+            'NOT_FOUND_2002': notfound_coll.count_documents({'status': 'NOT_FOUND_2002'}),
+            'NOT_FOUND_BOTH': notfound_coll.count_documents({'status': 'NOT_FOUND_BOTH'}),
+        }
+        counts['TOTAL'] = sum(counts.values())
+
+        # ── Fetch records for the requested category ──────────────────────────
+        PROJ = {
+            '_id': 1, 'status': 1,
+            'name': 1, 'voterid': 1, 'house': 1, 'relation': 1,
+            'record_2025': 1, 'record_2002': 1,
+            'not_found_2025': 1, 'not_found_2002': 1,
+            'search_inputs': 1, 'confirmed_at': 1,
+        }
+
+        def _serialize(docs):
+            out = []
+            for d in docs:
+                d['_id'] = str(d['_id'])
+                ca = d.get('confirmed_at')
+                if hasattr(ca, 'isoformat'):
+                    d['confirmed_at'] = ca.isoformat()
+                out.append(d)
+            return out
+
+        if category == 'MATCHED':
+            total   = counts['MATCHED']
+            records = _serialize(list(
+                matched_coll.find({}, PROJ).sort('confirmed_at', -1).skip(skip).limit(limit)
+            ))
+
+        elif category in ('NOT_FOUND_2025', 'NOT_FOUND_2002', 'NOT_FOUND_BOTH'):
+            q       = {'status': category}
+            total   = counts[category]
+            records = _serialize(list(
+                notfound_coll.find(q, PROJ).sort('confirmed_at', -1).skip(skip).limit(limit)
+            ))
+
+        else:
+            # ALL — merge most-recent from both collections
+            total = counts['TOTAL']
+            fetch_n = limit + skip          # fetch enough to paginate in-memory
+            m_docs  = _serialize(list(matched_coll.find({}, PROJ).sort('confirmed_at', -1).limit(fetch_n)))
+            nf_docs = _serialize(list(notfound_coll.find({}, PROJ).sort('confirmed_at', -1).limit(fetch_n)))
+            merged  = sorted(
+                m_docs + nf_docs,
+                key=lambda d: d.get('confirmed_at', ''),
+                reverse=True,
+            )
+            records = merged[skip: skip + limit]
+
+        return JsonResponse({
+            'success': True,
+            'counts':  counts,
+            'records': records,
+            'total':   total,
+            'page':    page,
+        })
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
 
     r25 = doc.get('voter_record_2025') or {}
     r02 = doc.get('voter_record_2002') or {}
