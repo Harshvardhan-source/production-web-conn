@@ -4057,7 +4057,78 @@ def api_sir_data(request):
                          'records': all_records[:limit], 'total': total})
 
 
-def _sir_to_frontend(doc, category):
+# ─── SIR Confirm Match ────────────────────────────────────────────────────────
+@csrf_exempt
+@require_http_methods(['POST'])
+def api_sir_confirm_match(request):
+    """
+    Persist a user-confirmed SIR match decision.
+
+    Payload:
+      record_2025    : dict | null   — the 2025 roll row the user ticked (null if absent)
+      record_2002    : dict | null   — the 2002 roll row the user ticked (null if absent)
+      not_found_2025 : bool          — user explicitly marked "not in 2025"
+      not_found_2002 : bool          — user explicitly marked "not in 2002"
+      search_inputs  : dict          — { name, epic, house, relation } typed by the user
+
+    Storage rules:
+      • Both records confirmed      → SIR_ConfirmedMatches
+      • One or both absent          → SIR_ConfirmedNotFound
+        (reuses the existing SIR_NotFound collection for "not found" verdicts)
+    """
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        return JsonResponse({'success': False, 'message': 'Invalid JSON'}, status=400)
+
+    rec25       = body.get('record_2025')   # dict or None
+    rec02       = body.get('record_2002')   # dict or None
+    nf25        = bool(body.get('not_found_2025', False))
+    nf02        = bool(body.get('not_found_2002', False))
+    search_inputs = body.get('search_inputs', {})
+
+    # Determine status
+    has25 = bool(rec25 and rec25.get('name'))
+    has02 = bool(rec02 and rec02.get('name'))
+
+    if has25 and has02:
+        status = 'MATCHED'            # voter confirmed in both rolls
+    elif nf25 and nf02:
+        status = 'NOT_FOUND_BOTH'
+    elif nf25 or not has25:
+        status = 'NOT_FOUND_2025'
+    elif nf02 or not has02:
+        status = 'NOT_FOUND_2002'
+    else:
+        status = 'PARTIAL'
+
+    doc = {
+        'status':         status,
+        'record_2025':    rec25,
+        'record_2002':    rec02,
+        'not_found_2025': nf25,
+        'not_found_2002': nf02,
+        'search_inputs':  search_inputs,
+        'confirmed_at':   datetime.now(timezone.utc),
+        # Convenience top-level fields for easy querying
+        'name':     (rec25 or rec02 or {}).get('name', '') or search_inputs.get('name', ''),
+        'voterid':  (rec25 or rec02 or {}).get('voterid', '') or search_inputs.get('epic', ''),
+        'house':    (rec25 or rec02 or {}).get('house', '') or search_inputs.get('house', ''),
+    }
+
+    try:
+        survey_db = get_survey_db()
+        if status == 'MATCHED':
+            survey_db['SIR_ConfirmedMatches'].insert_one(doc)
+        else:
+            survey_db['SIR_ConfirmedNotFound'].insert_one(doc)
+        return JsonResponse({'success': True, 'status': status})
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+
+
     r25 = doc.get('voter_record_2025') or {}
     r02 = doc.get('voter_record_2002') or {}
 
