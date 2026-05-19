@@ -3835,34 +3835,6 @@ def api_check_sir(request):
         similar_2025.append(rec)
         if len(similar_2025) >= 300: break
 
-    # ── Mark rows that have already been confirmed ──────────────────────────────
-    # Query SIR_ConfirmedMatches + SIR_ConfirmedNotFound for any voterid that was
-    # already saved, then stamp _already_confirmed on matching suggestion rows.
-    try:
-        _survey_db_check = get_survey_db()
-        _confirmed_voterids = set()
-        for _coll_name in ('SIR_ConfirmedMatches', 'SIR_ConfirmedNotFound'):
-            for _cdoc in _survey_db_check[_coll_name].find(
-                    {}, {'record_2025.voterid': 1, 'record_2002.voterid': 1, 'voterid': 1}):
-                for _fld in ('voterid',):
-                    _v = (_cdoc.get(_fld) or '').strip().upper()
-                    if _v: _confirmed_voterids.add(_v)
-                _r25c = _cdoc.get('record_2025') or {}
-                _r02c = _cdoc.get('record_2002') or {}
-                for _rv in (_r25c.get('voterid',''), _r02c.get('voterid','')):
-                    _rv = (_rv or '').strip().upper()
-                    if _rv: _confirmed_voterids.add(_rv)
-        for _row in similar_2025:
-            _rv = (_row.get('voterid') or '').strip().upper()
-            if _rv and _rv in _confirmed_voterids:
-                _row['_already_confirmed'] = True
-        for _row in suggestions_2002:
-            _rv = (_row.get('voterid') or '').strip().upper()
-            if _rv and _rv in _confirmed_voterids:
-                _row['_already_confirmed'] = True
-    except Exception as _ce:
-        pass  # non-fatal — best effort highlighting only
-
     _response_data = {
         'success':    True,
         'results':    results,
@@ -4146,26 +4118,6 @@ def api_sir_confirm_match(request):
 
     try:
         survey_db = get_db()
-
-        # ── Idempotency guard — prevent double saves ────────────────────────────
-        # Build a filter on the primary voter IDs that were confirmed.
-        _dedup_vids = [v for v in [
-            (rec25 or {}).get('voterid', ''),
-            (rec02 or {}).get('voterid', ''),
-        ] if v and v.strip()]
-        if _dedup_vids:
-            _dedup_filter = {'$or': [{'record_2025.voterid': v} for v in _dedup_vids]
-                              + [{'record_2002.voterid': v} for v in _dedup_vids]
-                              + [{'voterid': v} for v in _dedup_vids]}
-            _already = (
-                survey_db['SIR_ConfirmedMatches'].find_one(_dedup_filter) or
-                survey_db['SIR_ConfirmedNotFound'].find_one(_dedup_filter)
-            )
-            if _already:
-                return JsonResponse({'success': True, 'status': status,
-                                     'already_saved': True,
-                                     'message': 'Record already confirmed — duplicate save prevented.'})
-
         if status == 'MATCHED':
             survey_db['SIR_ConfirmedMatches'].insert_one(doc)
         else:
