@@ -8198,7 +8198,7 @@ def api_ai_data_files(request):
     }))
     
     
-_PLACE_ALLOWED_TYPES = {'club', 'temple', 'church', 'mosque', 'gov_school', 'private_school', 'muslim_school', 'missionary_school', 'old_age_school'}
+_PLACE_ALLOWED_TYPES = {'club', 'temple', 'church', 'mosque'}
 
 
 def _places_cors(request, response):
@@ -8381,7 +8381,7 @@ def api_local_places_summary(request):
         for d in docs:
             d['_id'] = str(d['_id'])
 
-        type_counts = {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0, 'gov_school': 0, 'private_school': 0, 'muslim_school': 0, 'missionary_school': 0, 'old_age_school': 0}
+        type_counts = {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0}
         for d in docs:
             t = d.get('type', '')
             if t in type_counts:
@@ -8394,7 +8394,7 @@ def api_local_places_summary(request):
             if ward not in ward_map:
                 ward_map[ward] = {
                     'ward': ward, 'wardName': wname, 'places': [],
-                    'counts': {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0, 'gov_school': 0, 'private_school': 0, 'muslim_school': 0, 'missionary_school': 0, 'old_age_school': 0},
+                    'counts': {'club': 0, 'temple': 0, 'church': 0, 'mosque': 0},
                 }
             ward_map[ward]['places'].append(d)
             t = d.get('type', '')
