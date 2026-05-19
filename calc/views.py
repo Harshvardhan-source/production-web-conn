@@ -4117,7 +4117,7 @@ def api_sir_confirm_match(request):
     }
 
     try:
-        survey_db = get_survey_db()
+        survey_db = get_db()
         if status == 'MATCHED':
             survey_db['SIR_ConfirmedMatches'].insert_one(doc)
         else:
