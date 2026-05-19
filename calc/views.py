@@ -4001,6 +4001,79 @@ def api_sir_stats(request):
 
 
 @require_http_methods(['GET'])
+def _sir_to_frontend(doc, category):
+    """
+    Normalise a raw SIR MongoDB document into the shape RecordCard expects.
+
+    Stored fields vary by category (see _save_sir_record):
+      NEW_ADDITION : name, voterid, house, age_2025, gender, relation
+      DELETION     : name, voterid, house, age_2002, gender, relation
+      MODIFICATION : name_2002, name_2025, voterid, house_2002, house_2025,
+                     age_2002, age_2025, changes
+      RETAINED     : name, voterid, house, age_2002, age_2025, gender
+      NOT_FOUND    : name, voterid, house
+      SUSPICIOUS   : name, voterid, flags (list of strings)
+    All share: surveyed_at, ward, booth, survey_name, survey_house,
+               survey_voterid, category, note
+    """
+    cat = (doc.get('category') or category or '').upper()
+
+    # ── Timestamp ──────────────────────────────────────────────────────────────
+    ts = doc.get('surveyed_at')
+    try:
+        ts_str = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
+    except Exception:
+        ts_str = None
+
+    # ── Primary identifiers ───────────────────────────────────────────────────
+    name     = (doc.get('name')
+                or doc.get('name_2025')
+                or doc.get('name_2002')
+                or doc.get('survey_name', ''))
+    voterid  = doc.get('voterid') or doc.get('survey_voterid', '')
+    house_no = (doc.get('house')
+                or doc.get('house_2025')
+                or doc.get('house_2002')
+                or doc.get('survey_house', ''))
+
+    ward_number = str(doc.get('ward') or doc.get('ward_number') or '')
+    booth_no    = str(doc.get('booth') or doc.get('booth_no') or '')
+
+    # ── Per-roll presence ─────────────────────────────────────────────────────
+    found_2025 = cat in ('NEW_ADDITION', 'NEW', 'MODIFICATION', 'RETAINED')
+    found_2002 = cat in ('DELETION', 'MODIFICATION', 'RETAINED')
+
+    # ── Flags / anomalies ─────────────────────────────────────────────────────
+    flags = list(doc.get('flags') or [])
+    if not flags and cat == 'SUSPICIOUS' and doc.get('note'):
+        flags = [doc['note']]
+
+    return {
+        'category':    cat,
+        'name':        name,
+        'voterid':     voterid,
+        'house_no':    house_no,
+        'ward_number': ward_number,
+        'booth_no':    booth_no,
+        'details':     doc.get('note', ''),
+        'Time_stamp':  ts_str,
+        # Per-roll
+        'found_2025':  found_2025,
+        'found_2002':  found_2002,
+        'name_2025':   doc.get('name_2025') or (name if found_2025 else ''),
+        'name_2002':   doc.get('name_2002') or (name if found_2002 else ''),
+        'age_2025':    doc.get('age_2025') or doc.get('age', ''),
+        'age_2002':    doc.get('age_2002', ''),
+        'house_2025':  doc.get('house_2025') or doc.get('house', ''),
+        'house_2002':  doc.get('house_2002') or doc.get('house', ''),
+        # Extras
+        'changes':     doc.get('changes', []),
+        'flags':       flags,
+        'gender':      doc.get('gender', ''),
+        'relation':    doc.get('relation', ''),
+    }
+
+
 def api_sir_data(request):
     db        = get_db()
     survey_db = get_survey_db()   # SIR_* collections live here
