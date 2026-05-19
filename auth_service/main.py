@@ -12,6 +12,19 @@ Security changes vs previous version
   SEC-4  Token no longer returned in JSON body (httponly cookie only)
   SEC-5  Plaintext password fallback removed; unknown hash = hard 401
 
+Fixes applied in this revision
+───────────────────────────────
+  FIX-1  /auth/me now revokes the old jti before issuing a fresh token
+          (previously old tokens stayed valid for their full lifetime)
+  FIX-2  /auth/register no longer issues a cookie for pending accounts
+          (previously a valid JWT was given before admin approval)
+  FIX-3  _revoke_token logs non-duplicate DB errors instead of silently
+          swallowing them (logout failures were invisible before)
+  FIX-4  Startup/shutdown migrated to FastAPI lifespan context manager
+          (on_event is deprecated and generates warnings on newer FastAPI)
+  FIX-5  TOKEN_EXP_M raised to 480 min (8 h) to prevent idle-tab logouts;
+          still configurable via TOKEN_EXP_MINUTES env-var
+
 Run:  uvicorn auth_service.main:app --port 8001 --reload
 
 Extra dependency (add to requirements.txt):
@@ -24,6 +37,7 @@ import logging
 import os
 import re
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -31,11 +45,12 @@ import bcrypt as _bcrypt
 import certifi
 import jwt
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends, Response, Request, status
+from fastapi import FastAPI, HTTPException, Depends, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr, field_validator
 from pymongo import MongoClient, ASCENDING
+from pymongo.errors import DuplicateKeyError
+from pydantic import BaseModel, EmailStr, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -51,7 +66,8 @@ MONGO_URI   = os.getenv("MONGODB_URL")
 DB_NAME     = "SurveyDataBase"
 JWT_SECRET  = os.getenv("JWT_SECRET")
 JWT_ALG     = "HS256"
-TOKEN_EXP_M = 60           # access-token lifetime in minutes (was 24 h)
+# FIX-5: raised default to 8 h; override with TOKEN_EXP_MINUTES env-var
+TOKEN_EXP_M = int(os.getenv("TOKEN_EXP_MINUTES", "480"))
 BLOCKLIST_C = "TokenBlocklist"   # collection name for revoked JTIs
 
 bearer = HTTPBearer(auto_error=False)
@@ -81,42 +97,9 @@ def get_db():
     return _mongo_db
 
 
-# ─── App ──────────────────────────────────────────────────────────────────────
+# ─── FIX-4: Lifespan replaces deprecated @app.on_event ───────────────────────
 
-app = FastAPI(title="Constituency Connect — Auth Service", version="2.0.0")
-
-# Wire rate-limiter into FastAPI
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-# ─── CORS ─────────────────────────────────────────────────────────────────────
-
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
-if not ALLOWED_ORIGINS:
-    ALLOWED_ORIGINS = [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-        "https://production-web-conn-bzpt.onrender.com",
-        "https://frontend-production-web-e44x.onrender.com",
-    ]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
-
-
-# ─── Startup / Shutdown ───────────────────────────────────────────────────────
-
-@app.on_event("startup")
-def startup():
+def _startup() -> None:
     global _mongo_client, _mongo_db
 
     # SEC-3 ── Hard failure when JWT_SECRET is absent or still the default ─────
@@ -156,7 +139,7 @@ def startup():
         )
         _mongo_db[BLOCKLIST_C].create_index("jti", unique=True, background=True)
 
-        logger.info("[Auth] ✓ MongoDB connected  →  %s", DB_NAME)
+        logger.info("[Auth] ✓ MongoDB connected  →  %s  (token TTL: %d min)", DB_NAME, TOKEN_EXP_M)
 
     except Exception as exc:
         logger.error("[Auth] MongoDB connection FAILED: %s", exc)
@@ -164,10 +147,53 @@ def startup():
         # _mongo_db stays None — get_db() returns HTTP 503 on every request
 
 
-@app.on_event("shutdown")
-def shutdown():
+def _shutdown() -> None:
     if _mongo_client:
         _mongo_client.close()
+        logger.info("[Auth] MongoDB connection closed.")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _startup()
+    yield
+    _shutdown()
+
+
+# ─── App ──────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="Constituency Connect — Auth Service",
+    version="2.1.0",
+    lifespan=lifespan,          # FIX-4: modern lifespan handler
+)
+
+# Wire rate-limiter into FastAPI
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ─── CORS ─────────────────────────────────────────────────────────────────────
+
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if not ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "https://production-web-conn-bzpt.onrender.com",
+        "https://frontend-production-web-e44x.onrender.com",
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 
 
 # ─── JWT helpers ──────────────────────────────────────────────────────────────
@@ -209,24 +235,33 @@ def _revoke_token(payload: dict) -> None:
     """
     Add the token's jti to the blocklist.
     Store the expiry datetime so the TTL index can clean it up automatically.
+
+    FIX-3: Non-duplicate errors are now logged rather than silently swallowed,
+    so a failed revocation (DB timeout, write error) is visible in the logs.
     """
     db  = get_db()
     jti = payload.get("jti")
     exp = payload.get("exp")
     if not jti:
         return
-    # exp comes back from PyJWT as a datetime when decode_token is used
+    # exp comes back from PyJWT as an int (unix ts) or datetime depending on version
     exp_dt = exp if isinstance(exp, datetime) else datetime.fromtimestamp(exp, tz=timezone.utc)
     try:
         db[BLOCKLIST_C].insert_one({"jti": jti, "exp": exp_dt})
-    except Exception:
-        pass  # duplicate insert on double-click logout — ignore silently
+    except DuplicateKeyError:
+        pass   # double-click logout — harmless, ignore silently
+    except Exception as exc:
+        # FIX-3: any other error means the token was NOT actually revoked — log it
+        logger.error("[Auth] _revoke_token FAILED for jti=%s: %s", jti, exc)
 
+
+# ─── Request → token extraction ───────────────────────────────────────────────
 
 def _token_from_request(
     request:     Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
 ) -> str:
+    # Prefer httponly cookie; fall back to Authorization header for API clients
     token = request.cookies.get("cc_token")
     if not token and credentials:
         token = credentials.credentials
@@ -307,15 +342,30 @@ class LoginBody(BaseModel):
     password: str
 
 
+# ─── Cookie helper ────────────────────────────────────────────────────────────
+
+def _set_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key="cc_token",
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        max_age=TOKEN_EXP_M * 60,
+        path="/",
+    )
+
+
 # ─── Health check ─────────────────────────────────────────────────────────────
 
 @app.get("/auth/health")
 def health():
     """Quick check — confirms FastAPI is running and shows DB status."""
     return {
-        "status":  "ok",
-        "db":      "connected" if _mongo_db is not None else "disconnected",
-        "db_name": DB_NAME,
+        "status":        "ok",
+        "db":            "connected" if _mongo_db is not None else "disconnected",
+        "db_name":       DB_NAME,
+        "token_ttl_min": TOKEN_EXP_M,
     }
 
 
@@ -323,7 +373,15 @@ def health():
 
 @app.post("/auth/register", status_code=201)
 @limiter.limit("5/minute")          # SEC-1: max 5 registrations per IP per minute
-def register(request: Request, body: RegisterBody, response: Response):
+def register(request: Request, body: RegisterBody):
+    """
+    Create a new account.
+
+    FIX-2: No cookie is issued at registration time.  The account starts as
+    'pending' and requires admin approval before the user can log in.
+    Issuing a JWT to a pending account would let them call protected endpoints
+    before approval — that hole is now closed.
+    """
     db = get_db()
 
     if db["UserReg"].find_one({"Email": body.email}, {"_id": 1}):
@@ -342,10 +400,7 @@ def register(request: Request, body: RegisterBody, response: Response):
         "booth":      body.booth,
     })
 
-    token = create_token(body.username, body.email)
-    _set_cookie(response, token)
-
-    # SEC-4 ── Token NOT returned in body — httponly cookie is the only channel
+    # FIX-2: No token / cookie set — user must wait for approval, then log in.
     return {
         "success":  True,
         "username": body.username,
@@ -418,6 +473,7 @@ def verify_admin(request: Request, body: LoginBody):
     db   = get_db()
     user = db["UserReg"].find_one({"Email": body.email})
 
+    # Intentionally same message for missing user (user enumeration prevention)
     if not user:
         raise HTTPException(status_code=401, detail="Incorrect password.")
 
@@ -431,12 +487,30 @@ def verify_admin(request: Request, body: LoginBody):
 
 
 @app.get("/auth/me")
-def me(response: Response, user: dict = Depends(get_current_user)):
+def me(
+    response: Response,
+    token:    str  = Depends(_token_from_request),
+    user:     dict = Depends(get_current_user),
+):
+    """
+    Return the current user's profile and silently rotate the session token.
+
+    FIX-1: The old jti is now revoked before the fresh token is issued.
+    Previously the old token stayed valid for its full remaining lifetime,
+    meaning a stolen token could be used even after the browser had moved on
+    to a newer one.  Now each /auth/me call invalidates the previous token,
+    giving true rolling-window single-session semantics.
+    """
     db      = get_db()
     profile = db["UserReg"].find_one({"Email": user["sub"]}) or {}
 
-    # Rotate the token so the old jti is still valid (no revocation needed here).
-    # If you want strict single-session semantics, revoke the old jti here too.
+    # FIX-1: Revoke the current token before issuing a replacement ────────────
+    try:
+        old_payload = decode_token(token)
+        _revoke_token(old_payload)
+    except HTTPException:
+        pass   # token already expired — still issue a fresh one below
+
     fresh_token = create_token(user["username"], user["sub"])
     _set_cookie(response, fresh_token)
 
@@ -450,17 +524,4 @@ def me(response: Response, user: dict = Depends(get_current_user)):
         "booth":    profile.get("booth",  ""),
         "status":   profile.get("status", "pending"),
     }
-
-
-# ─── Cookie helper ────────────────────────────────────────────────────────────
-
-def _set_cookie(response: Response, token: str) -> None:
-    response.set_cookie(
-        key="cc_token",
-        value=token,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        max_age=TOKEN_EXP_M * 60,
-        path="/",
-    )
+    
