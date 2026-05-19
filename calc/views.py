@@ -198,65 +198,104 @@ _COL_MAP_2002 = {
 
 # ─── MongoDB connection pool (module-level singletons) ───────────────────────
 #
-# MongoClient is thread-safe and manages its own connection pool internally.
-# Creating it ONCE at import time means every request reuses warm TLS connections
-# instead of doing a fresh 300-800ms Atlas handshake on each call.
+# IMPORTANT — READ BEFORE TOUCHING THIS BLOCK
+# ─────────────────────────────────────────────
+# MongoClient MUST be created at import time (module level), NOT inside a view
+# or a lazy getter that runs inside a Gunicorn request handler.
+#
+# Why: MongoClient with a mongodb+srv:// URI triggers SRV DNS resolution, which
+# imports dnspython (dns.asyncquery).  On Python 3.14 + Gunicorn sync workers,
+# dnspython ≥ 2.3 imports asyncio internals at module level.  If this import
+# happens mid-request, Gunicorn's SIGALRM worker-timeout handler fires inside
+# the import machinery and kills the worker with SIGKILL — producing the
+# "WORKER TIMEOUT / Error handling request" crash seen in logs.
+#
+# Solution: create all three clients here, at Django import time (before any
+# Gunicorn worker timeout is armed).  MongoClient is fully thread-safe and
+# connection-pooled; one instance per process is correct and optimal.
+#
+# Also add to requirements.txt:  dnspython==2.2.1
+# (last version without the asyncio-at-import-time behaviour)
 #
 # Cluster layout:
-#   MONGODB_URL        — original cluster  → SurveyDataBase (voter rolls, SIR, 2002/2025)
-#                                           → MainB          (CollDB, scheme data)
-#   MONGODB_SURVEY_URL — NEW cluster       → SurveyDataBase  (SurveyRecords, FutureVoters, Deceased)
+#   MONGODB_URL  — original cluster → SurveyDataBase (voter rolls, SIR, 2002/2025)
+#                                   → MainB          (CollDB, scheme data)
+#   _SURVEY_URL  — survey cluster   → SurveyDataBase (SurveyRecords, FutureVoters, Deceased)
 
-_SURVEY_URL = 'mongodb+srv://vickyhooda799_db_user:LgAvVKcZE7gM0ess@cluster0.kkin5ww.mongodb.net/'
+_SURVEY_URL = _os.getenv(
+    'MONGODB_SURVEY_URL',
+    'mongodb+srv://vickyhooda799_db_user:LgAvVKcZE7gM0ess@cluster0.kkin5ww.mongodb.net/'
+)
 
-# Lazy-initialised singletons — created on first use, reused forever after
-_client_main   = None
-_client_survey = None
-_client_main1  = None
+_MONGO_OPTS = dict(
+    tls=True,
+    tlsCAFile=certifi.where(),
+    serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=5000,
+    socketTimeoutMS=30000,   # prevent hung queries from blocking the worker
+)
 
-def _get_main_client():
-    global _client_main
-    if _client_main is None:
-        _client_main = MongoClient(
-            settings.MONGODB_URL, tls=True, tlsCAFile=certifi.where(),
-            maxPoolSize=10, minPoolSize=2,
-            serverSelectionTimeoutMS=5000, connectTimeoutMS=5000,
-        )
-    return _client_main
+# ── Eagerly create all clients at import time — never inside a request ────────
+try:
+    _client_main = MongoClient(
+        settings.MONGODB_URL,
+        maxPoolSize=10, minPoolSize=2,
+        **_MONGO_OPTS,
+    )
+except Exception as _e:
+    import logging as _logging
+    _logging.getLogger('views').error('[DB] _client_main failed to initialise: %s', _e)
+    _client_main = None
 
-def _get_survey_client():
-    global _client_survey
-    if _client_survey is None:
-        _client_survey = MongoClient(
-            _SURVEY_URL, tls=True, tlsCAFile=certifi.where(),
-            maxPoolSize=10, minPoolSize=2,
-            serverSelectionTimeoutMS=5000, connectTimeoutMS=5000,
-        )
-    return _client_survey
+try:
+    _client_survey = MongoClient(
+        _SURVEY_URL,
+        maxPoolSize=10, minPoolSize=2,
+        **_MONGO_OPTS,
+    )
+except Exception as _e:
+    import logging as _logging
+    _logging.getLogger('views').error('[DB] _client_survey failed to initialise: %s', _e)
+    _client_survey = None
 
-def _get_main1_client():
-    global _client_main1
-    if _client_main1 is None:
-        _client_main1 = MongoClient(
-            settings.MONGODB_URL, tls=True, tlsCAFile=certifi.where(),
-            maxPoolSize=5, minPoolSize=1,
-            serverSelectionTimeoutMS=5000, connectTimeoutMS=5000,
-        )
-    return _client_main1
+try:
+    _client_main1 = MongoClient(
+        settings.MONGODB_URL,
+        maxPoolSize=5, minPoolSize=1,
+        **_MONGO_OPTS,
+    )
+except Exception as _e:
+    import logging as _logging
+    _logging.getLogger('views').error('[DB] _client_main1 failed to initialise: %s', _e)
+    _client_main1 = None
+
 
 def get_db():
     """Original cluster — voter rolls, SIR, 2002/2025, WardReference (pooled)."""
-    return _get_main_client().get_database('SurveyDataBase')
+    if _client_main is None:
+        raise RuntimeError('Main MongoDB client not initialised. Check MONGODB_URL and server logs.')
+    return _client_main.get_database('SurveyDataBase')
 
 def get_survey_db():
-    """New cluster — SurveyRecords, FutureVoters, Deceased (pooled)."""
-    return _get_survey_client().get_database('SurveyDataBase')
+    """Survey cluster — SurveyRecords, FutureVoters, Deceased (pooled)."""
+    if _client_survey is None:
+        raise RuntimeError('Survey MongoDB client not initialised. Check MONGODB_SURVEY_URL and server logs.')
+    return _client_survey.get_database('SurveyDataBase')
 
 def get_db1():
     """Original cluster — MainB / CollDB (pooled)."""
-    return _get_main1_client().get_database('MainB')
+    if _client_main1 is None:
+        raise RuntimeError('MainB MongoDB client not initialised. Check MONGODB_URL and server logs.')
+    return _client_main1.get_database('MainB')
 
-JWT_SECRET = 'c0bcbb0e7afbdef8e53f9db603fb9140b1c793cd1e3e6379e3648281474e83f470b201b882b1864b09a0d3a9bb3716829563218e2813c4f89d35053a0141cd29'
+
+# ── JWT — load secret from env; fall back to hardcoded value for local dev ────
+# WARNING: set JWT_SECRET in your Render/production env-vars.
+# The hardcoded value below is kept only so local dev without a .env still works.
+JWT_SECRET = _os.getenv(
+    'JWT_SECRET',
+    'c0bcbb0e7afbdef8e53f9db603fb9140b1c793cd1e3e6379e3648281474e83f470b201b882b1864b09a0d3a9bb3716829563218e2813c4f89d35053a0141cd29',
+)
 JWT_ALG    = 'HS256'
 
 
@@ -1056,8 +1095,8 @@ def api_booth_dashboard(request):
 
     try:
         # WardBoothWise_2026 is in SurveyDataBase on the ORIGINAL cluster
-        main_db   = get_db()           # _get_main_client() → SurveyDataBase
-        survey_db = get_survey_db()    # _get_survey_client() → SurveyDataBase
+        main_db   = get_db()           # original cluster → SurveyDataBase
+        survey_db = get_survey_db()    # survey cluster   → SurveyDataBase
         ward_int  = int(ward)  if ward.isdigit()  else None
         booth_int = int(booth) if booth.isdigit() else None
 
@@ -4761,7 +4800,7 @@ ML_CHUNK_SIZE       = 500   # must match predict_query_stack.py
 
 def _get_ml_db():
     """Return SurveyDataBase from the survey cluster (same cluster as NewQueryStack1)."""
-    return _get_survey_client()["SurveyDataBase"]
+    return get_survey_db()
 
 
 def _reassemble_chunks(col, filter_q: dict) -> list:
