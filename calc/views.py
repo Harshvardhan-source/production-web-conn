@@ -4001,160 +4001,60 @@ def api_sir_stats(request):
 
 
 @require_http_methods(['GET'])
-def _sir_to_frontend(doc, category):
-    """
-    Normalise a raw SIR MongoDB document into the shape RecordCard expects.
+def api_sir_data(request):
+    db        = get_db()
+    survey_db = get_survey_db()   # SIR_* collections live here
+    category = request.GET.get('category', 'ALL').upper()
+    page     = max(1, int(request.GET.get('page', 1)))
+    limit    = 50
+    skip     = (page - 1) * limit
+    # Optional filters
+    ward_filter  = request.GET.get('ward',  '').strip()
+    booth_filter = request.GET.get('booth', '').strip()
 
-    Stored fields vary by category (see _save_sir_record):
-      NEW_ADDITION : name, voterid, house, age_2025, gender, relation
-      DELETION     : name, voterid, house, age_2002, gender, relation
-      MODIFICATION : name_2002, name_2025, voterid, house_2002, house_2025,
-                     age_2002, age_2025, changes
-      RETAINED     : name, voterid, house, age_2002, age_2025, gender
-      NOT_FOUND    : name, voterid, house
-      SUSPICIOUS   : name, voterid, flags (list of strings)
-    All share: surveyed_at, ward, booth, survey_name, survey_house,
-               survey_voterid, category, note
-    """
-    cat = (doc.get('category') or category or '').upper()
-
-    # ── Timestamp ──────────────────────────────────────────────────────────────
-    ts = doc.get('surveyed_at')
-    try:
-        ts_str = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
-    except Exception:
-        ts_str = None
-
-    # ── Primary identifiers ───────────────────────────────────────────────────
-    name     = (doc.get('name')
-                or doc.get('name_2025')
-                or doc.get('name_2002')
-                or doc.get('survey_name', ''))
-    voterid  = doc.get('voterid') or doc.get('survey_voterid', '')
-    house_no = (doc.get('house')
-                or doc.get('house_2025')
-                or doc.get('house_2002')
-                or doc.get('survey_house', ''))
-
-    ward_number = str(doc.get('ward') or doc.get('ward_number') or '')
-    booth_no    = str(doc.get('booth') or doc.get('booth_no') or '')
-
-    # ── Per-roll presence ─────────────────────────────────────────────────────
-    found_2025 = cat in ('NEW_ADDITION', 'NEW', 'MODIFICATION', 'RETAINED')
-    found_2002 = cat in ('DELETION', 'MODIFICATION', 'RETAINED')
-
-    # ── Flags / anomalies ─────────────────────────────────────────────────────
-    flags = list(doc.get('flags') or [])
-    if not flags and cat == 'SUSPICIOUS' and doc.get('note'):
-        flags = [doc['note']]
-
-    return {
-        'category':    cat,
-        'name':        name,
-        'voterid':     voterid,
-        'house_no':    house_no,
-        'ward_number': ward_number,
-        'booth_no':    booth_no,
-        'details':     doc.get('note', ''),
-        'Time_stamp':  ts_str,
-        # Per-roll
-        'found_2025':  found_2025,
-        'found_2002':  found_2002,
-        'name_2025':   doc.get('name_2025') or (name if found_2025 else ''),
-        'name_2002':   doc.get('name_2002') or (name if found_2002 else ''),
-        'age_2025':    doc.get('age_2025') or doc.get('age', ''),
-        'age_2002':    doc.get('age_2002', ''),
-        'house_2025':  doc.get('house_2025') or doc.get('house', ''),
-        'house_2002':  doc.get('house_2002') or doc.get('house', ''),
-        # Extras
-        'changes':     doc.get('changes', []),
-        'flags':       flags,
-        'gender':      doc.get('gender', ''),
-        'relation':    doc.get('relation', ''),
+    col_map = {
+        'NEW':        'SIR_NewAdditions',
+        'DELETED':    'SIR_Deleted',
+        'MODIFIED':   'SIR_Modified',
+        'SUSPICIOUS': 'SIR_Suspicious',
+        'RETAINED':   'SIR_Retained',
+        'NOT_FOUND':  'SIR_NotFound',
     }
 
+    # Build optional mongo filter for ward/booth
+    base_filter = {}
+    if ward_filter:
+        base_filter['$or'] = [{'ward': ward_filter}, {'ward_number': ward_filter}]
+    if booth_filter:
+        bf = {'$or': [{'booth': booth_filter}, {'booth_no': booth_filter}]}
+        base_filter = {'$and': [base_filter, bf]} if base_filter else bf
 
-def api_sir_data(request):
-    """
-    Return SIR records and per-category summary counts.
+    summary = {
+        'NEW':        survey_db['SIR_NewAdditions'].count_documents(base_filter),
+        'DELETED':    survey_db['SIR_Deleted'].count_documents(base_filter),
+        'MODIFIED':   survey_db['SIR_Modified'].count_documents(base_filter),
+        'SUSPICIOUS': survey_db['SIR_Suspicious'].count_documents(base_filter),
+        'RETAINED':   survey_db['SIR_Retained'].count_documents(base_filter),
+        'NOT_FOUND':  survey_db['SIR_NotFound'].count_documents(base_filter),
+    }
+    summary['TOTAL'] = sum(summary.values())
 
-    Speed notes
-    -----------
-    • When no ward/booth filter is active we use estimated_document_count()
-      (reads collection metadata, no collection scan → ~50× faster than
-      count_documents).
-    • The ALL view fetches at most 20 docs per collection (120 total) and
-      sorts in Python — avoids a slow cross-collection aggregation.
-    • Every error is caught and returned as JSON so the frontend never sees
-      a raw 500 traceback.
-    """
-    try:
-        survey_db = get_survey_db()
-        category  = request.GET.get('category', 'ALL').upper()
-        page      = max(1, int(request.GET.get('page', 1)))
-        limit     = 50
-        skip      = (page - 1) * limit
-
-        ward_filter  = request.GET.get('ward',  '').strip()
-        booth_filter = request.GET.get('booth', '').strip()
-
-        col_map = {
-            'NEW':        'SIR_NewAdditions',
-            'DELETED':    'SIR_Deleted',
-            'MODIFIED':   'SIR_Modified',
-            'SUSPICIOUS': 'SIR_Suspicious',
-            'RETAINED':   'SIR_Retained',
-            'NOT_FOUND':  'SIR_NotFound',
-        }
-
-        # ── Build filter ──────────────────────────────────────────────────────
-        base_filter = {}
-        if ward_filter:
-            base_filter['$or'] = [{'ward': ward_filter}, {'ward_number': ward_filter}]
-        if booth_filter:
-            bf = {'$or': [{'booth': booth_filter}, {'booth_no': booth_filter}]}
-            base_filter = {'$and': [base_filter, bf]} if base_filter else bf
-
-        filtered = bool(base_filter)   # True when ward/booth filter is active
-
-        # ── Summary counts ────────────────────────────────────────────────────
-        # Use estimated_document_count() (fast metadata read) when no filter is
-        # applied; fall back to count_documents() only when a filter is present.
-        def _count(col_name):
-            col = survey_db[col_name]
-            if filtered:
-                return col.count_documents(base_filter)
-            try:
-                return col.estimated_document_count()
-            except Exception:
-                return col.count_documents({})
-
-        summary = {k: _count(v) for k, v in col_map.items()}
-        summary['TOTAL'] = sum(summary.values())
-
-        # ── Records ───────────────────────────────────────────────────────────
-        if category in col_map:
-            col     = survey_db[col_map[category]]
-            total   = summary[category]
-            raw     = col.find(base_filter).sort('surveyed_at', -1).skip(skip).limit(limit)
-            records = [_sir_to_frontend(bson_clean(d), category) for d in raw]
-        else:
-            # ALL — fetch latest 20 from each collection, merge, sort, slice
-            all_records = []
-            for cat, cname in col_map.items():
-                for d in survey_db[cname].find(base_filter).sort('surveyed_at', -1).limit(20):
-                    all_records.append(_sir_to_frontend(bson_clean(d), cat))
-            all_records.sort(key=lambda r: r.get('Time_stamp') or '', reverse=True)
-            records = all_records[:limit]
-            total   = summary['TOTAL']
-
+    if category in col_map:
+        col   = survey_db[col_map[category]]
+        total = col.count_documents({})
+        raw   = col.find(base_filter).sort('surveyed_at', -1).skip(skip).limit(limit)
+        records = [_sir_to_frontend(bson_clean(d), category) for d in raw]
         return JsonResponse({'success': True, 'summary': summary,
                              'records': records, 'total': total})
 
-    except Exception as exc:
-        traceback.print_exc()
-        return JsonResponse({'success': False, 'message': str(exc),
-                             'records': [], 'summary': {}, 'total': 0}, status=500)
+    all_records = []
+    for cat, cname in col_map.items():
+        for d in survey_db[cname].find(base_filter).sort('surveyed_at', -1).limit(20):
+            all_records.append(_sir_to_frontend(bson_clean(d), cat))
+    all_records.sort(key=lambda r: r.get('Time_stamp', ''), reverse=True)
+    total = sum(summary[k] for k in col_map)
+    return JsonResponse({'success': True, 'summary': summary,
+                         'records': all_records[:limit], 'total': total})
 
 
 # ─── SIR Confirm Match ────────────────────────────────────────────────────────
