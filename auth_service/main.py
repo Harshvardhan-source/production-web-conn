@@ -433,9 +433,16 @@ def login(request: Request, body: LoginBody, response: Response):
     token = create_token(user["Username"], body.email)
     _set_cookie(response, token)
 
-    # SEC-4 ── Token NOT returned in body
+    # Cross-domain architecture note:
+    # FastAPI runs on a different subdomain than Django (Render free tier).
+    # The httponly cookie is sent back to the browser for same-origin /auth/* calls,
+    # but the browser will NOT forward it to Django's different subdomain.
+    # Django reads the token from the Authorization header (set by client.js from
+    # sessionStorage).  We therefore also return the token in the response body
+    # so the React app can store it in sessionStorage for cross-domain API calls.
     return {
         "success":  True,
+        "token":    token,          # ← stored in sessionStorage by client.js for Django calls
         "username": user["Username"],
         "email":    body.email,
         "role":     user.get("role",  ""),
@@ -514,9 +521,13 @@ def me(
     fresh_token = create_token(user["username"], user["sub"])
     _set_cookie(response, fresh_token)
 
-    # SEC-4 ── Token NOT returned in body
+    # Return token in body — Django lives on a different subdomain on Render,
+    # so the httponly cookie is never forwarded there.  The React app stores
+    # this token in sessionStorage and sends it as Authorization: Bearer for
+    # all Django API calls (see client.js interceptors).
     return {
         "success":  True,
+        "token":    fresh_token,    # ← client.js refreshes sessionStorage with this
         "username": user["username"],
         "email":    user["sub"],
         "role":     profile.get("role",   ""),
@@ -524,4 +535,3 @@ def me(
         "booth":    profile.get("booth",  ""),
         "status":   profile.get("status", "pending"),
     }
-    
