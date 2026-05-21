@@ -1379,29 +1379,31 @@ def api_community_records(request):
         collection = db['2025_caste_comm_hmc']
 
         # ── Resolve the Community filter ───────────────────────────────────────
-        # Step 1: try exact match
-        community_filter = {'Community': community}
+        # community param may be a single name OR comma-joined group e.g.
+        # "Mangalorean Catholic,Christian,Possibly Christian"
+        community_names = [c.strip() for c in community.split(',') if c.strip()]
 
-        if collection.count_documents(community_filter, limit=1) == 0:
-            # Step 2: fall back to case-insensitive regex with flexible whitespace.
-            # This handles: trailing/leading spaces, double spaces, case differences,
-            # and minor transliteration variants (e.g. "Mangalorean" vs "Manglorean").
-            escaped  = re.escape(community.strip())           # escape regex special chars
-            flexible = re.sub(r'\\ ', r'\\s+', escaped)      # allow any whitespace between words
-            community_filter = {
-                'Community': {'$regex': f'^\\s*{flexible}\\s*$', '$options': 'i'}
-            }
+        def _make_filter_for_name(name):
+            """Exact match first; falls back to flexible regex."""
+            exact = {'Community': name}
+            if collection.count_documents(exact, limit=1) > 0:
+                return exact
+            escaped  = re.escape(name)
+            flexible = re.sub(r'\\ ', r'\\s+', escaped)
+            regex_f  = {'Community': {'$regex': f'^\\s*{flexible}\\s*$', '$options': 'i'}}
+            if collection.count_documents(regex_f, limit=1) > 0:
+                return regex_f
+            # Broadest: all words present (order-independent)
+            words = name.split()
+            if len(words) > 1:
+                return {'$and': [{'Community': {'$regex': re.escape(w), '$options': 'i'}} for w in words]}
+            return regex_f  # return regex even if 0 — better than wrong filter
 
-            # Step 3: if still nothing, try a broader contains-style match
-            if collection.count_documents(community_filter, limit=1) == 0:
-                # Split into words and require all words present (order-independent)
-                words = community.strip().split()
-                if len(words) > 1:
-                    word_patterns = [
-                        {'Community': {'$regex': re.escape(w), '$options': 'i'}}
-                        for w in words
-                    ]
-                    community_filter = {'$and': word_patterns}
+        if len(community_names) == 1:
+            community_filter = _make_filter_for_name(community_names[0])
+        else:
+            # OR across all named communities
+            community_filter = {'$or': [_make_filter_for_name(n) for n in community_names]}
 
         # ── Build full filter (community + optional text search) ──────────────
         if q:
