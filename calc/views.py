@@ -1338,7 +1338,7 @@ def api_large_families(request):
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
  
 
-# ─── COMMUNITY RECORDS (2025_caste_comm_hmc) ──────────────────────────────────
+# ─── COMMUNITY RECORDS (2025_cst_com_hmc) ───────────────────────────────────────
 
 @require_http_methods(['GET'])
 def api_community_records(request):
@@ -1350,7 +1350,7 @@ def api_community_records(request):
       limit      — records per page (default 25, max 100)
       q          — free-text search across Name, Epic No, Booth No (optional)
 
-    Reads from the '2025_caste_comm_hmc' collection in SurveyDataBase (MONGODB_URL cluster).
+    Reads from the '2025_cst_com_hmc' collection in SurveyDataBase (MONGODB_URL cluster).
     Returns paginated voter records for the selected community.
 
     Matching strategy (in order):
@@ -1376,7 +1376,7 @@ def api_community_records(request):
 
     try:
         db         = get_db()
-        collection = db['2025_caste_comm_hmc']
+        collection = db['2025_cst_com_hmc']
 
         # ── Resolve the Community filter ───────────────────────────────────────
         # community param may be a single name OR comma-joined group e.g.
@@ -1472,7 +1472,7 @@ def api_debug_community_values(request):
         return JsonResponse({'error': 'q param required'}, status=400)
     try:
         db     = get_db()
-        coll   = db['2025_caste_comm_hmc']
+        coll   = db['2025_cst_com_hmc']
         values = coll.distinct('Community', {
             'Community': {'$regex': re.escape(q), '$options': 'i'}
         })
@@ -8897,3 +8897,202 @@ def api_beneficiary_list(request):
 
     except Exception as e:
         return _ai_cors(request, JsonResponse({'success': False, 'error': str(e)}, status=500))
+
+# ─── HMC RECORDS (2025_new) ────────────────────────────────────────────────────
+@require_http_methods(['GET'])
+def api_hmc_records(request):
+    """
+    GET /api/hmc-records/
+    Query params:
+      religion  — H | M | C (required)
+      page      — 1-based (default 1)
+      limit     — max 100 (default 25)
+      q         — free-text search across Name, Epic NO (optional)
+      ward      — Ward filter (optional)
+      booth     — Booth No filter (optional)
+
+    Reads from '2025_new' collection, filtered by Religion field.
+    """
+    religion = request.GET.get('religion', '').strip().upper()
+    if religion not in ('H', 'M', 'C'):
+        return JsonResponse({'success': False, 'message': "religion must be H, M, or C"}, status=400)
+
+    try:
+        page  = max(1, int(request.GET.get('page', 1)))
+    except (ValueError, TypeError):
+        page = 1
+    try:
+        limit = min(100, max(1, int(request.GET.get('limit', 25))))
+    except (ValueError, TypeError):
+        limit = 25
+
+    q     = request.GET.get('q', '').strip()
+    ward  = request.GET.get('ward', '').strip()
+    booth = request.GET.get('booth', '').strip()
+
+    try:
+        db         = get_db()
+        collection = db['2025_new']
+
+        mongo_filter = {'Religion': religion}
+
+        if ward:
+            mongo_filter['Ward'] = ward
+        if booth:
+            try:
+                mongo_filter['Booth No'] = int(booth)
+            except ValueError:
+                mongo_filter['Booth No'] = booth
+
+        if q:
+            try:
+                booth_int = int(q)
+                search_or = [
+                    {'Name':    {'$regex': re.escape(q), '$options': 'i'}},
+                    {'Epic NO': {'$regex': re.escape(q), '$options': 'i'}},
+                    {'Booth No': booth_int},
+                ]
+            except ValueError:
+                search_or = [
+                    {'Name':    {'$regex': re.escape(q), '$options': 'i'}},
+                    {'Epic NO': {'$regex': re.escape(q), '$options': 'i'}},
+                ]
+            mongo_filter = {'$and': [mongo_filter, {'$or': search_or}]}
+
+        total_count = collection.count_documents(mongo_filter)
+        total_pages = max(1, math.ceil(total_count / limit))
+        page        = min(page, total_pages)
+        skip        = (page - 1) * limit
+
+        projection = {
+            '_id': 0,
+            'Serial No': 1, 'Epic NO': 1, 'Name': 1,
+            'Relation Name': 1, 'Age': 1, 'Gender': 1,
+            'Booth No': 1, 'Part No': 1, 'Religion': 1,
+            'Address': 1,
+        }
+
+        records = list(collection.find(mongo_filter, projection).skip(skip).limit(limit))
+        for rec in records:
+            for k, v in rec.items():
+                if not isinstance(v, (str, int, float, bool, type(None))):
+                    rec[k] = str(v)
+
+        return JsonResponse({
+            'success':     True,
+            'religion':    religion,
+            'total_count': total_count,
+            'total_pages': total_pages,
+            'page':        page,
+            'limit':       limit,
+            'records':     records,
+        })
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+
+# ─── POLLED / NOTPOLLED RECORDS (2023_polled_notpolled_caste_comm_hmc) ─────────
+@require_http_methods(['GET'])
+def api_polled_records(request):
+    """
+    GET /api/polled-records/
+    Query params:
+      filter_type — 'religion' | 'category' | 'community' (required)
+      value       — filter value (required)
+      status      — 'Polled' | 'NotPolled' | 'All' (default 'All')
+      page        — 1-based (default 1)
+      limit       — max 100 (default 25)
+      q           — free-text search across name, voterId (optional)
+
+    Reads from '2023_polled_notpolled_caste_comm_hmc' collection.
+    """
+    filter_type = request.GET.get('filter_type', '').strip()
+    value       = request.GET.get('value', '').strip()
+    status      = request.GET.get('status', 'All').strip()
+
+    if filter_type not in ('religion', 'category', 'community'):
+        return JsonResponse({'success': False, 'message': "filter_type must be religion, category, or community"}, status=400)
+    if not value:
+        return JsonResponse({'success': False, 'message': "value parameter is required"}, status=400)
+
+    try:
+        page  = max(1, int(request.GET.get('page', 1)))
+    except (ValueError, TypeError):
+        page = 1
+    try:
+        limit = min(100, max(1, int(request.GET.get('limit', 25))))
+    except (ValueError, TypeError):
+        limit = 25
+
+    q = request.GET.get('q', '').strip()
+
+    FIELD_MAP = {
+        'religion':  'religion',
+        'category':  'Category',
+        'community': 'Community',
+    }
+
+    try:
+        db         = get_db()
+        collection = db['2023_polled_notpolled_caste_comm_hmc']
+
+        field = FIELD_MAP[filter_type]
+        mongo_filter = {field: value}
+
+        # religion stored as single letter H/M/C (sometimes mixed case)
+        if filter_type == 'religion':
+            mongo_filter = {'religion': {'$in': [value, value.lower(), value.upper()]}}
+
+        if status in ('Polled', 'NotPolled'):
+            mongo_filter['Polling Status'] = status
+
+        if q:
+            search_or = [
+                {'name':    {'$regex': re.escape(q), '$options': 'i'}},
+                {'voterId': {'$regex': re.escape(q), '$options': 'i'}},
+            ]
+            try:
+                booth_int = int(q)
+                search_or.append({'booth': booth_int})
+            except ValueError:
+                pass
+            mongo_filter = {'$and': [mongo_filter, {'$or': search_or}]}
+
+        total_count = collection.count_documents(mongo_filter)
+        total_pages = max(1, math.ceil(total_count / limit))
+        page        = min(page, total_pages)
+        skip        = (page - 1) * limit
+
+        projection = {
+            '_id': 0,
+            'booth': 1, 'serialNumber': 1, 'houseNumber': 1,
+            'name': 1, 'relationType': 1, 'relationName': 1,
+            'voterId': 1, 'gender': 1, 'age': 1,
+            'religion': 1, 'ward': 1,
+            'Community': 1, 'Caste': 1, 'Category': 1,
+            'Polling Status': 1,
+        }
+
+        records = list(collection.find(mongo_filter, projection).skip(skip).limit(limit))
+        for rec in records:
+            for k, v in rec.items():
+                if not isinstance(v, (str, int, float, bool, type(None))):
+                    rec[k] = str(v)
+
+        return JsonResponse({
+            'success':     True,
+            'filter_type': filter_type,
+            'value':       value,
+            'status':      status,
+            'total_count': total_count,
+            'total_pages': total_pages,
+            'page':        page,
+            'limit':       limit,
+            'records':     records,
+        })
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)

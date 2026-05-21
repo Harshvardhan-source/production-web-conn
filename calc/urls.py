@@ -57,9 +57,15 @@ urlpatterns = [
     path('update-survey/',           views.api_update_survey,      name='api_update_survey'),
     path('large-families/',          views.api_large_families,     name='api_large_families'),
 
-    # ── Community Records (2025_caste_comm_hmc) ───────────────────────────────
+    # ── Community Records (2025_cst_com_hmc) ────────────────────────────────────
     path('community-records/',       views.api_community_records,       name='api_community_records'),
-    path('debug-community/',         views.api_debug_community_values,  name='api_debug_community_values'),  # TEMP — remove after fixing DB spelling
+    path('debug-community/',         views.api_debug_community_values,  name='api_debug_community_values'),
+
+    # ── HMC Records (2025_new) — Religion filter ─────────────────────────────────
+    path('hmc-records/',             views.api_hmc_records,             name='api_hmc_records'),
+
+    # ── Polled / NotPolled Records (2023_polled_notpolled_caste_comm_hmc) ─────────
+    path('polled-records/',          views.api_polled_records,          name='api_polled_records'),
 
     # Wards
     path('wards/',                   views.api_wards,              name='api_wards'),
