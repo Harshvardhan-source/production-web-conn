@@ -1,14 +1,12 @@
-# ── Add these lines to your existing urls.py urlpatterns list ────────────────
+# ── Add this one line to the urlpatterns list in urls.py ─────────────────────
 #
-# from . import views   ← already present
+#   path('community-records/', views.api_community_records, name='api_community_records'),
 #
-#   # AI Chat — document-aware Anthropic chat
-#   path('ai/chat/',         views.api_ai_chat,         name='api_ai_chat'),
-#   path('ai/chat/export/',  views.api_ai_chat_export,  name='api_ai_chat_export'),
-#   path('ai/data-files/',   views.api_ai_data_files,   name='api_ai_data_files'),
-#
+# Full updated urlpatterns list shown below for reference.
+# Place it alongside the other dashboard/data routes.
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Full urls.py with new routes added (safe to replace your existing file)
+# Suggested placement inside urlpatterns (after 'large-families/'):
 # ─────────────────────────────────────────────────────────────────────────────
 
 from django.urls import path
@@ -59,6 +57,9 @@ urlpatterns = [
     path('update-survey/',           views.api_update_survey,      name='api_update_survey'),
     path('large-families/',          views.api_large_families,     name='api_large_families'),
 
+    # ── Community Records (2025_caste_comm_hmc) — NEW ─────────────────────────
+    path('community-records/',       views.api_community_records,  name='api_community_records'),
+
     # Wards
     path('wards/',                   views.api_wards,              name='api_wards'),
 
@@ -79,16 +80,16 @@ urlpatterns = [
     # ML Intelligence
     path('ml/constituency-swot/',    views.api_ml_constituency_swot,  name='api_ml_constituency_swot'),
 
-    # AI Insights (existing)
+    # AI Insights
     path('ai/query-insight/',        views.api_ai_query_insight,      name='api_ai_query_insight'),
     path('ai/birdseye-view/',        views.api_ai_birdseye_view,      name='api_ai_birdseye_view'),
     path('ai/swot-overview/',        views.api_swot_overview,         name='api_swot_overview'),
 
-    # ── AI Chat — NEW ─────────────────────────────────────────────────────────
+    # AI Chat
     path('ai/chat/',                 views.api_ai_chat,               name='api_ai_chat'),
     path('ai/chat/export/',          views.api_ai_chat_export,        name='api_ai_chat_export'),
     path('ai/data-files/',           views.api_ai_data_files,         name='api_ai_data_files'),
-    path('ward-places/',             views.api_ward_places,              name='api_ward_places'),
-    path('local-places-summary/',    views.api_local_places_summary,     name='api_local_places_summary'),
-    path('swot/beneficiaries/',      views.api_beneficiary_list,         name='api_beneficiary_list'),
+    path('ward-places/',             views.api_ward_places,           name='api_ward_places'),
+    path('local-places-summary/',    views.api_local_places_summary,  name='api_local_places_summary'),
+    path('swot/beneficiaries/',      views.api_beneficiary_list,      name='api_beneficiary_list'),
 ]

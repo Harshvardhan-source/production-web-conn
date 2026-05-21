@@ -1338,6 +1338,92 @@ def api_large_families(request):
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
  
 
+# ─── COMMUNITY RECORDS (2025_caste_comm_hmc) ──────────────────────────────────
+
+@require_http_methods(['GET'])
+def api_community_records(request):
+    """
+    GET /api/community-records/
+    Query params:
+      community  — exact Community field value to filter (required)
+      page       — 1-based page number (default 1)
+      limit      — records per page (default 25, max 100)
+      q          — free-text search across Name, Epic No, Booth No (optional)
+
+    Reads from the '2025_caste_comm_hmc' collection in SurveyDataBase (MONGODB_URL cluster).
+    Returns paginated voter records for the selected community.
+    """
+    community = request.GET.get('community', '').strip()
+    if not community:
+        return JsonResponse({'success': False, 'message': 'community parameter is required'}, status=400)
+
+    try:
+        page  = max(1, int(request.GET.get('page', 1)))
+    except (ValueError, TypeError):
+        page  = 1
+
+    try:
+        limit = min(100, max(1, int(request.GET.get('limit', 25))))
+    except (ValueError, TypeError):
+        limit = 25
+
+    q = request.GET.get('q', '').strip()
+
+    try:
+        db         = get_db()
+        collection = db['2025_caste_comm_hmc']
+
+        # ── Build filter ──────────────────────────────────────────────────────
+        mongo_filter = {'Community': community}
+
+        if q:
+            try:
+                booth_int = int(q)
+                mongo_filter['$or'] = [
+                    {'Name':    {'$regex': q, '$options': 'i'}},
+                    {'Epic No': {'$regex': q, '$options': 'i'}},
+                    {'Booth No': booth_int},
+                ]
+            except ValueError:
+                mongo_filter['$or'] = [
+                    {'Name':    {'$regex': q, '$options': 'i'}},
+                    {'Epic No': {'$regex': q, '$options': 'i'}},
+                ]
+
+        # ── Count + paginate ──────────────────────────────────────────────────
+        total_count = collection.count_documents(mongo_filter)
+        total_pages = max(1, math.ceil(total_count / limit))
+        page        = min(page, total_pages)
+        skip        = (page - 1) * limit
+
+        projection  = {
+            '_id': 0, 'Serial No': 1, 'Epic No': 1, 'Name': 1,
+            'Relation Name': 1, 'Age': 1, 'Gender': 1,
+            'Booth No': 1, 'Category': 1, 'Community': 1,
+        }
+
+        records = list(collection.find(mongo_filter, projection).skip(skip).limit(limit))
+
+        for rec in records:
+            for k, v in rec.items():
+                if not isinstance(v, (str, int, float, bool, type(None))):
+                    rec[k] = str(v)
+
+        return JsonResponse({
+            'success':     True,
+            'community':   community,
+            'total_count': total_count,
+            'total_pages': total_pages,
+            'page':        page,
+            'limit':       limit,
+            'records':     records,
+        })
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+
 # ─── SURVEY ───────────────────────────────────────────────────────────────────
 
 @require_http_methods(['GET'])
