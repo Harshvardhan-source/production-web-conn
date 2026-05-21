@@ -1345,13 +1345,18 @@ def api_community_records(request):
     """
     GET /api/community-records/
     Query params:
-      community  — exact Community field value to filter (required)
+      community  — Community field value to filter (required)
       page       — 1-based page number (default 1)
       limit      — records per page (default 25, max 100)
       q          — free-text search across Name, Epic No, Booth No (optional)
 
     Reads from the '2025_caste_comm_hmc' collection in SurveyDataBase (MONGODB_URL cluster).
     Returns paginated voter records for the selected community.
+
+    Matching strategy (in order):
+      1. Exact match on Community field
+      2. If 0 results → case-insensitive regex with flexible whitespace
+         (handles trailing spaces, double spaces, minor encoding differences)
     """
     community = request.GET.get('community', '').strip()
     if not community:
@@ -1373,22 +1378,49 @@ def api_community_records(request):
         db         = get_db()
         collection = db['2025_caste_comm_hmc']
 
-        # ── Build filter ──────────────────────────────────────────────────────
-        mongo_filter = {'Community': community}
+        # ── Resolve the Community filter ───────────────────────────────────────
+        # Step 1: try exact match
+        community_filter = {'Community': community}
 
+        if collection.count_documents(community_filter, limit=1) == 0:
+            # Step 2: fall back to case-insensitive regex with flexible whitespace.
+            # This handles: trailing/leading spaces, double spaces, case differences,
+            # and minor transliteration variants (e.g. "Mangalorean" vs "Manglorean").
+            escaped  = re.escape(community.strip())           # escape regex special chars
+            flexible = re.sub(r'\\ ', r'\\s+', escaped)      # allow any whitespace between words
+            community_filter = {
+                'Community': {'$regex': f'^\\s*{flexible}\\s*$', '$options': 'i'}
+            }
+
+            # Step 3: if still nothing, try a broader contains-style match
+            if collection.count_documents(community_filter, limit=1) == 0:
+                # Split into words and require all words present (order-independent)
+                words = community.strip().split()
+                if len(words) > 1:
+                    word_patterns = [
+                        {'Community': {'$regex': re.escape(w), '$options': 'i'}}
+                        for w in words
+                    ]
+                    community_filter = {'$and': word_patterns}
+
+        # ── Build full filter (community + optional text search) ──────────────
         if q:
             try:
                 booth_int = int(q)
-                mongo_filter['$or'] = [
-                    {'Name':    {'$regex': q, '$options': 'i'}},
-                    {'Epic No': {'$regex': q, '$options': 'i'}},
+                search_or = [
+                    {'Name':    {'$regex': re.escape(q), '$options': 'i'}},
+                    {'Epic No': {'$regex': re.escape(q), '$options': 'i'}},
                     {'Booth No': booth_int},
                 ]
             except ValueError:
-                mongo_filter['$or'] = [
-                    {'Name':    {'$regex': q, '$options': 'i'}},
-                    {'Epic No': {'$regex': q, '$options': 'i'}},
+                search_or = [
+                    {'Name':    {'$regex': re.escape(q), '$options': 'i'}},
+                    {'Epic No': {'$regex': re.escape(q), '$options': 'i'}},
                 ]
+            # Merge community filter + search filter via $and
+            mongo_filter = {'$and': [community_filter, {'$or': search_or}]}
+        else:
+            mongo_filter = community_filter
 
         # ── Count + paginate ──────────────────────────────────────────────────
         total_count = collection.count_documents(mongo_filter)
@@ -1422,6 +1454,30 @@ def api_community_records(request):
     except Exception as exc:
         traceback.print_exc()
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+
+@csrf_exempt
+@require_http_methods(['GET'])
+def api_debug_community_values(request):
+    """
+    GET /api/debug-community/?q=Mangalorean
+    Returns the distinct Community values in 2025_caste_comm_hmc that match
+    the query string (case-insensitive contains).
+    USE ONLY FOR DEBUGGING — remove or restrict once issue is resolved.
+    """
+    q  = request.GET.get('q', '').strip()
+    if not q:
+        return JsonResponse({'error': 'q param required'}, status=400)
+    try:
+        db     = get_db()
+        coll   = db['2025_caste_comm_hmc']
+        values = coll.distinct('Community', {
+            'Community': {'$regex': re.escape(q), '$options': 'i'}
+        })
+        return JsonResponse({'query': q, 'matched_values': sorted(values), 'count': len(values)})
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'error': str(exc)}, status=500)
 
 
 # ─── SURVEY ───────────────────────────────────────────────────────────────────

@@ -57,8 +57,9 @@ urlpatterns = [
     path('update-survey/',           views.api_update_survey,      name='api_update_survey'),
     path('large-families/',          views.api_large_families,     name='api_large_families'),
 
-    # ── Community Records (2025_caste_comm_hmc) — NEW ─────────────────────────
-    path('community-records/',       views.api_community_records,  name='api_community_records'),
+    # ── Community Records (2025_caste_comm_hmc) ───────────────────────────────
+    path('community-records/',       views.api_community_records,       name='api_community_records'),
+    path('debug-community/',         views.api_debug_community_values,  name='api_debug_community_values'),  # TEMP — remove after fixing DB spelling
 
     # Wards
     path('wards/',                   views.api_wards,              name='api_wards'),
