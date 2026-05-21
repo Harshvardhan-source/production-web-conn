@@ -3475,8 +3475,10 @@ def _run_sir_analysis(voterid, name, house, ward, booth, serial, relation='',
 
 
 @csrf_exempt
-@require_http_methods(['POST'])
+@require_http_methods(['POST', 'OPTIONS'])
 def api_check_sir(request):
+    if request.method == 'OPTIONS':
+        return _sir_options(request)
     """
     SIR check endpoint.
     store=false (default) → read-only preview, nothing written to DB.
@@ -3496,7 +3498,7 @@ def api_check_sir(request):
     try:
         body = json.loads(request.body)
     except Exception:
-        return JsonResponse({'success': False, 'message': 'Invalid JSON'}, status=400)
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'Invalid JSON'}, status=400))
 
     # ── Parse inputs ──────────────────────────────────────────────────────────
     # Accept either 'name' (from live-check panel) or firstName+lastName (from survey form)
@@ -3519,11 +3521,11 @@ def api_check_sir(request):
     if not do_store:
         _cached_data = _sir_cache_get(_sir_cache_key)
         if _cached_data is not None:
-            return JsonResponse(_cached_data)
+            return _sir_cors(request, JsonResponse(_cached_data))
 
     if do_store:
         sir = _run_sir_analysis(voterid, name, house, ward, booth, serial, relation, db=db)
-        return JsonResponse({'success': True, **sir})
+        return _sir_cors(request, JsonResponse({'success': True, **sir}))
 
     # ── Read-only preview (no DB writes) ──────────────────────────────────────
     col_2025 = db['2025']
@@ -3578,7 +3580,7 @@ def api_check_sir(request):
             if _name_tokens_list:
                 # c) Single-token search: contains each token anywhere in name
                 #    This catches "AKSHAYA RAJESH", "B RAJESH BALIGA" etc.
-                _tok_lim = 500 if _name_only_search else 200
+                _tok_lim = 150 if _name_only_search else 80
                 for tok in _name_tokens_list:
                     rx = {'$regex': re.escape(tok), '$options': 'i'}
                     _add(col_2002.find({'$or':[{'Voter Name':rx},{'Name':rx}]}, _PROJ_02).limit(_tok_lim))
@@ -3591,7 +3593,7 @@ def api_check_sir(request):
                     for tok in _name_tokens_list:
                         rx = {'$regex': re.escape(tok), '$options': 'i'}
                         and_clauses.append({'$or':[{'Voter Name':rx},{'Name':rx}]})
-                    _add(col_2002.find({'$and': and_clauses}, _PROJ_02).limit(500))
+                    _add(col_2002.find({'$and': and_clauses}, _PROJ_02).limit(200))
 
                 # e) Phonetic prefix variants (original fallback for transliteration)
                 if _name_tok:
@@ -3599,7 +3601,7 @@ def api_check_sir(request):
                     for p in _name_prefixes:
                         rx = {'$regex':f'^{re.escape(p)}','$options':'i'}
                         clauses.append({'Voter Name':rx}); clauses.append({'Name':rx})
-                    _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(500))
+                    _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(150))
 
             # f) Relation prefix — greatly expanded for relation-only searches
             if relation and len(relation) >= 2:
@@ -3612,7 +3614,7 @@ def api_check_sir(request):
                     for _rtok in relation.split():
                         if len(_rtok) >= 3:
                             _rx = {'$regex': re.escape(_rtok), '$options': 'i'}
-                            _add(col_2002.find({'$or':[{'Relative Name':_rx},{'Relation Name':_rx}]}, _PROJ_02).limit(200))
+                            _add(col_2002.find({'$or':[{'Relative Name':_rx},{'Relation Name':_rx}]}, _PROJ_02).limit(100))
         except Exception:
             pass
 
@@ -3636,7 +3638,7 @@ def api_check_sir(request):
 
             if _name_tokens_list:
                 # c) Contains search for each token — catches mid-name occurrences
-                _tok_lim25 = 500 if _name_only_search else 200
+                _tok_lim25 = 150 if _name_only_search else 80
                 for tok in _name_tokens_list:
                     rx = {'$regex': re.escape(tok), '$options': 'i'}
                     _add(col_2025.find({'Name': rx}, _PROJ_25).limit(_tok_lim25))
@@ -3644,12 +3646,12 @@ def api_check_sir(request):
                 # d) Multi-token AND intersection — highest precision for multi-word queries
                 if len(_name_tokens_list) >= 2:
                     and_clauses = [{'Name':{'$regex':re.escape(tok),'$options':'i'}} for tok in _name_tokens_list]
-                    _add(col_2025.find({'$and': and_clauses}, _PROJ_25).limit(500))
+                    _add(col_2025.find({'$and': and_clauses}, _PROJ_25).limit(200))
 
                 # e) Phonetic prefix variants fallback
                 if _name_tok:
                     clauses = [{'Name':{'$regex':f'^{re.escape(p)}','$options':'i'}} for p in _name_prefixes]
-                    _add(col_2025.find({'$or':clauses}, _PROJ_25).limit(500))
+                    _add(col_2025.find({'$or':clauses}, _PROJ_25).limit(150))
 
             if relation and len(relation) >= 3:
                 frt = relation.split()[0]
@@ -3661,7 +3663,7 @@ def api_check_sir(request):
                     for _rtok in relation.split():
                         if len(_rtok) >= 3:
                             _rx = {'$regex': re.escape(_rtok), '$options': 'i'}
-                            _add(col_2025.find({'Relation Name': _rx}, _PROJ_25).limit(200))
+                            _add(col_2025.find({'Relation Name': _rx}, _PROJ_25).limit(100))
         except Exception:
             pass
 
@@ -3874,7 +3876,7 @@ def api_check_sir(request):
         -x['comp'],
     ))
     _seen_sigs02 = set()
-    for item in _scored02[:300]:
+    for item in _scored02[:100]:
         f   = item['flat']
         doc = item['doc']
         sig = (f['name'], f['house'])
@@ -3903,7 +3905,7 @@ def api_check_sir(request):
         -x.get('rel_quality', 0),
         -x['score'],
     ))
-    suggestions_2002 = suggestions_2002[:300]
+    suggestions_2002 = suggestions_2002[:100]
 
     # ── Score similar_2025 from pre-fetched _raw25 ────────────────────────────────────
     similar_2025 = []
@@ -3977,7 +3979,7 @@ def api_check_sir(request):
         if _conf25_epic and epic == _conf25_epic: continue
         _seen25_epics.add(epic)
         similar_2025.append(rec)
-        if len(similar_2025) >= 300: break
+        if len(similar_2025) >= 100: break
 
     _response_data = {
         'success':    True,
@@ -4011,11 +4013,14 @@ def api_check_sir(request):
     }
     # Cache the result — persists to MongoDB so it survives server restarts/sleep
     _sir_cache_set(_sir_cache_key, _response_data)
-    return JsonResponse(_response_data)
+    return _sir_cors(request, JsonResponse(_response_data))
 
 
-@require_http_methods(['GET'])
+@csrf_exempt
+@require_http_methods(['GET', 'OPTIONS'])
 def api_sir_records(request):
+    if request.method == 'OPTIONS':
+        return _sir_options(request)
     db       = get_db()
     category = request.GET.get('category', 'ALL')
     page     = max(1, int(request.GET.get('page', 1)))
@@ -4037,15 +4042,15 @@ def api_sir_records(request):
         col   = db[col_map[category]]
         total = col.count_documents(base_filter)
         docs  = [bson_clean(d) for d in col.find().skip(skip).limit(limit).sort('surveyed_at', -1)]
-        return JsonResponse({'success': True, 'category': category,
-                             'records': docs, 'total': total, 'page': page})
+        return _sir_cors(request, JsonResponse({'success': True, 'category': category,
+                             'records': docs, 'total': total, 'page': page}))
 
     counts  = {k: db[v].count_documents({}) for k, v in col_map.items()}
     samples = {k: [bson_clean(d) for d in db[v].find().limit(5).sort('surveyed_at', -1)]
                for k, v in col_map.items()}
-    return JsonResponse({'success': True, 'category': 'ALL',
+    return _sir_cors(request, JsonResponse({'success': True, 'category': 'ALL',
                          'counts': counts, 'samples': samples,
-                         'total': sum(counts.values())})
+                         'total': sum(counts.values())}))
 
 
 @csrf_exempt
@@ -4124,13 +4129,16 @@ def api_sir_suggest(request):
         })
     return JsonResponse({'success': True, 'suggestions': suggestions})
 
-@require_http_methods(['GET'])
+@csrf_exempt
+@require_http_methods(['GET', 'OPTIONS'])
 def api_sir_stats(request):
+    if request.method == 'OPTIONS':
+        return _sir_options(request)
     db        = get_db()
     survey_db = get_survey_db()
     voters_2002 = db['2002'].count_documents({})
     voters_2025 = db['2025'].count_documents({})
-    return JsonResponse({'success': True,
+    return _sir_cors(request, JsonResponse({'success': True,
         'new_additions':  survey_db['SIR_NewAdditions'].count_documents({}),
         'deletions':      survey_db['SIR_Deleted'].count_documents({}),
         'modifications':  survey_db['SIR_Modified'].count_documents({}),
@@ -4141,11 +4149,14 @@ def api_sir_stats(request):
         'voters_2025':    voters_2025,
         'db_2002_status': 'ok' if voters_2002 > 0 else 'empty — place 2002.xlsx in project root and call /api/sync-2002/',
         'db_2025_status': 'ok' if voters_2025 > 0 else 'empty — upload voter list first',
-    })
+    }))
 
 
-@require_http_methods(['GET'])
+@csrf_exempt
+@require_http_methods(['GET', 'OPTIONS'])
 def api_sir_data(request):
+    if request.method == 'OPTIONS':
+        return _sir_options(request)
     db        = get_db()
     survey_db = get_survey_db()   # SIR_* collections live here
     category = request.GET.get('category', 'ALL').upper()
@@ -4203,8 +4214,10 @@ def api_sir_data(request):
 
 # ─── SIR Confirm Match ────────────────────────────────────────────────────────
 @csrf_exempt
-@require_http_methods(['POST'])
+@require_http_methods(['POST', 'OPTIONS'])
 def api_sir_confirm_match(request):
+    if request.method == 'OPTIONS':
+        return _sir_options(request)
     """
     Persist a user-confirmed SIR match decision.
 
@@ -4269,10 +4282,10 @@ def api_sir_confirm_match(request):
             survey_db['SIR_ConfirmedMatches'].insert_one(doc)
         else:
             survey_db['SIR_ConfirmedNotFound'].insert_one(doc)
-        return JsonResponse({'success': True, 'status': status})
+        return _sir_cors(request, JsonResponse({'success': True, 'status': status}))
     except Exception as exc:
         traceback.print_exc()
-        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+        return _sir_cors(request, JsonResponse({'success': False, 'message': str(exc)}, status=500))
 
 
 # ─── ADD TO urls.py: path('api/sir/confirmed/', views.api_sir_confirmed_list) ──
@@ -4303,18 +4316,11 @@ def api_sir_confirmed_list(request):
     }
     """
     if request.method == 'OPTIONS':
-        resp = JsonResponse({})
-        origin = request.META.get('HTTP_ORIGIN', '')
-        if origin:
-            resp['Access-Control-Allow-Origin']      = origin
-            resp['Access-Control-Allow-Credentials'] = 'true'
-            resp['Access-Control-Allow-Methods']     = 'GET, OPTIONS'
-            resp['Access-Control-Allow-Headers']     = 'Content-Type, Authorization, X-CSRFToken'
-        return resp
+        return _sir_options(request)
 
     user = _user_from_request(request)
     if not user:
-        return JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401)
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401))
 
     category = request.GET.get('category', 'ALL').upper()
     page     = max(1, int(request.GET.get('page', 1)))
@@ -4380,17 +4386,17 @@ def api_sir_confirmed_list(request):
             )
             records = merged[skip: skip + limit]
 
-        return JsonResponse({
+        return _sir_cors(request, JsonResponse({
             'success': True,
             'counts':  counts,
             'records': records,
             'total':   total,
             'page':    page,
-        })
+        }))
 
     except Exception as exc:
         traceback.print_exc()
-        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+        return _sir_cors(request, JsonResponse({'success': False, 'message': str(exc)}, status=500))
 
 
     r25 = doc.get('voter_record_2025') or {}
@@ -4458,8 +4464,10 @@ def api_sir_confirmed_list(request):
 
 
 @csrf_exempt
-@require_http_methods(['POST'])
+@require_http_methods(['POST', 'OPTIONS'])
 def api_sir_bulk(request):
+    if request.method == 'OPTIONS':
+        return _sir_options(request)
     """
     Bulk SIR pass over both voter rolls stored in MongoDB.
       Phase 1 — iterate SurveyDataBase.2025  (catches NEW additions, MODIFICATIONS, floods)
@@ -5957,6 +5965,18 @@ def _ai_cors(request, response):
             'Content-Type, Authorization, X-CSRFToken, X-Requested-With'
         )
     return response
+
+
+# Alias — SIR endpoints use the same CORS policy as AI endpoints
+def _sir_cors(request, response):
+    """Add cross-origin headers to every SIR response."""
+    return _ai_cors(request, response)
+
+
+def _sir_options(request):
+    """Return a 200 OPTIONS preflight response for SIR endpoints."""
+    resp = JsonResponse({})
+    return _sir_cors(request, resp)
 
 
 def _ai_err(request, msg, status=500):
