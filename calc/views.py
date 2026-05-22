@@ -3315,7 +3315,7 @@ def _run_sir_analysis(voterid, name, house, ward, booth, serial, relation='',
         write_db = read_db
 
     col_2025 = read_db['2025']
-    col_2002 = get_survey_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
+    col_2002 = get_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
 
     # ── Look up in both rolls — parallel threads ─────────────────────────────────
     _rr = [None, None]
@@ -3529,7 +3529,7 @@ def api_check_sir(request):
 
     # ── Read-only preview (no DB writes) ──────────────────────────────────────
     col_2025 = db['2025']
-    col_2002 = get_survey_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
+    col_2002 = get_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
 
     # ── Pre-compute name tokens and prefix variants ─────────────────────────────────────────
     # Split name into individual tokens used by all 4 parallel phases.
@@ -4476,7 +4476,7 @@ def api_sir_bulk(request):
     """
     db        = get_db()
     col_2025  = db['2025']
-    col_2002  = get_survey_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
+    col_2002  = get_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
     processed = 0
     errors    = 0
 
@@ -6201,7 +6201,7 @@ def _ai_ctx_sir_summary():
             except Exception:
                 pass
 
-        v2002 = _safe_count(db['2002'])
+        v2002 = _safe_count(db2['2002'])
         v2025 = _safe_count(db2['2025'])
 
         lines = ['=== SIR (Summary Intensive Revision) — 2002 vs 2025 ===',
@@ -6627,7 +6627,7 @@ def _ai_ctx_swot_stack():
 
 def _ai_ctx_voter_roll_2002():
     try:
-        db    = get_survey_db()
+        db    = get_db()
         total = _safe_count(db['2002'])
 
         agg = list(db['2002'].aggregate([{'$facet': {
@@ -8514,7 +8514,7 @@ def api_ai_data_files(request):
     mongo_sources = []
     try:
         db1 = get_db()
-        db2 = get_survey_db()
+        db2 = get_db()
         mongo_sources = [
             {'name': '2025 Voter Roll',              'ext': 'mongodb', 'type': 'collection',
              'size': db1['2025'].estimated_document_count()},
