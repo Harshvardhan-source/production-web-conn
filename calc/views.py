@@ -1376,7 +1376,7 @@ def api_community_records(request):
 
     try:
         db         = get_db()
-        collection = db['2025_cst_com_hmc']
+        collection = db['2025_caste_comm_hmc']
 
         # ── Resolve the Community filter ───────────────────────────────────────
         # community param may be a single name OR comma-joined group e.g.
@@ -1472,7 +1472,7 @@ def api_debug_community_values(request):
         return JsonResponse({'error': 'q param required'}, status=400)
     try:
         db     = get_db()
-        coll   = db['2025_cst_com_hmc']
+        coll   = db['2025_caste_comm_hmc']
         values = coll.distinct('Community', {
             'Community': {'$regex': re.escape(q), '$options': 'i'}
         })
