@@ -9246,15 +9246,28 @@ def api_polled_records(request):
 # }
 # ─────────────────────────────────────────────────────────────────────────────
 
-_polled_breakdown_cache     = {}   # (ward, booth) → {'data': {...}, 'ts': float}
+_polled_breakdown_cache     = {}   # (ward, booth, age_group) → {'data': {...}, 'ts': float}
 _POLLED_BREAKDOWN_CACHE_TTL = 300  # 5 min
+
+# Map frontend age-group labels to (min_age, max_age) inclusive ranges
+_AGE_GROUP_RANGES = {
+    '18-25': (18, 25),
+    '26-30': (26, 30),
+    '31-35': (31, 35),
+    '36-40': (36, 40),
+    '41-45': (41, 45),
+    '46-50': (46, 50),
+    '51-60': (51, 60),
+    '60+':   (61, 999),
+}
 
 @require_http_methods(['GET'])
 def api_polled_breakdown(request):
     import time as _t
 
-    ward  = request.GET.get('ward',  '').strip()
-    booth = request.GET.get('booth', '').strip()
+    ward      = request.GET.get('ward',      '').strip()
+    booth     = request.GET.get('booth',     '').strip()
+    age_group = request.GET.get('age_group', 'All').strip()
 
     if not ward and not booth:
         return JsonResponse(
@@ -9262,7 +9275,7 @@ def api_polled_breakdown(request):
             status=400,
         )
 
-    cache_key = (ward, booth)
+    cache_key = (ward, booth, age_group)
     cached = _polled_breakdown_cache.get(cache_key)
     if cached and (_t.time() - cached['ts']) < _POLLED_BREAKDOWN_CACHE_TTL:
         return JsonResponse({'success': True, **cached['data']})
@@ -9295,6 +9308,13 @@ def api_polled_breakdown(request):
             # Include both int and str forms for every booth
             booth_vals = list(ward_booths) + [str(b) for b in ward_booths]
             match_filter = {'booth': {'$in': booth_vals}}
+
+        # ── Apply age_group filter on the Age field (numeric) ────────────────
+        age_range = _AGE_GROUP_RANGES.get(age_group)
+        if age_range:
+            min_age, max_age = age_range
+            match_filter = dict(match_filter)   # shallow copy before mutating
+            match_filter['Age'] = {'$gte': min_age, '$lte': max_age}
 
         # ── Helper: run one aggregation and pivot into {key: {polled, notPolled}} ──
         def _agg(group_field):
