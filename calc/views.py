@@ -8927,34 +8927,50 @@ def api_community_breakdown(request):
     """
     GET /api/community-breakdown/
     Query params:
-      ward  — Ward No filter (optional; omit for constituency-wide)
-      booth — Booth No filter (optional; requires ward)
+      booths — comma-separated list of Booth No values to include
+               (frontend sends all booths for the selected ward, or a single
+                booth when a specific booth is chosen)
+      ward   — constituency ward number; stored for the response only, NOT
+               used as a DB field (Ward No in this collection is the local HMC
+               ward, which differs from the constituency ward number)
+      booth  — single booth number; if provided, overrides booths list
 
     Aggregates Community + Category counts from '2025_new_mapped_notmapped_hmc',
-    sorted by count descending.  Used by the Community Classification Panel on
-    the dashboard when a ward or booth is selected.
+    sorted by count descending.
 
     Response:
       { success, ward, booth, total, rows: [{community, category, count}, …] }
     """
-    ward  = request.GET.get('ward',  '').strip()
-    booth = request.GET.get('booth', '').strip()
+    ward   = request.GET.get('ward',   '').strip()
+    booth  = request.GET.get('booth',  '').strip()
+    booths = request.GET.get('booths', '').strip()
 
     try:
         db         = get_db()
         collection = db['2025_new_mapped_notmapped_hmc']
 
         mongo_filter = {}
-        if ward:
-            try:
-                mongo_filter['Ward No'] = int(ward)
-            except ValueError:
-                mongo_filter['Ward No'] = ward
+
+        # A single booth selection overrides the booths list
         if booth:
             try:
                 mongo_filter['Booth No'] = int(booth)
             except ValueError:
                 mongo_filter['Booth No'] = booth
+        elif booths:
+            # Parse comma-separated booth numbers into a list of ints
+            booth_list = []
+            for b in booths.split(','):
+                b = b.strip()
+                if b:
+                    try:
+                        booth_list.append(int(b))
+                    except ValueError:
+                        booth_list.append(b)
+            if len(booth_list) == 1:
+                mongo_filter['Booth No'] = booth_list[0]
+            elif booth_list:
+                mongo_filter['Booth No'] = {'$in': booth_list}
 
         pipeline = [
             {'$match': mongo_filter},
@@ -9017,6 +9033,7 @@ def api_mapped_records(request):
     q         = request.GET.get('q',         '').strip()
     ward      = request.GET.get('ward',      '').strip()
     booth     = request.GET.get('booth',     '').strip()
+    booths    = request.GET.get('booths',    '').strip()  # comma-separated booth numbers
     community = request.GET.get('community', '').strip()
 
     try:
@@ -9037,17 +9054,35 @@ def api_mapped_records(request):
         elif poll_status == 'NotPolled':
             mongo_filter['Poll Status 2023'] = 'NOT POLLED'
 
-        if ward:
-            try:
-                mongo_filter['Ward No'] = int(ward)
-            except ValueError:
-                mongo_filter['Ward No'] = ward
-
+        # Ward / booth filtering — NOTE: 'Ward No' in this collection is the local
+        # HMC ward number, which does NOT match the constituency ward numbers (21-60).
+        # Always filter by Booth No instead, using the booth list passed from the
+        # frontend (which derives it from the WARD_FULL_DATA mapping).
         if booth:
             try:
                 mongo_filter['Booth No'] = int(booth)
             except ValueError:
                 mongo_filter['Booth No'] = booth
+        elif booths:
+            booth_list = []
+            for b in booths.split(','):
+                b = b.strip()
+                if b:
+                    try:
+                        booth_list.append(int(b))
+                    except ValueError:
+                        booth_list.append(b)
+            if len(booth_list) == 1:
+                mongo_filter['Booth No'] = booth_list[0]
+            elif booth_list:
+                mongo_filter['Booth No'] = {'$in': booth_list}
+        elif ward:
+            # Legacy fallback: if no booths list is provided, try Ward No
+            # (may not return correct results for constituency wards 21-60)
+            try:
+                mongo_filter['Ward No'] = int(ward)
+            except ValueError:
+                mongo_filter['Ward No'] = ward
 
         # Community filter — supports comma-joined list (OR across multiple names)
         if community:
