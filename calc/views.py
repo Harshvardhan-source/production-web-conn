@@ -9309,12 +9309,19 @@ def api_polled_breakdown(request):
             booth_vals = list(ward_booths) + [str(b) for b in ward_booths]
             match_filter = {'booth': {'$in': booth_vals}}
 
-        # ── Apply age_group filter on the Age field (numeric) ────────────────
+        # ── Apply age_group filter on the age field (lowercase in collection) ──────
         age_range = _AGE_GROUP_RANGES.get(age_group)
         if age_range:
             min_age, max_age = age_range
             match_filter = dict(match_filter)   # shallow copy before mutating
-            match_filter['Age'] = {'$gte': min_age, '$lte': max_age}
+            # Field is 'age' (lowercase int) in 2023_polled_notpolled_caste_comm_hmc.
+            # Use $expr + $toInt so it works even if some docs store age as a string.
+            match_filter['$expr'] = {
+                '$and': [
+                    {'$gte': [{'$toInt': {'$ifNull': ['$age', -1]}}, min_age]},
+                    {'$lte': [{'$toInt': {'$ifNull': ['$age', -1]}}, max_age]},
+                ]
+            }
 
         # ── Helper: run one aggregation and pivot into {key: {polled, notPolled}} ──
         def _agg(group_field):
