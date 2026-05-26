@@ -2720,14 +2720,15 @@ def _flat_2025(doc):
     if not doc:
         return {}
     return {
-        'name':     _norm(doc.get('Name', '')),
-        'relation': _norm(doc.get('Relation Name', '')),
-        'house':    _norm(doc.get('House No', '')),
-        'voterid':  _norm(doc.get('Epic NO', '')),
-        'gender':   _norm(doc.get('Gender', '')),
-        'age':      str(doc.get('Age', '')).strip(),
-        'booth':    str(doc.get('Booth No', '')),
-        'ward':     str(doc.get('Part No', '')),
+        'name':           _norm(doc.get('Name', '')),
+        'relation':       _norm(doc.get('Relation Name', '')),
+        'house':          _norm(doc.get('House No', '')),
+        'voterid':        _norm(doc.get('Epic NO', '')),
+        'gender':         _norm(doc.get('Gender', '')),
+        'age':            str(doc.get('Age', '')).strip(),
+        'booth':          str(doc.get('Booth No', '')),
+        'ward':           str(doc.get('Part No', '')),
+        'mapping_status': str(doc.get('Mapping Status', '')).strip(),
     }
 
 
@@ -3528,7 +3529,7 @@ def api_check_sir(request):
         return _sir_cors(request, JsonResponse({'success': True, **sir}))
 
     # ── Read-only preview (no DB writes) ──────────────────────────────────────
-    col_2025 = db['2025']
+    col_2025 = db['2025_new_mapped_notmapped']
     col_2002 = get_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
 
     # ── Pre-compute name tokens and prefix variants ─────────────────────────────────────────
@@ -3539,7 +3540,7 @@ def api_check_sir(request):
     _name_tok         = _name_tokens_list[0] if _name_tokens_list else ''
     _name_prefixes    = _gen_prefixes(_name_tok) if _name_tok else ()
 
-    _PROJ_25 = {'Name':1,'Relation Name':1,'Epic NO':1,'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1}
+    _PROJ_25 = {'Name':1,'Relation Name':1,'Epic NO':1,'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1,'Mapping Status':1}
     _PROJ_02 = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
                 'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,
                 'Gender':1,'Age':1,'Booth No':1,'Part No':1,'Serial No':1}
@@ -3970,6 +3971,7 @@ def api_check_sir(request):
             'part':   str(d.get('Part No','')).strip(),
             'score':  round(min(100.0, _c25)),
             'matched_by': flags,
+            'mapping_status': str(d.get('Mapping Status','')).strip(),
         }))
 
     _scored25.sort(key=lambda x: (-x[0], -x[1]))
@@ -4001,14 +4003,15 @@ def api_check_sir(request):
             'booth':    r02.get('booth',    ''),
         } if in_2002 else {},
         'record_2025': {
-            'name':     r25.get('name',     ''),
-            'relation': r25.get('relation', ''),
-            'house':    r25.get('house',    ''),
-            'gender':   r25.get('gender',   ''),
-            'age':      r25.get('age',      ''),
-            'voterid':  r25.get('voterid',  ''),
-            'booth':    r25.get('booth',    ''),
-            'ward':     r25.get('ward',     ''),
+            'name':           r25.get('name',           ''),
+            'relation':       r25.get('relation',       ''),
+            'house':          r25.get('house',          ''),
+            'gender':         r25.get('gender',         ''),
+            'age':            r25.get('age',            ''),
+            'voterid':        r25.get('voterid',        ''),
+            'booth':          r25.get('booth',          ''),
+            'ward':           r25.get('ward',           ''),
+            'mapping_status': r25.get('mapping_status', ''),
         } if in_2025 else {},
     }
     # Cache the result — persists to MongoDB so it survives server restarts/sleep
