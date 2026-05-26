@@ -64,6 +64,9 @@ urlpatterns = [
     # ── HMC Records (2025_new) — Religion filter ─────────────────────────────────
     path('hmc-records/',             views.api_hmc_records,             name='api_hmc_records'),
 
+    # ── Mapped / Not-Mapped Records (2025_new_mapped_notmapped_hmc) ──────────────
+    path('mapped-records/',          views.api_mapped_records,          name='api_mapped_records'),
+
     # ── Polled / NotPolled Records (2023_polled_notpolled_caste_comm_hmc) ─────────
     path('polled-records/',          views.api_polled_records,          name='api_polled_records'),
 

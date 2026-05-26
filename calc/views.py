@@ -8921,6 +8921,116 @@ def api_beneficiary_list(request):
     except Exception as e:
         return _ai_cors(request, JsonResponse({'success': False, 'error': str(e)}, status=500))
 
+# ─── MAPPED / NOT-MAPPED RECORDS (2025_new_mapped_notmapped_hmc) ─────────────
+@require_http_methods(['GET'])
+def api_mapped_records(request):
+    """
+    GET /api/mapped-records/
+    Query params:
+      mapping_status — 'Mapped' | 'NotMapped' | 'All'  (default 'All')
+      poll_status    — 'Polled' | 'NotPolled'  | 'All'  (default 'All')
+      page           — 1-based  (default 1)
+      limit          — max 100  (default 25)
+      q              — free-text search across Name, Epic No (optional)
+      ward           — Ward No filter (optional)
+      booth          — Booth No filter (optional)
+
+    Reads from '2025_new_mapped_notmapped_hmc' collection in SurveyDataBase (MONGODB_URL cluster).
+    """
+    mapping_status = request.GET.get('mapping_status', 'All').strip()
+    poll_status    = request.GET.get('poll_status',    'All').strip()
+
+    try:
+        page  = max(1, int(request.GET.get('page', 1)))
+    except (ValueError, TypeError):
+        page = 1
+    try:
+        limit = min(100, max(1, int(request.GET.get('limit', 25))))
+    except (ValueError, TypeError):
+        limit = 25
+
+    q     = request.GET.get('q',     '').strip()
+    ward  = request.GET.get('ward',  '').strip()
+    booth = request.GET.get('booth', '').strip()
+
+    try:
+        db         = get_db()
+        collection = db['2025_new_mapped_notmapped_hmc']
+
+        mongo_filter = {}
+
+        # Mapping Status stored as 'MAPPED' / 'NOT MAPPED'
+        if mapping_status == 'Mapped':
+            mongo_filter['Mapping Status'] = 'MAPPED'
+        elif mapping_status == 'NotMapped':
+            mongo_filter['Mapping Status'] = 'NOT MAPPED'
+
+        # Poll Status 2023 stored as 'POLLED' / 'NOT POLLED'
+        if poll_status == 'Polled':
+            mongo_filter['Poll Status 2023'] = 'POLLED'
+        elif poll_status == 'NotPolled':
+            mongo_filter['Poll Status 2023'] = 'NOT POLLED'
+
+        if ward:
+            try:
+                mongo_filter['Ward No'] = int(ward)
+            except ValueError:
+                mongo_filter['Ward No'] = ward
+
+        if booth:
+            try:
+                mongo_filter['Booth No'] = int(booth)
+            except ValueError:
+                mongo_filter['Booth No'] = booth
+
+        if q:
+            search_or = [
+                {'Name':    {'$regex': re.escape(q), '$options': 'i'}},
+                {'Epic No': {'$regex': re.escape(q), '$options': 'i'}},
+            ]
+            try:
+                search_or.append({'Booth No': int(q)})
+            except ValueError:
+                pass
+            mongo_filter = {'$and': [mongo_filter, {'$or': search_or}]} if mongo_filter else {'$or': search_or}
+
+        total_count = collection.count_documents(mongo_filter)
+        total_pages = max(1, math.ceil(total_count / limit))
+        page        = min(page, total_pages)
+        skip        = (page - 1) * limit
+
+        projection = {
+            '_id': 0,
+            'Epic No': 1, 'Name': 1, 'House No': 1,
+            'Relation Type': 1, 'Relative Name': 1,
+            'Age': 1, 'Gender': 1,
+            'Booth No': 1, 'Part No': 1, 'Ward No': 1,
+            'Community': 1, 'Category': 1, 'Confidence': 1,
+            'Mapping Status': 1, 'Poll Status 2023': 1,
+        }
+
+        records = list(collection.find(mongo_filter, projection).skip(skip).limit(limit))
+        for rec in records:
+            for k, v in rec.items():
+                if not isinstance(v, (str, int, float, bool, type(None))):
+                    rec[k] = str(v)
+
+        return JsonResponse({
+            'success':        True,
+            'mapping_status': mapping_status,
+            'poll_status':    poll_status,
+            'total_count':    total_count,
+            'total_pages':    total_pages,
+            'page':           page,
+            'limit':          limit,
+            'records':        records,
+        })
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+
 # ─── HMC RECORDS (2025_new) ────────────────────────────────────────────────────
 @require_http_methods(['GET'])
 def api_hmc_records(request):
