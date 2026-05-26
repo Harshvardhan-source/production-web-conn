@@ -61,6 +61,12 @@ urlpatterns = [
     path('community-records/',       views.api_community_records,       name='api_community_records'),
     path('debug-community/',         views.api_debug_community_values,  name='api_debug_community_values'),
 
+    # ── Community Breakdown Aggregation (2025_new_mapped_notmapped_hmc) ─────────
+    # GET /api/community-breakdown/              → constituency-wide counts
+    # GET /api/community-breakdown/?ward=<N>     → ward-level counts
+    # GET /api/community-breakdown/?ward=<N>&booth=<B> → booth-level counts
+    path('community-breakdown/',     views.api_community_breakdown,     name='api_community_breakdown'),
+
     # ── HMC Records (2025_new) — Religion filter ─────────────────────────────────
     path('hmc-records/',             views.api_hmc_records,             name='api_hmc_records'),
 

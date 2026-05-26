@@ -8921,6 +8921,71 @@ def api_beneficiary_list(request):
     except Exception as e:
         return _ai_cors(request, JsonResponse({'success': False, 'error': str(e)}, status=500))
 
+# ─── COMMUNITY BREAKDOWN AGGREGATION (2025_new_mapped_notmapped_hmc) ──────────
+@require_http_methods(['GET'])
+def api_community_breakdown(request):
+    """
+    GET /api/community-breakdown/
+    Query params:
+      ward  — Ward No filter (optional; omit for constituency-wide)
+      booth — Booth No filter (optional; requires ward)
+
+    Aggregates Community + Category counts from '2025_new_mapped_notmapped_hmc',
+    sorted by count descending.  Used by the Community Classification Panel on
+    the dashboard when a ward or booth is selected.
+
+    Response:
+      { success, ward, booth, total, rows: [{community, category, count}, …] }
+    """
+    ward  = request.GET.get('ward',  '').strip()
+    booth = request.GET.get('booth', '').strip()
+
+    try:
+        db         = get_db()
+        collection = db['2025_new_mapped_notmapped_hmc']
+
+        mongo_filter = {}
+        if ward:
+            try:
+                mongo_filter['Ward No'] = int(ward)
+            except ValueError:
+                mongo_filter['Ward No'] = ward
+        if booth:
+            try:
+                mongo_filter['Booth No'] = int(booth)
+            except ValueError:
+                mongo_filter['Booth No'] = booth
+
+        pipeline = [
+            {'$match': mongo_filter},
+            {'$group': {
+                '_id':   {'community': '$Community', 'category': '$Category'},
+                'count': {'$sum': 1},
+            }},
+            {'$sort': {'count': -1}},
+            {'$project': {
+                '_id':       0,
+                'community': '$_id.community',
+                'category':  '$_id.category',
+                'count':     1,
+            }},
+        ]
+
+        rows  = list(collection.aggregate(pipeline))
+        total = sum(r['count'] for r in rows)
+
+        return JsonResponse({
+            'success': True,
+            'ward':    ward  or None,
+            'booth':   booth or None,
+            'total':   total,
+            'rows':    rows,
+        })
+
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': str(e)}, status=500)
+
+
 # ─── MAPPED / NOT-MAPPED RECORDS (2025_new_mapped_notmapped_hmc) ─────────────
 @require_http_methods(['GET'])
 def api_mapped_records(request):
@@ -8949,9 +9014,10 @@ def api_mapped_records(request):
     except (ValueError, TypeError):
         limit = 25
 
-    q     = request.GET.get('q',     '').strip()
-    ward  = request.GET.get('ward',  '').strip()
-    booth = request.GET.get('booth', '').strip()
+    q         = request.GET.get('q',         '').strip()
+    ward      = request.GET.get('ward',      '').strip()
+    booth     = request.GET.get('booth',     '').strip()
+    community = request.GET.get('community', '').strip()
 
     try:
         db         = get_db()
@@ -8982,6 +9048,14 @@ def api_mapped_records(request):
                 mongo_filter['Booth No'] = int(booth)
             except ValueError:
                 mongo_filter['Booth No'] = booth
+
+        # Community filter — supports comma-joined list (OR across multiple names)
+        if community:
+            community_names = [c.strip() for c in community.split(',') if c.strip()]
+            if len(community_names) == 1:
+                mongo_filter['Community'] = community_names[0]
+            else:
+                mongo_filter['Community'] = {'$in': community_names}
 
         if q:
             search_or = [
