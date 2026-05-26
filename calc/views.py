@@ -9229,3 +9229,140 @@ def api_polled_records(request):
     except Exception as exc:
         traceback.print_exc()
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+# ─── POLLED BREAKDOWN — ward / booth level ────────────────────────────────────
+# GET /api/polled-breakdown/?ward=<N>          → all booths for that ward
+# GET /api/polled-breakdown/?ward=<N>&booth=<B> → single booth
+#
+# Source collection: 2023_polled_notpolled_caste_comm_hmc  (MONGODB_URL cluster)
+# Doc shape: { booth:int, religion:"H"|"M"|"C", Category:"...", Community:"...",
+#              "Polling Status":"Polled"|"NotPolled", age, gender, … }
+#
+# Returns:
+# {
+#   "hmc":       { "H":{"polled":N,"notPolled":N,"total":N}, "M":{…}, "C":{…}, "total":{…} },
+#   "category":  [ {"key":"Hindu - OBC","polled":N,"notPolled":N}, … ],  # sorted by total desc
+#   "community": [ {"key":"Devadiga",   "polled":N,"notPolled":N}, … ],
+# }
+# ─────────────────────────────────────────────────────────────────────────────
+
+_polled_breakdown_cache     = {}   # (ward, booth) → {'data': {...}, 'ts': float}
+_POLLED_BREAKDOWN_CACHE_TTL = 300  # 5 min
+
+@require_http_methods(['GET'])
+def api_polled_breakdown(request):
+    import time as _t
+
+    ward  = request.GET.get('ward',  '').strip()
+    booth = request.GET.get('booth', '').strip()
+
+    if not ward and not booth:
+        return JsonResponse(
+            {'success': False, 'message': 'ward or booth parameter required'},
+            status=400,
+        )
+
+    cache_key = (ward, booth)
+    cached = _polled_breakdown_cache.get(cache_key)
+    if cached and (_t.time() - cached['ts']) < _POLLED_BREAKDOWN_CACHE_TTL:
+        return JsonResponse({'success': True, **cached['data']})
+
+    try:
+        db   = get_db()
+        coll = db['2023_polled_notpolled_caste_comm_hmc']
+
+        # ── Build the $match filter ──────────────────────────────────────────
+        if booth:
+            # Booth level — match both int and str forms (MongoDB $in is type-strict)
+            try:
+                booth_int = int(booth)
+                match_filter = {'booth': {'$in': [booth_int, str(booth_int)]}}
+            except ValueError:
+                match_filter = {'booth': booth}
+        else:
+            # Ward level — expand to all booth numbers for that ward
+            try:
+                ward_int = int(ward)
+            except ValueError:
+                ward_int = None
+
+            ward_booths = WARD_FULL_DATA.get(ward_int, {}).get('booths', [])
+            if not ward_booths:
+                return JsonResponse(
+                    {'success': False, 'message': f'No booths found for ward {ward}'},
+                    status=404,
+                )
+            # Include both int and str forms for every booth
+            booth_vals = list(ward_booths) + [str(b) for b in ward_booths]
+            match_filter = {'booth': {'$in': booth_vals}}
+
+        # ── Helper: run one aggregation and pivot into {key: {polled, notPolled}} ──
+        def _agg(group_field):
+            pipeline = [
+                {'$match': match_filter},
+                {'$group': {
+                    '_id': {
+                        'key':    f'${group_field}',
+                        'status': '$Polling Status',
+                    },
+                    'n': {'$sum': 1},
+                }},
+            ]
+            rows = list(coll.aggregate(pipeline))
+            bucket = {}
+            for row in rows:
+                key    = row['_id'].get('key') or 'Unclassified'
+                status = row['_id'].get('status', '')
+                n      = row['n']
+                if key not in bucket:
+                    bucket[key] = {'polled': 0, 'notPolled': 0}
+                if status == 'Polled':
+                    bucket[key]['polled']    += n
+                else:
+                    bucket[key]['notPolled'] += n
+            # Sort by total desc
+            return [
+                {'key': k, 'polled': v['polled'], 'notPolled': v['notPolled']}
+                for k, v in sorted(
+                    bucket.items(),
+                    key=lambda x: -(x[1]['polled'] + x[1]['notPolled']),
+                )
+            ]
+
+        # ── HMC ──────────────────────────────────────────────────────────────
+        # religion field stores single letters: H / M / C  (occasionally lowercase)
+        hmc_raw = _agg('religion')
+        rel_norm = {'h': 'H', 'm': 'M', 'c': 'C', 'H': 'H', 'M': 'M', 'C': 'C',
+                    'Hindu': 'H', 'Muslim': 'M', 'Christian': 'C'}
+        hmc = {
+            'H':     {'polled': 0, 'notPolled': 0, 'total': 0},
+            'M':     {'polled': 0, 'notPolled': 0, 'total': 0},
+            'C':     {'polled': 0, 'notPolled': 0, 'total': 0},
+            'total': {'polled': 0, 'notPolled': 0, 'total': 0},
+        }
+        for row in hmc_raw:
+            k = rel_norm.get(str(row['key']).strip())
+            if not k:
+                continue
+            hmc[k]['polled']    += row['polled']
+            hmc[k]['notPolled'] += row['notPolled']
+            hmc['total']['polled']    += row['polled']
+            hmc['total']['notPolled'] += row['notPolled']
+        for k in ('H', 'M', 'C', 'total'):
+            hmc[k]['total'] = hmc[k]['polled'] + hmc[k]['notPolled']
+
+        # ── Category & Community ──────────────────────────────────────────────
+        category  = _agg('Category')
+        community = _agg('Community')
+
+        result = {
+            'hmc':       hmc,
+            'category':  category,
+            'community': community,
+        }
+        _polled_breakdown_cache[cache_key] = {'data': result, 'ts': _t.time()}
+        return JsonResponse({'success': True, **result})
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)

@@ -70,6 +70,11 @@ urlpatterns = [
     # ── Polled / NotPolled Records (2023_polled_notpolled_caste_comm_hmc) ─────────
     path('polled-records/',          views.api_polled_records,          name='api_polled_records'),
 
+    # ── Polled Breakdown — ward / booth level HMC + Category + Community ─────────
+    # GET /api/polled-breakdown/?ward=<N>            → all booths for that ward
+    # GET /api/polled-breakdown/?ward=<N>&booth=<B>  → single booth
+    path('polled-breakdown/',        views.api_polled_breakdown,        name='api_polled_breakdown'),
+
     # Wards
     path('wards/',                   views.api_wards,              name='api_wards'),
 
