@@ -4622,11 +4622,21 @@ def api_sir_confirmed_list(request):
 def api_sir_attach_form(request):
     """
     PATCH a confirmed SIR record (in SIR_ConfirmedMatches or SIR_ConfirmedNotFound)
-    with the AI-extracted Annexure-III form data.
+    with the AI-extracted Annexure-III form data AND the original form photo.
 
-    Payload:
-      doc_id          : str  — MongoDB ObjectId of the document to update
-      form_extraction : dict — structured JSON extracted from the physical form image
+    Accepts TWO content types (mirrors api_save_survey Aadhaar pattern):
+
+    ── Multipart/form-data (preferred — same credentials as Aadhaar upload) ──
+      doc_id          : form field (str)   — MongoDB ObjectId
+      form_extraction : form field (str)   — JSON-encoded extraction dict
+      form_image      : file field         — compressed JPEG (uploaded to GCS via
+                                             _upload_to_gcs, same as Aadhaar)
+
+    ── application/json (backward-compat / base64 fallback) ─────────────────
+      doc_id          : str
+      form_extraction : dict
+      form_image_b64  : str  (optional) — raw base64, no data-URL prefix
+      image_mime_type : str  (optional, default image/jpeg)
     """
     if request.method == 'OPTIONS':
         return _sir_options(request)
@@ -4635,77 +4645,101 @@ def api_sir_attach_form(request):
     if not user:
         return _sir_cors(request, JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401))
 
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        return JsonResponse({'success': False, 'message': 'Invalid JSON'}, status=400)
+    # ── Detect multipart vs JSON ──────────────────────────────────────────────
+    is_multipart    = bool(request.FILES.get('form_image'))
+    form_image_file = None    # Django InMemoryUploadedFile / TemporaryUploadedFile
+    raw_image       = ''      # base64 string (JSON path)
+    image_mime      = 'image/jpeg'
 
-    raw_id     = body.get('doc_id', '')
-    extraction = body.get('form_extraction', {})
+    if is_multipart:
+        # ── Same pattern as api_save_survey reading aadhaar_photo ────────────
+        raw_id     = request.POST.get('doc_id', '').strip()
+        extr_raw   = request.POST.get('form_extraction', '{}')
+        try:
+            extraction = json.loads(extr_raw)
+        except Exception:
+            return _sir_cors(request, JsonResponse({'success': False, 'message': 'form_extraction must be valid JSON'}, status=400))
+        form_image_file = request.FILES['form_image']
+        print(f"[sir_attach_form] MULTIPART | doc_id={raw_id} | file={form_image_file.name} size={form_image_file.size}B")
+    else:
+        # ── JSON path ─────────────────────────────────────────────────────────
+        try:
+            body = json.loads(request.body)
+        except Exception:
+            return _sir_cors(request, JsonResponse({'success': False, 'message': 'Invalid JSON'}, status=400))
+        raw_id     = body.get('doc_id', '').strip()
+        extraction = body.get('form_extraction', {})
+        raw_image  = body.get('form_image_b64', '')
+        image_mime = body.get('image_mime_type', 'image/jpeg')
 
     if not raw_id:
-        return JsonResponse({'success': False, 'message': 'doc_id is required'}, status=400)
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'doc_id is required'}, status=400))
     if not extraction:
-        return JsonResponse({'success': False, 'message': 'form_extraction is required'}, status=400)
-
-    raw_image  = body.get('form_image_b64', '')    # optional base64 image
-    image_mime = body.get('image_mime_type', 'image/jpeg')
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'form_extraction is required'}, status=400))
 
     try:
         oid = ObjectId(raw_id)
     except Exception:
-        return JsonResponse({'success': False, 'message': f'Invalid doc_id: {raw_id}'}, status=400)
+        return _sir_cors(request, JsonResponse({'success': False, 'message': f'Invalid doc_id: {raw_id}'}, status=400))
 
-    # ── Upload form image to GCS (if provided) ────────────────────────────────
-    # Uses _upload_bytes_to_gcs which takes raw bytes directly —
-    # no fake file-object needed, same proven temp-file pattern as _upload_to_gcs.
+    safe_id        = str(raw_id).replace('/', '_')
     form_image_url = None
-    if raw_image:
+
+    # ── Upload form photo to GCS ──────────────────────────────────────────────
+    if form_image_file:
+        # Multipart path — uses _upload_to_gcs (same function as Aadhaar in api_save_survey)
+        try:
+            ext       = _os.path.splitext(form_image_file.name)[1].lower() or '.jpg'
+            blob_name = f"sir_form_photos/{safe_id}_{_uuid.uuid4().hex[:8]}{ext}"
+            form_image_url = _upload_to_gcs(form_image_file, blob_name)
+            print(f"[sir_attach_form] ✓ GCS URL (multipart/_upload_to_gcs): {form_image_url}")
+        except Exception as gcs_err:
+            print(f"[sir_attach_form] ✗ GCS upload failed (multipart): {gcs_err}")
+            form_image_url = None
+
+    elif raw_image:
+        # JSON / base64 fallback path — uses _upload_bytes_to_gcs
         try:
             import base64 as _b64
             ext_map = {
                 'image/jpeg': '.jpg', 'image/jpg': '.jpg',
                 'image/png':  '.png', 'image/webp': '.webp',
-                'image/gif':  '.gif', 'image/heic': '.heic',
+                'image/heic': '.heic',
             }
-            ext       = ext_map.get(image_mime, '.jpg')
-            img_bytes = _b64.b64decode(raw_image)
-            safe_id   = str(raw_id).replace('/', '_')
-            blob_name = f"sir_form_photos/{safe_id}{ext}"
-
+            ext            = ext_map.get(image_mime, '.jpg')
+            img_bytes      = _b64.b64decode(raw_image)
+            blob_name      = f"sir_form_photos/{safe_id}{ext}"
             form_image_url = _upload_bytes_to_gcs(img_bytes, blob_name, content_type=image_mime)
-            print(f"[sir_attach_form] ✓ GCS URL: {form_image_url}")
-
+            print(f"[sir_attach_form] ✓ GCS URL (base64/_upload_bytes_to_gcs): {form_image_url}")
         except Exception as gcs_err:
-            # Non-fatal — log but still save extraction JSON
-            print(f"[sir_attach_form] ✗ GCS upload failed: {gcs_err}")
+            print(f"[sir_attach_form] ✗ GCS upload failed (base64): {gcs_err}")
             form_image_url = None
 
+    # ── Persist to MongoDB ────────────────────────────────────────────────────
     try:
         db     = get_db()
         fields = {
-            'form_extraction':          extraction,
-            'form_extraction_at':       datetime.now(timezone.utc),
-            'form_extraction_source':   'claude-vision-annexure-iii',
+            'form_extraction':        extraction,
+            'form_extraction_at':     datetime.now(timezone.utc),
+            'form_extraction_source': 'claude-vision-annexure-iii',
         }
-        # Store public GCS URL (never raw base64 in MongoDB)
         if form_image_url:
-            fields['form_image_url'] = form_image_url
+            fields['form_image_url'] = form_image_url   # GCS public URL, never raw base64
 
         update = {'$set': fields}
-        # Try both collections — we don't know which one this doc is in
+        # Try SIR_ConfirmedMatches first, then SIR_ConfirmedNotFound
         res = db['SIR_ConfirmedMatches'].update_one({'_id': oid}, update)
         if res.matched_count == 0:
             res = db['SIR_ConfirmedNotFound'].update_one({'_id': oid}, update)
 
         if res.matched_count == 0:
-            return _sir_cors(request, JsonResponse({'success': False, 'message': 'Document not found'}, status=404))
+            return _sir_cors(request, JsonResponse({'success': False, 'message': 'Document not found in either SIR collection'}, status=404))
 
         return _sir_cors(request, JsonResponse({
             'success':        True,
             'doc_id':         raw_id,
             'modified':       res.modified_count,
-            'form_image_url': form_image_url,   # ← frontend stores this for display
+            'form_image_url': form_image_url,   # frontend uses this to show the stored URL
         }))
     except Exception as exc:
         traceback.print_exc()
