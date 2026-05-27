@@ -4610,6 +4610,107 @@ def api_sir_attach_form(request):
 
 @csrf_exempt
 @require_http_methods(['POST', 'OPTIONS'])
+def api_sir_form_extract(request):
+    """
+    POST /api/sir/form-extract/
+
+    Server-side proxy for Annexure-III SIR form OCR.
+    The browser cannot call api.anthropic.com directly (CORS).  This
+    endpoint receives the base64 image, forwards it to Claude on the
+    server, and returns the structured extraction JSON.
+
+    Body (JSON):
+      {
+        "image":     "<base64-encoded image bytes>",
+        "mimeType":  "image/jpeg" | "image/png" | "image/webp"
+      }
+
+    Response (JSON):
+      { "success": true,  "data": { <extracted fields> } }
+      { "success": false, "message": "<error>" }
+    """
+    if request.method == 'OPTIONS':
+        return _sir_options(request)
+
+    user = _user_from_request(request)
+    if not user:
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'Unauthorized'}, status=401))
+
+    try:
+        body      = json.loads(request.body)
+        image_b64 = body.get('image', '').strip()
+        mime_type = body.get('mimeType', 'image/jpeg').strip()
+    except Exception:
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'Invalid JSON body'}, status=400))
+
+    if not image_b64:
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'Missing image data'}, status=400))
+
+    SYSTEM_PROMPT = (
+        "You are an expert OCR system for Indian electoral Annexure-III Enumeration Forms. "
+        "Extract ALL visible information and return ONLY a valid JSON object with this exact structure:\n"
+        "{\n"
+        '  "personal": { "dateOfBirth": "", "aadhaarNo": "", "mobileNo": "", '
+        '"fathersGuardianName": "", "fathersGuardianEpicNo": "", "mothersName": "", '
+        '"mothersEpicNo": "", "spouseName": "", "spouseEpicNo": "" },\n'
+        '  "electorDetails": { "electorName": "", "epicNo": "", "relativeName": "", '
+        '"relationship": "", "district": "", "state": "", "acName": "", "acNumber": "", '
+        '"partNo": "", "srNo": "" },\n'
+        '  "relativeDetails": { "name": "", "epicNo": "", "relativeName": "", '
+        '"relationship": "", "district": "", "state": "", "acName": "", "acNumber": "", '
+        '"partNo": "", "srNo": "" },\n'
+        '  "preprinted": { "serialNo": "", "partNo": "", "acPcName": "", "state": "", '
+        '"electorName": "", "epicNo": "", "address": "" },\n'
+        '  "meta": { "confidence": "high", "missingFields": [], "notes": "" }\n'
+        "}\n"
+        'Return ONLY the JSON. Use "" for blank/unreadable fields. '
+        "List blank field names in missingFields."
+    )
+
+    try:
+        client = _get_anthropic()
+        message = client.messages.create(
+            model='claude-sonnet-4-20250514',
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=[{
+                'role': 'user',
+                'content': [
+                    {
+                        'type': 'image',
+                        'source': {
+                            'type':       'base64',
+                            'media_type': mime_type,
+                            'data':       image_b64,
+                        },
+                    },
+                    {
+                        'type': 'text',
+                        'text': 'Extract all fields from this Annexure-III SIR form. Return only JSON.',
+                    },
+                ],
+            }],
+            timeout=30.0,
+        )
+        raw   = ''.join(b.text for b in message.content if hasattr(b, 'text')).strip()
+        raw   = raw.lstrip('```json').lstrip('```').rstrip('```').strip()
+        data  = json.loads(raw)
+        return _sir_cors(request, JsonResponse({'success': True, 'data': data}))
+
+    except json.JSONDecodeError as exc:
+        return _sir_cors(request, JsonResponse({
+            'success': False,
+            'message': f'Claude returned non-JSON: {exc}',
+        }, status=500))
+    except Exception as exc:
+        return _sir_cors(request, JsonResponse({
+            'success': False,
+            'message': str(exc),
+        }, status=500))
+
+
+@csrf_exempt
+@require_http_methods(['POST', 'OPTIONS'])
 def api_sir_bulk(request):
     if request.method == 'OPTIONS':
         return _sir_options(request)
