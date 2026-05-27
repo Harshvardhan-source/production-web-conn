@@ -4318,6 +4318,10 @@ def api_sir_confirm_match(request):
       • One or both absent          → SIR_ConfirmedNotFound
         (reuses the existing SIR_NotFound collection for "not found" verdicts)
     """
+    user = _user_from_request(request)
+    if not user:
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401))
+
     try:
         body = json.loads(request.body)
     except Exception:
@@ -4352,6 +4356,8 @@ def api_sir_confirm_match(request):
         'not_found_2002': nf02,
         'search_inputs':  search_inputs,
         'confirmed_at':   datetime.now(timezone.utc),
+        # Track who saved this record for audit trail
+        'confirmed_by':   user.get('Username') or user.get('Email') or 'unknown',
         # Convenience top-level fields for easy querying.
         # When both rolls are "not found", rec25 and rec02 are both None, so we
         # fall back to whatever the user typed in the search inputs.
@@ -4564,6 +4570,11 @@ def api_sir_attach_form(request):
     """
     if request.method == 'OPTIONS':
         return _sir_options(request)
+
+    user = _user_from_request(request)
+    if not user:
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401))
+
     try:
         body = json.loads(request.body)
     except Exception:
@@ -4577,20 +4588,27 @@ def api_sir_attach_form(request):
     if not extraction:
         return JsonResponse({'success': False, 'message': 'form_extraction is required'}, status=400)
 
+    raw_image  = body.get('form_image_b64', '')   # optional — store original photo for re-extraction
+    image_mime = body.get('image_mime_type', 'image/jpeg')
+
     try:
         oid = ObjectId(raw_id)
     except Exception:
         return JsonResponse({'success': False, 'message': f'Invalid doc_id: {raw_id}'}, status=400)
 
     try:
-        db      = get_db()
-        update  = {
-            '$set': {
-                'form_extraction':          extraction,
-                'form_extraction_at':       datetime.now(timezone.utc),
-                'form_extraction_source':   'claude-vision-annexure-iii',
-            }
+        db     = get_db()
+        fields = {
+            'form_extraction':          extraction,
+            'form_extraction_at':       datetime.now(timezone.utc),
+            'form_extraction_source':   'claude-vision-annexure-iii',
         }
+        # Persist the original image so staff can re-extract or audit later.
+        # Stored as base64 string; kept only if the caller sent it.
+        if raw_image:
+            fields['form_image_b64']   = raw_image
+            fields['form_image_mime']  = image_mime
+        update  = {'$set': fields}
         # Try both collections — we don't know which one this doc is in
         res = db['SIR_ConfirmedMatches'].update_one({'_id': oid}, update)
         if res.matched_count == 0:
@@ -4671,7 +4689,9 @@ def api_sir_form_extract(request):
         client = _get_anthropic()
         message = client.messages.create(
             model='claude-sonnet-4-20250514',
-            max_tokens=1000,
+            # 1500 tokens: Annexure-III has 4 sections × ~10 fields = ~40 fields.
+            # With keys + values the JSON can be ~1200 tokens; 1000 caused truncation.
+            max_tokens=1500,
             system=SYSTEM_PROMPT,
             messages=[{
                 'role': 'user',
@@ -4690,19 +4710,27 @@ def api_sir_form_extract(request):
                     },
                 ],
             }],
-            timeout=30.0,
+            timeout=45.0,   # bumped from 30s — large images on slow connections need more
         )
-        raw   = ''.join(b.text for b in message.content if hasattr(b, 'text')).strip()
-        raw   = raw.lstrip('```json').lstrip('```').rstrip('```').strip()
-        data  = json.loads(raw)
+        raw = ''.join(b.text for b in message.content if hasattr(b, 'text')).strip()
+        # Strip any markdown code fences Claude might add despite the system prompt
+        import re as _re
+        raw = _re.sub(r'^```(?:json)?\s*', '', raw, flags=_re.MULTILINE)
+        raw = _re.sub(r'\s*```$',          '', raw, flags=_re.MULTILINE)
+        raw = raw.strip()
+        data = json.loads(raw)
         return _sir_cors(request, JsonResponse({'success': True, 'data': data}))
 
     except json.JSONDecodeError as exc:
+        # Return raw text so the frontend can show a useful error + the actual response
+        raw_preview = raw[:300] if 'raw' in dir() else '(no response)'
         return _sir_cors(request, JsonResponse({
             'success': False,
             'message': f'Claude returned non-JSON: {exc}',
+            'raw_preview': raw_preview,
         }, status=500))
     except Exception as exc:
+        traceback.print_exc()
         return _sir_cors(request, JsonResponse({
             'success': False,
             'message': str(exc),
