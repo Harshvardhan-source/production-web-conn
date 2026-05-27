@@ -2717,18 +2717,36 @@ def _norm(v):
 #   Epic NO, Name, Relation Name, House No, Gender, Age, Booth No, Part No
 
 def _flat_2025(doc):
+    """Normalise a raw 2025 roll document into a consistent flat dict.
+
+    Handles two field-name schemas transparently:
+    ┌─────────────────┬───────────────────────────────┬──────────────────────────────┐
+    │ Field           │ Old ('2025')                  │ New ('2025_new_..._hmc')      │
+    ├─────────────────┼───────────────────────────────┼──────────────────────────────┤
+    │ Voter ID        │ Epic NO                       │ Epic No                      │
+    │ Relation / rel  │ Relation Name                 │ Relative Name                │
+    │ All others      │ Name / House No / Gender / …  │ same                         │
+    └─────────────────┴───────────────────────────────┴──────────────────────────────┘
+    """
     if not doc:
         return {}
+    def _g(*keys):
+        """Return the first non-empty value from candidate field names."""
+        for k in keys:
+            v = doc.get(k)
+            if v is not None and str(v).strip() not in ('', 'nan', 'NaN', 'NAN'):
+                return str(v)
+        return ''
     return {
-        'name':           _norm(doc.get('Name', '')),
-        'relation':       _norm(doc.get('Relation Name', '')),
-        'house':          _norm(doc.get('House No', '')),
-        'voterid':        _norm(doc.get('Epic NO', '')),
-        'gender':         _norm(doc.get('Gender', '')),
-        'age':            str(doc.get('Age', '')).strip(),
-        'booth':          str(doc.get('Booth No', '')),
-        'ward':           str(doc.get('Part No', '')),
-        'mapping_status': str(doc.get('Mapping Status', '')).strip(),
+        'name':           _norm(_g('Name')),
+        'relation':       _norm(_g('Relative Name', 'Relation Name')),
+        'house':          _norm(_g('House No')),
+        'voterid':        _norm(_g('Epic No', 'Epic NO')),
+        'gender':         _norm(_g('Gender')),
+        'age':            _g('Age'),
+        'booth':          _g('Booth No'),
+        'ward':           _g('Ward No', 'Part No'),
+        'mapping_status': _g('Mapping Status'),
     }
 
 
@@ -3162,12 +3180,20 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
     Tier 4 no-house + relation : 88  (must match BOTH name and relation well)
     Tier 4 no-house, name only : 90  (very high bar without corroborating field)
     """
-    _PROJ = {'Name':1,'Relation Name':1,'Epic NO':1,
-             'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1}
+    _PROJ = {
+        'Name': 1,
+        'Relation Name': 1, 'Relative Name': 1,   # old / new schema
+        'Epic NO': 1,       'Epic No': 1,          # old / new schema
+        'House No': 1, 'Gender': 1, 'Age': 1,
+        'Booth No': 1, 'Part No': 1, 'Ward No': 1,
+        'Mapping Status': 1,
+    }
 
     # ── Tier 1: EPIC exact ────────────────────────────────────────────────────
     if voterid:
-        doc = col.find_one({'Epic NO': voterid}, _PROJ)
+        doc = col.find_one(
+            {'$or': [{'Epic NO': voterid}, {'Epic No': voterid}]}, _PROJ
+        )
         if doc:
             return bson_clean(doc)
 
@@ -3333,7 +3359,7 @@ def _run_sir_analysis(voterid, name, house, ward, booth, serial, relation='',
     if write_db is None:
         write_db = read_db
 
-    col_2025 = read_db['2025']
+    col_2025 = read_db['2025_new_mapped_notmapped_hmc']
     col_2002 = get_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
 
     # ── Look up in both rolls — parallel threads ─────────────────────────────────
@@ -3459,7 +3485,7 @@ def _run_sir_analysis(voterid, name, house, ward, booth, serial, relation='',
             suspicious.append({'flag': 'OUT_OF_STATE_EPIC', 'label': 'Out-of-State EPIC',
                                 'detail': f'Prefix "{prefix}" is not a Karnataka code.',
                                 'value': voterid})
-        dup = col_2025.count_documents({'Epic NO': voterid})
+        dup = col_2025.count_documents({'$or': [{'Epic NO': voterid}, {'Epic No': voterid}]})
         if dup > 1:
             suspicious.append({'flag': 'DUPLICATE_EPIC', 'label': 'Duplicate EPIC',
                                 'detail': f'EPIC "{voterid}" appears {dup} times in the 2025 list.',
@@ -3547,7 +3573,7 @@ def api_check_sir(request):
         return _sir_cors(request, JsonResponse({'success': True, **sir}))
 
     # ── Read-only preview (no DB writes) ──────────────────────────────────────
-    col_2025 = db['2025_new_mapped_notmapped']
+    col_2025 = db['2025_new_mapped_notmapped_hmc']
     col_2002 = get_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
 
     # ── Pre-compute name tokens and prefix variants ─────────────────────────────────────────
@@ -3558,7 +3584,14 @@ def api_check_sir(request):
     _name_tok         = _name_tokens_list[0] if _name_tokens_list else ''
     _name_prefixes    = _gen_prefixes(_name_tok) if _name_tok else ()
 
-    _PROJ_25 = {'Name':1,'Relation Name':1,'Epic NO':1,'House No':1,'Gender':1,'Age':1,'Booth No':1,'Part No':1,'Mapping Status':1}
+    _PROJ_25 = {
+        'Name': 1,
+        'Relation Name': 1, 'Relative Name': 1,   # old / new schema
+        'Epic NO': 1,       'Epic No': 1,          # old / new schema
+        'House No': 1, 'Gender': 1, 'Age': 1,
+        'Booth No': 1, 'Part No': 1, 'Ward No': 1,
+        'Mapping Status': 1,
+    }
     _PROJ_02 = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
                 'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,
                 'Gender':1,'Age':1,'Booth No':1,'Part No':1,'Serial No':1}
@@ -3648,7 +3681,10 @@ def api_check_sir(request):
                     if oid not in seen: seen.add(oid); _raw25.append(bson_clean(d))
 
             if voterid:
-                _add(col_2025.find({'Epic NO':voterid}, _PROJ_25).limit(5))
+                _add(col_2025.find(
+                    {'$or': [{'Epic NO': voterid}, {'Epic No': voterid}]},
+                    _PROJ_25
+                ).limit(5))
 
             if house:
                 _add(col_2025.find({'House No':house}, _PROJ_25).limit(60))
@@ -3765,7 +3801,7 @@ def api_check_sir(request):
                 'detail': 'Prefix "{}" is not a recognised Karnataka EPIC code.'.format(prefix),
                 'value': voterid,
             })
-        dup = col_2025.count_documents({'Epic NO': voterid})
+        dup = col_2025.count_documents({'$or': [{'Epic NO': voterid}, {'Epic No': voterid}]})
         if dup > 1:
             suspicious.append({
                 'flag': 'DUPLICATE_EPIC', 'label': 'Duplicate EPIC',
@@ -3983,10 +4019,13 @@ def api_check_sir(request):
 
     _scored25 = []
     for d in _raw25:
-        rn  = _norm(d.get('Name',''))
-        rr  = _norm(d.get('Relation Name',''))
-        rh  = _norm(d.get('House No',''))
-        re_ = _norm(d.get('Epic NO',''))
+        # Use _flat_2025 so field-name aliases (Relative Name / Relation Name,
+        # Epic No / Epic NO) are resolved the same way throughout.
+        _f25     = _flat_2025(d)
+        rn  = _f25['name']
+        rr  = _f25['relation']
+        rh  = _f25['house']
+        re_ = _f25['voterid']
         flags = _flags25(rn, rr, rh, re_)
         if not flags: continue
         n_sc25 = _name_score(name, rn)     if name     else 0.0
@@ -4008,13 +4047,13 @@ def api_check_sir(request):
             _c25 = min(_c25, 55.0)
         _scored25.append((len([f for f in flags if f != 'partial']), _c25, {
             'name': rn, 'relation': rr, 'house': rh, 'voterid': re_,
-            'gender': _norm(d.get('Gender','')),
-            'age':    str(d.get('Age','')).strip(),
-            'booth':  str(d.get('Booth No','')).strip(),
-            'part':   str(d.get('Part No','')).strip(),
+            'gender': _f25['gender'],
+            'age':    _f25['age'],
+            'booth':  _f25['booth'],
+            'part':   _f25['ward'],
             'score':  round(min(100.0, _c25)),
             'matched_by': flags,
-            'mapping_status': str(d.get('Mapping Status','')).strip(),
+            'mapping_status': _f25['mapping_status'],
         }))
 
     _scored25.sort(key=lambda x: (-x[0], -x[1]))
