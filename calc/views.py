@@ -4439,15 +4439,20 @@ def api_sir_confirmed_list(request):
             'record_2025': 1, 'record_2002': 1,
             'not_found_2025': 1, 'not_found_2002': 1,
             'search_inputs': 1, 'confirmed_at': 1,
+            # ── Form extraction (Annexure-III AI data) ────────────────────────
+            'form_extraction': 1, 'form_extraction_at': 1,
+            'form_extraction_source': 1,
         }
 
         def _serialize(docs):
             out = []
             for d in docs:
                 d['_id'] = str(d['_id'])
-                ca = d.get('confirmed_at')
-                if hasattr(ca, 'isoformat'):
-                    d['confirmed_at'] = ca.isoformat()
+                # Serialise datetime fields
+                for dt_field in ('confirmed_at', 'form_extraction_at'):
+                    dt_val = d.get(dt_field)
+                    if hasattr(dt_val, 'isoformat'):
+                        d[dt_field] = dt_val.isoformat()
                 out.append(d)
             return out
 
