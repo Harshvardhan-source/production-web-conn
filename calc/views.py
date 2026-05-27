@@ -1957,6 +1957,60 @@ def _upload_to_gcs(file_obj, destination_blob_name):
             pass
 
 
+def _upload_bytes_to_gcs(image_bytes, destination_blob_name, content_type='image/jpeg'):
+    """
+    Upload raw bytes to GCS. Returns the public HTTPS URL or raises on error.
+    Follows the exact same pattern as _upload_to_gcs (temp-file + upload_from_filename).
+    """
+    import os as _os, json as _json, tempfile as _tmp
+    from google.cloud import storage as _gcs
+    from google.oauth2 import service_account as _sa
+
+    bucket_name = _os.environ.get('GCS_BUCKET_NAME', '')
+    creds_json  = _os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON', '')
+
+    if not bucket_name:
+        raise ValueError('GCS_BUCKET_NAME env var is not set')
+    if not creds_json:
+        raise ValueError('GOOGLE_APPLICATION_CREDENTIALS_JSON env var is not set')
+
+    creds_dict  = _json.loads(creds_json)
+    credentials = _sa.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=[
+            'https://www.googleapis.com/auth/cloud-platform',
+            'https://www.googleapis.com/auth/devstorage.full_control',
+        ],
+    )
+    client = _gcs.Client(credentials=credentials, project=creds_dict.get('project_id'))
+    bucket = client.bucket(bucket_name)
+    blob   = bucket.blob(destination_blob_name)
+
+    # Write bytes to a temp file, then upload_from_filename (proven pattern)
+    ext = _os.path.splitext(destination_blob_name)[1] or '.jpg'
+    with _tmp.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp.write(image_bytes)
+        tmp_path = tmp.name
+
+    try:
+        blob.upload_from_filename(tmp_path, content_type=content_type)
+        try:
+            blob.make_public()
+            public_url = blob.public_url
+        except Exception as _acl_err:
+            print(f"[GCS] make_public() skipped ({_acl_err}); using direct URL.")
+            public_url = f"https://storage.googleapis.com/{bucket_name}/{destination_blob_name}"
+
+        print(f"[GCS] ✓ Uploaded bytes → gs://{bucket_name}/{destination_blob_name}")
+        print(f"[GCS] ✓ Public URL: {public_url}")
+        return public_url
+    finally:
+        try:
+            _os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 @csrf_exempt
 @require_http_methods(['POST'])
 def api_save_deceased(request):
@@ -4603,51 +4657,27 @@ def api_sir_attach_form(request):
         return JsonResponse({'success': False, 'message': f'Invalid doc_id: {raw_id}'}, status=400)
 
     # ── Upload form image to GCS (if provided) ────────────────────────────────
+    # Uses _upload_bytes_to_gcs which takes raw bytes directly —
+    # no fake file-object needed, same proven temp-file pattern as _upload_to_gcs.
     form_image_url = None
     if raw_image:
         try:
-            import base64 as _b64, tempfile as _tmp, os as _os
-
-            # Decode base64 → temp file
+            import base64 as _b64
             ext_map = {
                 'image/jpeg': '.jpg', 'image/jpg': '.jpg',
                 'image/png':  '.png', 'image/webp': '.webp',
                 'image/gif':  '.gif', 'image/heic': '.heic',
             }
-            ext      = ext_map.get(image_mime, '.jpg')
+            ext       = ext_map.get(image_mime, '.jpg')
             img_bytes = _b64.b64decode(raw_image)
-
-            with _tmp.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                tmp.write(img_bytes)
-                tmp_path = tmp.name
-
-            # Build a file-like object that _upload_to_gcs() expects
-            class _FakeDjangoFile:
-                def __init__(self, path, name, content_type):
-                    self.name         = name
-                    self.content_type = content_type
-                    self._path        = path
-                    self._f           = open(path, 'rb')
-                def seek(self, n):   self._f.seek(n)
-                def read(self):      return self._f.read()
-                def chunks(self):    yield self._f.read()
-                def close(self):     self._f.close()
-
-            # Derive a safe filename from the doc_id
             safe_id   = str(raw_id).replace('/', '_')
             blob_name = f"sir_form_photos/{safe_id}{ext}"
-            fake_file = _FakeDjangoFile(tmp_path, f"sir_form{ext}", image_mime)
 
-            try:
-                form_image_url = _upload_to_gcs(fake_file, blob_name)
-                print(f"[sir_attach_form] ✓ GCS URL: {form_image_url}")
-            finally:
-                fake_file.close()
-                try: _os.unlink(tmp_path)
-                except OSError: pass
+            form_image_url = _upload_bytes_to_gcs(img_bytes, blob_name, content_type=image_mime)
+            print(f"[sir_attach_form] ✓ GCS URL: {form_image_url}")
 
         except Exception as gcs_err:
-            # GCS failure is non-fatal — log it but still save extraction JSON
+            # Non-fatal — log but still save extraction JSON
             print(f"[sir_attach_form] ✗ GCS upload failed: {gcs_err}")
             form_image_url = None
 
