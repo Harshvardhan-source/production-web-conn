@@ -4442,6 +4442,7 @@ def api_sir_confirmed_list(request):
             # ── Form extraction (Annexure-III AI data) ────────────────────────
             'form_extraction': 1, 'form_extraction_at': 1,
             'form_extraction_source': 1,
+            'form_image_url': 1,          # GCS public URL of the original form photo
         }
 
         def _serialize(docs):
@@ -4593,13 +4594,62 @@ def api_sir_attach_form(request):
     if not extraction:
         return JsonResponse({'success': False, 'message': 'form_extraction is required'}, status=400)
 
-    raw_image  = body.get('form_image_b64', '')   # optional — store original photo for re-extraction
+    raw_image  = body.get('form_image_b64', '')    # optional base64 image
     image_mime = body.get('image_mime_type', 'image/jpeg')
 
     try:
         oid = ObjectId(raw_id)
     except Exception:
         return JsonResponse({'success': False, 'message': f'Invalid doc_id: {raw_id}'}, status=400)
+
+    # ── Upload form image to GCS (if provided) ────────────────────────────────
+    form_image_url = None
+    if raw_image:
+        try:
+            import base64 as _b64, tempfile as _tmp, os as _os
+
+            # Decode base64 → temp file
+            ext_map = {
+                'image/jpeg': '.jpg', 'image/jpg': '.jpg',
+                'image/png':  '.png', 'image/webp': '.webp',
+                'image/gif':  '.gif', 'image/heic': '.heic',
+            }
+            ext      = ext_map.get(image_mime, '.jpg')
+            img_bytes = _b64.b64decode(raw_image)
+
+            with _tmp.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp.write(img_bytes)
+                tmp_path = tmp.name
+
+            # Build a file-like object that _upload_to_gcs() expects
+            class _FakeDjangoFile:
+                def __init__(self, path, name, content_type):
+                    self.name         = name
+                    self.content_type = content_type
+                    self._path        = path
+                    self._f           = open(path, 'rb')
+                def seek(self, n):   self._f.seek(n)
+                def read(self):      return self._f.read()
+                def chunks(self):    yield self._f.read()
+                def close(self):     self._f.close()
+
+            # Derive a safe filename from the doc_id
+            safe_id   = str(raw_id).replace('/', '_')
+            blob_name = f"sir_form_photos/{safe_id}{ext}"
+            fake_file = _FakeDjangoFile(tmp_path, f"sir_form{ext}", image_mime)
+
+            try:
+                form_image_url = _upload_to_gcs(fake_file, blob_name)
+                print(f"[sir_attach_form] ✓ GCS URL: {form_image_url}")
+            finally:
+                fake_file.close()
+                try: _os.unlink(tmp_path)
+                except OSError: pass
+
+        except Exception as gcs_err:
+            # GCS failure is non-fatal — log it but still save extraction JSON
+            print(f"[sir_attach_form] ✗ GCS upload failed: {gcs_err}")
+            form_image_url = None
 
     try:
         db     = get_db()
@@ -4608,12 +4658,11 @@ def api_sir_attach_form(request):
             'form_extraction_at':       datetime.now(timezone.utc),
             'form_extraction_source':   'claude-vision-annexure-iii',
         }
-        # Persist the original image so staff can re-extract or audit later.
-        # Stored as base64 string; kept only if the caller sent it.
-        if raw_image:
-            fields['form_image_b64']   = raw_image
-            fields['form_image_mime']  = image_mime
-        update  = {'$set': fields}
+        # Store public GCS URL (never raw base64 in MongoDB)
+        if form_image_url:
+            fields['form_image_url'] = form_image_url
+
+        update = {'$set': fields}
         # Try both collections — we don't know which one this doc is in
         res = db['SIR_ConfirmedMatches'].update_one({'_id': oid}, update)
         if res.matched_count == 0:
@@ -4623,9 +4672,10 @@ def api_sir_attach_form(request):
             return _sir_cors(request, JsonResponse({'success': False, 'message': 'Document not found'}, status=404))
 
         return _sir_cors(request, JsonResponse({
-            'success':  True,
-            'doc_id':   raw_id,
-            'modified': res.modified_count,
+            'success':        True,
+            'doc_id':         raw_id,
+            'modified':       res.modified_count,
+            'form_image_url': form_image_url,   # ← frontend stores this for display
         }))
     except Exception as exc:
         traceback.print_exc()
