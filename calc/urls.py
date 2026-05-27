@@ -48,6 +48,7 @@ urlpatterns = [
     path('sir/check/',               views.api_check_sir,          name='api_check_sir'),
     path('sir/confirm/',             views.api_sir_confirm_match,   name='api_sir_confirm_match'),
     path('sir/confirmed/',           views.api_sir_confirmed_list,  name='api_sir_confirmed_list'),
+    path('sir/attach-form/',         views.api_sir_attach_form,     name='api_sir_attach_form'),
     path('sir-data/',                views.api_sir_data,           name='api_sir_data'),
     path('sir-bulk/',                views.api_sir_bulk,           name='api_sir_bulk'),
     path('sir/records/',             views.api_sir_records,        name='api_sir_records'),

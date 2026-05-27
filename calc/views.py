@@ -4325,10 +4325,10 @@ def api_sir_confirm_match(request):
     try:
         survey_db = get_db()
         if status == 'MATCHED':
-            survey_db['SIR_ConfirmedMatches'].insert_one(doc)
+            result = survey_db['SIR_ConfirmedMatches'].insert_one(doc)
         else:
-            survey_db['SIR_ConfirmedNotFound'].insert_one(doc)
-        return _sir_cors(request, JsonResponse({'success': True, 'status': status}))
+            result = survey_db['SIR_ConfirmedNotFound'].insert_one(doc)
+        return _sir_cors(request, JsonResponse({'success': True, 'status': status, 'doc_id': str(result.inserted_id)}))
     except Exception as exc:
         traceback.print_exc()
         return _sir_cors(request, JsonResponse({'success': False, 'message': str(exc)}, status=500))
@@ -4508,6 +4508,66 @@ def api_sir_confirmed_list(request):
         'voter_record_2002': r02,
     }
 
+
+
+
+# ─── SIR: Attach extracted form data to an existing confirmed record ──────────
+@csrf_exempt
+@require_http_methods(['POST', 'OPTIONS'])
+def api_sir_attach_form(request):
+    """
+    PATCH a confirmed SIR record (in SIR_ConfirmedMatches or SIR_ConfirmedNotFound)
+    with the AI-extracted Annexure-III form data.
+
+    Payload:
+      doc_id          : str  — MongoDB ObjectId of the document to update
+      form_extraction : dict — structured JSON extracted from the physical form image
+    """
+    if request.method == 'OPTIONS':
+        return _sir_options(request)
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        return JsonResponse({'success': False, 'message': 'Invalid JSON'}, status=400)
+
+    raw_id     = body.get('doc_id', '')
+    extraction = body.get('form_extraction', {})
+
+    if not raw_id:
+        return JsonResponse({'success': False, 'message': 'doc_id is required'}, status=400)
+    if not extraction:
+        return JsonResponse({'success': False, 'message': 'form_extraction is required'}, status=400)
+
+    try:
+        oid = ObjectId(raw_id)
+    except Exception:
+        return JsonResponse({'success': False, 'message': f'Invalid doc_id: {raw_id}'}, status=400)
+
+    try:
+        db      = get_db()
+        update  = {
+            '$set': {
+                'form_extraction':          extraction,
+                'form_extraction_at':       datetime.now(timezone.utc),
+                'form_extraction_source':   'claude-vision-annexure-iii',
+            }
+        }
+        # Try both collections — we don't know which one this doc is in
+        res = db['SIR_ConfirmedMatches'].update_one({'_id': oid}, update)
+        if res.matched_count == 0:
+            res = db['SIR_ConfirmedNotFound'].update_one({'_id': oid}, update)
+
+        if res.matched_count == 0:
+            return _sir_cors(request, JsonResponse({'success': False, 'message': 'Document not found'}, status=404))
+
+        return _sir_cors(request, JsonResponse({
+            'success':  True,
+            'doc_id':   raw_id,
+            'modified': res.modified_count,
+        }))
+    except Exception as exc:
+        traceback.print_exc()
+        return _sir_cors(request, JsonResponse({'success': False, 'message': str(exc)}, status=500))
 
 @csrf_exempt
 @require_http_methods(['POST', 'OPTIONS'])
