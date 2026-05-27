@@ -3043,6 +3043,24 @@ def _score_candidates(candidates, flat_fn, name, relation):
         if n_toks >= 2 and tok_cov_pct < 0.5:
             comp = min(comp, 62.0)
 
+        # ── Relation token-coverage guard ─────────────────────────────────────
+        # Mirrors the name multi-token guard above.
+        # partial_ratio inflates scores whenever two relations share any common
+        # token (typically the surname).  "MADHAVARAYA KAMATH" vs "VAMANA KAMATH"
+        # scores ~75 because "KAMATH" is a perfect substring — but only 1 of the 2
+        # query tokens actually appears in the candidate.
+        # Rule: if strictly ≤50 % of the query relation tokens (≥2 chars) are
+        # found in the candidate relation, force comp below all thresholds.
+        # For a 2-token query this requires BOTH tokens to match (100 %);
+        # for a 3-token query it allows 2 of 3 (67 %); etc.
+        # Single-token relation queries are unaffected (they fall into the else branch).
+        if name and relation and cand_rel:
+            _rel_toks = [t for t in relation.split() if len(t) >= 2]
+            if len(_rel_toks) >= 2:
+                _rel_cov = sum(1 for t in _rel_toks if t in cand_rel)
+                if _rel_cov / len(_rel_toks) <= 0.5:
+                    comp = min(comp, 55.0)   # below all thresholds (60/78/88/90)
+
         comp = max(comp, 0.0)
 
         if comp > best_score:
@@ -3850,7 +3868,20 @@ def api_check_sir(request):
         elif has_name and cov02 > 0:                                     matched_by.append('partial')
         if has_house and h_ok:                                           matched_by.append('house')
         _rel_match_threshold = 35 if _relation_only_search else 60
-        if has_rel   and r_sc >= _rel_match_threshold:                   matched_by.append('relation')
+        if has_rel and r_sc >= _rel_match_threshold:
+            # Token-coverage guard: for multi-token relation queries, strictly
+            # more than half the tokens must appear in the candidate relation.
+            _rel_toks02 = [t for t in relation.split() if len(t) >= 2]
+            _cand_rel02 = flat.get('relation', '') or ''
+            if len(_rel_toks02) >= 2:
+                _rel_cov02 = sum(1 for t in _rel_toks02 if t in _cand_rel02)
+                _rel_ok02 = _rel_cov02 / len(_rel_toks02) > 0.5
+            else:
+                _rel_ok02 = True
+            if _rel_ok02:
+                matched_by.append('relation')
+            elif _relation_only_search:
+                matched_by.append('partial')
 
         _scored02.append({
             'comp':        comp,
@@ -3935,7 +3966,19 @@ def api_check_sir(request):
             # variants like VAMANA / VAMAN don't fall below the gate entirely.
             _rel_threshold = 35 if _relation_only_search else 60
             if _name_score(relation, rr) >= _rel_threshold:
-                flags.append('relation')
+                # Token-coverage guard: for multi-token relation queries, strictly
+                # more than half the tokens must appear in the candidate relation.
+                # Prevents a shared surname ("KAMATH") from flagging unrelated people.
+                _rel_toks25 = [t for t in relation.split() if len(t) >= 2]
+                if len(_rel_toks25) >= 2:
+                    _rel_cov25 = sum(1 for t in _rel_toks25 if t in (rr or ''))
+                    _rel_ok25 = _rel_cov25 / len(_rel_toks25) > 0.5
+                else:
+                    _rel_ok25 = True  # single-token query — trust the score
+                if _rel_ok25:
+                    flags.append('relation')
+                elif _relation_only_search:
+                    flags.append('partial')
         return flags
 
     _scored25 = []
