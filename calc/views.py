@@ -9990,3 +9990,149 @@ def api_polled_breakdown(request):
     except Exception as exc:
         traceback.print_exc()
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+# ─── COMMUNITY MAPPING & POLL RATES (2025_new_mapped_notmapped_hmc) ──────────
+# GET /api/community-map-poll-rates/
+#
+# Returns per-community aggregation using UNIQUE House No counts (not voter
+# counts) so the "Houses" column matches physical households, not voter rows.
+#
+# Response shape:
+# {
+#   "success": true,
+#   "summary": {
+#     "totalHouses": N,          // unique House No across whole collection
+#     "mapped": N, "mappedPct": F,
+#     "notMapped": N, "notMappedPct": F,
+#     "polled": N,  "polledPct": F,
+#     "notPolled": N, "notPolledPct": F,
+#     "totalVoters": N
+#   },
+#   "communities": [
+#     {
+#       "community": "Muslim",
+#       "houses": N,             // UNIQUE House No count for this community
+#       "voters": N,             // total voter rows
+#       "mapped": N, "mappedPct": F,
+#       "polled": N,  "polledPct": F
+#     }, ...
+#   ]
+# }
+# ─────────────────────────────────────────────────────────────────────────────
+
+_comm_map_poll_cache     = {}          # key → {'data': {...}, 'ts': float}
+_COMM_MAP_POLL_CACHE_TTL = 600         # 10 min — collection rarely changes
+
+@require_http_methods(['GET'])
+def api_community_map_poll_rates(request):
+    import time as _t
+
+    cache_key = 'global'
+    cached = _comm_map_poll_cache.get(cache_key)
+    if cached and (_t.time() - cached['ts']) < _COMM_MAP_POLL_CACHE_TTL:
+        return JsonResponse({'success': True, **cached['data']})
+
+    try:
+        db   = get_db()
+        coll = db['2025_new_mapped_notmapped_hmc']
+
+        # ── Per-community aggregation ─────────────────────────────────────────
+        # Use $addToSet to collect unique House No values per community, then
+        # $size to count them.  For mapped/polled we sum conditional flags.
+        pipeline = [
+            {'$group': {
+                '_id':          '$Community',
+                'uniqueHouses': {'$addToSet': '$House No'},
+                'voters':       {'$sum': 1},
+                'mapped': {'$sum': {
+                    '$cond': [{'$eq': ['$Mapping Status', 'MAPPED']}, 1, 0]
+                }},
+                'polled': {'$sum': {
+                    '$cond': [{'$eq': ['$Poll Status 2023', 'POLLED']}, 1, 0]
+                }},
+            }},
+            {'$project': {
+                '_id':       0,
+                'community': '$_id',
+                'houses':    {'$size': '$uniqueHouses'},
+                'voters':    1,
+                'mapped':    1,
+                'polled':    1,
+                'mappedPct': {'$round': [
+                    {'$cond': [
+                        {'$eq': ['$voters', 0]}, 0,
+                        {'$multiply': [{'$divide': ['$mapped', '$voters']}, 100]}
+                    ]}, 1
+                ]},
+                'polledPct': {'$round': [
+                    {'$cond': [
+                        {'$eq': ['$voters', 0]}, 0,
+                        {'$multiply': [{'$divide': ['$polled', '$voters']}, 100]}
+                    ]}, 1
+                ]},
+            }},
+            {'$sort': {'houses': -1}},
+        ]
+
+        communities = list(coll.aggregate(pipeline, allowDiskUse=True))
+
+        # Sanitise community name — replace None / empty with 'Unclassified'
+        for row in communities:
+            if not row.get('community'):
+                row['community'] = 'Unclassified'
+
+        # ── Overall summary ───────────────────────────────────────────────────
+        # Count unique House No across the ENTIRE collection in one pass.
+        summary_pipeline = [
+            {'$group': {
+                '_id':          None,
+                'uniqueHouses': {'$addToSet': '$House No'},
+                'voters':       {'$sum': 1},
+                'mapped': {'$sum': {
+                    '$cond': [{'$eq': ['$Mapping Status', 'MAPPED']}, 1, 0]
+                }},
+                'polled': {'$sum': {
+                    '$cond': [{'$eq': ['$Poll Status 2023', 'POLLED']}, 1, 0]
+                }},
+            }},
+            {'$project': {
+                '_id':         0,
+                'totalHouses': {'$size': '$uniqueHouses'},
+                'totalVoters': '$voters',
+                'mapped':      1,
+                'polled':      1,
+            }},
+        ]
+        s_rows = list(coll.aggregate(summary_pipeline, allowDiskUse=True))
+        if s_rows:
+            s = s_rows[0]
+            total_h  = s['totalHouses']
+            total_v  = s['totalVoters']
+            mapped_v = s['mapped']
+            polled_v = s['polled']
+        else:
+            total_h = total_v = mapped_v = polled_v = 0
+
+        def pct(num, den):
+            return round((num / den) * 100, 1) if den else 0.0
+
+        summary = {
+            'totalHouses':   total_h,
+            'totalVoters':   total_v,
+            'mapped':        mapped_v,
+            'mappedPct':     pct(mapped_v, total_v),
+            'notMapped':     total_v - mapped_v,
+            'notMappedPct':  pct(total_v - mapped_v, total_v),
+            'polled':        polled_v,
+            'polledPct':     pct(polled_v, total_v),
+            'notPolled':     total_v - polled_v,
+            'notPolledPct':  pct(total_v - polled_v, total_v),
+        }
+
+        result = {'summary': summary, 'communities': communities}
+        _comm_map_poll_cache[cache_key] = {'data': result, 'ts': _t.time()}
+        return JsonResponse({'success': True, **result})
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
