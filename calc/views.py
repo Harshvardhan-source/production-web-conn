@@ -4739,13 +4739,15 @@ def api_sir_attach_form(request):
     if is_multipart:
         # ── Same pattern as api_save_survey reading aadhaar_photo ────────────
         raw_id     = request.POST.get('doc_id', '').strip()
-        extr_raw   = request.POST.get('form_extraction', '{}')
+        extr_raw   = request.POST.get('form_extraction', '')
         try:
-            extraction = json.loads(extr_raw)
+            extraction = json.loads(extr_raw) if extr_raw else {}
         except Exception:
-            return _sir_cors(request, JsonResponse({'success': False, 'message': 'form_extraction must be valid JSON'}, status=400))
-        form_image_file = request.FILES['form_image']
-        print(f"[sir_attach_form] MULTIPART | doc_id={raw_id} | file={form_image_file.name} size={form_image_file.size}B")
+            extraction = {}
+        form_image_file = request.FILES.get('form_image')   # optional — image may not always be sent
+        print(f"[sir_attach_form] MULTIPART | doc_id={raw_id} | "
+              f"file={form_image_file.name if form_image_file else 'none'} | "
+              f"extraction={'yes' if extraction else 'no'}")
     else:
         # ── JSON path ─────────────────────────────────────────────────────────
         try:
@@ -4759,8 +4761,9 @@ def api_sir_attach_form(request):
 
     if not raw_id:
         return _sir_cors(request, JsonResponse({'success': False, 'message': 'doc_id is required'}, status=400))
-    if not extraction:
-        return _sir_cors(request, JsonResponse({'success': False, 'message': 'form_extraction is required'}, status=400))
+    # form_extraction is optional — a call may only update the image URL (extraction done separately)
+    if not extraction and not form_image_file and not raw_image:
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'Nothing to update: provide form_extraction and/or form_image'}, status=400))
 
     try:
         oid = ObjectId(raw_id)
@@ -4804,16 +4807,20 @@ def api_sir_attach_form(request):
     # ── Persist to MongoDB ────────────────────────────────────────────────────
     try:
         db     = get_db()
-        fields = {
-            'form_extraction':        extraction,
-            'form_extraction_at':     datetime.now(timezone.utc),
-            'form_extraction_source': 'claude-vision-annexure-iii',
-        }
+        fields = {}
+        # Only update extraction if provided
+        if extraction:
+            fields['form_extraction']        = extraction
+            fields['form_extraction_at']     = datetime.now(timezone.utc)
+            fields['form_extraction_source'] = 'claude-vision-annexure-iii'
+        # Only update image URL if GCS upload succeeded
         if form_image_url:
-            fields['form_image_url'] = form_image_url   # GCS public URL, never raw base64
+            fields['form_image_url'] = form_image_url
+
+        if not fields:
+            return _sir_cors(request, JsonResponse({'success': True, 'doc_id': raw_id, 'modified': 0, 'message': 'Nothing to update'}))
 
         update = {'$set': fields}
-        # Try SIR_ConfirmedMatches first, then SIR_ConfirmedNotFound
         res = db['SIR_ConfirmedMatches'].update_one({'_id': oid}, update)
         if res.matched_count == 0:
             res = db['SIR_ConfirmedNotFound'].update_one({'_id': oid}, update)
@@ -4822,10 +4829,11 @@ def api_sir_attach_form(request):
             return _sir_cors(request, JsonResponse({'success': False, 'message': 'Document not found in either SIR collection'}, status=404))
 
         return _sir_cors(request, JsonResponse({
-            'success':        True,
-            'doc_id':         raw_id,
-            'modified':       res.modified_count,
-            'form_image_url': form_image_url,   # frontend uses this to show the stored URL
+            'success':          True,
+            'doc_id':           raw_id,
+            'modified':         res.modified_count,
+            'form_image_url':   form_image_url,
+            'form_image_error': form_image_error if 'form_image_error' in dir() else None,
         }))
     except Exception as exc:
         traceback.print_exc()
