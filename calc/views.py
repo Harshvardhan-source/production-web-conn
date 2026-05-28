@@ -83,6 +83,23 @@ for _wnum, _wdata in WARD_FULL_DATA.items():
 # ward_name (upper) → list of booth ints
 WARD_NAME_TO_BOOTHS = {v["name"].upper(): v["booths"] for v in WARD_FULL_DATA.values()}
 
+# ── HMC label derived from Community field in 2025_new_mapped_notmapped_hmc ─────
+# Used in MongoDB $addFields to convert Community string → H / M / C label.
+# Reused by both api_ward_dashboard and api_booth_dashboard.
+_CHRISTIAN_COMMUNITIES = [
+    'Christian', 'Mangalorean Catholic', 'Christian + Catholic',
+    'Roman Catholic', 'Catholic', 'RC',
+]
+HMC_FROM_COMMUNITY = {
+    '$switch': {
+        'branches': [
+            {'case': {'$eq':  ['$Community', 'Muslim']},       'then': 'M'},
+            {'case': {'$in':  ['$Community', _CHRISTIAN_COMMUNITIES]}, 'then': 'C'},
+        ],
+        'default': 'H',   # Hindu + Unclassified + all other communities
+    }
+}
+
 # ── 2023 polled/notpolled collection uses SurveyOpt-style ward names ───────────
 # Maps WARD_FULL_DATA name (UPPER) → ward name stored in 2023_polled_notpolled
 _WARD_FULL_TO_CSV = {
@@ -968,36 +985,46 @@ def api_ward_dashboard(request):
         rmap        = {r['_id']: r['n'] for r in s_res['religions']}
         reg_religion= {r: rmap.get(r, 0) for r in religions}
 
-        # ── 3. Large families + HMC from 2025 voter list ────────────────────
-        # Use module-level WARD_NAME_TO_BOOTHS — no local copy needed
+        # ── 3. Voter counts + HMC + large families from 2025_new_mapped_notmapped_hmc ──
+        # Use Booth No field (int + str forms) mapped from WARD_FULL_DATA booth lists.
+        # Community field → H/M/C via HMC_FROM_COMMUNITY $switch expression.
         ward_name_upper  = ward_name.upper().strip()
         ward_booths_list = WARD_NAME_TO_BOOTHS.get(ward_name_upper, [])
+        if not ward_booths_list and ward_num_key:
+            ward_booths_list = WARD_FULL_DATA.get(ward_num_key, {}).get('booths', [])
 
-        # Include BOTH string and integer forms of each booth number.
-        # Part No in the 2025 collection may be stored as int or str — $in is type-strict.
+        # Both int and str forms — MongoDB $in is type-strict
+        booth_ints = list(ward_booths_list)
         booth_strs = [str(b) for b in ward_booths_list]
-        booth_ints = list(ward_booths_list)   # already ints from WARD_FULL_DATA
 
         large_family_count = 0
-        ward_hmc = {'H': 0, 'M': 0, 'C': 0, 'total': 0}
+        ward_hmc  = {'H': 0, 'M': 0, 'C': 0, 'total': 0}
+        ward_voter_total  = 0
+        ward_voter_male   = 0
+        ward_voter_female = 0
+
         if ward_booths_list:
-            booth_match = {'Part No': {'$in': booth_strs + booth_ints}}  # str + int forms
+            booth_match = {'Booth No': {'$in': booth_ints + booth_strs}}
             lf_pipeline = [
                 {'$match': booth_match},
+                {'$addFields': {'_hmc': HMC_FROM_COMMUNITY}},
                 {'$facet': {
                     'large_families': [
-                        {'$match': {'House No': {'$exists': True, '$ne': None}}},
+                        {'$match': {'House No': {'$exists': True, '$ne': None, '$ne': ''}}},
                         {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
                         {'$match': {'count': {'$gt': 15}}},
                         {'$count': 'n'},
                     ],
                     'hmc': [
-                        {'$match': {'Predicted_Religion_Label': {'$in': ['H', 'M', 'C']}}},
-                        {'$group': {'_id': '$Predicted_Religion_Label', 'n': {'$sum': 1}}},
+                        {'$group': {'_id': '$_hmc', 'n': {'$sum': 1}}},
                     ],
+                    'genders': [
+                        {'$group': {'_id': '$Gender', 'n': {'$sum': 1}}},
+                    ],
+                    'total': [{'$count': 'n'}],
                 }}
             ]
-            lf_result = list(db['2025'].aggregate(lf_pipeline))
+            lf_result = list(db['2025_new_mapped_notmapped_hmc'].aggregate(lf_pipeline))
             if lf_result:
                 r = lf_result[0]
                 large_family_count = r['large_families'][0]['n'] if r.get('large_families') else 0
@@ -1008,6 +1035,16 @@ def api_ward_dashboard(request):
                     'C': hmc_map.get('C', 0),
                     'total': sum(hmc_map.get(k, 0) for k in ('H', 'M', 'C')),
                 }
+                ward_voter_total  = r['total'][0]['n'] if r.get('total')   else 0
+                gmap_vl = {g['_id']: g['n'] for g in r.get('genders', [])}
+                ward_voter_male   = gmap_vl.get('Male',   0)
+                ward_voter_female = gmap_vl.get('Female', 0)
+
+        # Fall back to WardReference totalCount if collection returned 0
+        if not ward_voter_total:
+            ward_voter_total  = total_voters
+            ward_voter_male   = total_male
+            ward_voter_female = total_female
 
         # ── 4. Polled/NotPolled HMC from 2023_polled_notpolled for this ward ───
         # FIX 1: 2023_polled_notpolled is on SURVEY cluster (get_survey_db), not main db.
@@ -1029,7 +1066,7 @@ def api_ward_dashboard(request):
             ward_polled_hmc = None
 
         # ── 5. Coverage ───────────────────────────────────────────────────────
-        denom        = total_voters or 1
+        denom        = ward_voter_total or total_voters or 1
         coverage_pct = round(total_reg / denom * 100, 1)
 
         result = {
@@ -1037,10 +1074,11 @@ def api_ward_dashboard(request):
             'wardNumber':       ward,
             'districtId':       district_id,
             'constituencyId':   const_id,
-            'totalVoters':      total_voters,
-            'totalMale':        total_male,
-            'totalFemale':      total_female,
-            'totalTrans':       total_trans,
+            # Voter totals from 2025_new_mapped_notmapped_hmc (Booth No-based query)
+            'totalVoters':      ward_voter_total,
+            'totalMale':        ward_voter_male,
+            'totalFemale':      ward_voter_female,
+            'totalTrans':       total_trans,           # kept from WardReference
             'totalHindu':       total_hindu,
             'totalMuslim':      total_muslim,
             'totalChristian':   total_chr,
@@ -1152,28 +1190,28 @@ def api_booth_dashboard(request):
         house_count = s_res['houses'][0]['n'] if s_res['houses'] else 0
         gmap        = {g['_id']: g['n'] for g in s_res['genders']}
 
-        # ── 3. HMC from 2025 voter list for this booth ────────────────────────
-        # IMPORTANT: Part No may be stored as int OR string in MongoDB.
-        # $in does strict type matching, so we include BOTH forms to guarantee a hit.
-        booth_vals = list({booth, str(booth_int)} if booth_int is not None else {booth})
+        # ── 3. Voter counts + HMC + gender from 2025_new_mapped_notmapped_hmc ──────
+        # Query by Booth No (int + str). Community field → H/M/C via HMC_FROM_COMMUNITY.
+        booth_vals = []
         if booth_int is not None:
-            booth_vals.append(booth_int)   # ← integer form — critical for collections
-                                           #   where Part No is stored as int (e.g. 31, not "31")
+            booth_vals = [booth_int, str(booth_int)]   # int form first (more common)
+        else:
+            booth_vals = [booth, str(booth)]
+
         booth_voter_pipeline = [
-            {'$match': {'Part No': {'$in': booth_vals}}},
+            {'$match': {'Booth No': {'$in': booth_vals}}},
+            {'$addFields': {'_hmc': HMC_FROM_COMMUNITY}},
             {'$facet': {
                 'hmc': [
-                    {'$match': {'Predicted_Religion_Label': {'$in': ['H', 'M', 'C']}}},
-                    {'$group': {'_id': '$Predicted_Religion_Label', 'n': {'$sum': 1}}},
+                    {'$group': {'_id': '$_hmc', 'n': {'$sum': 1}}},
                 ],
-                # 2025 stores Gender as full strings: "Male" / "Female"
                 'genders': [
                     {'$group': {'_id': '$Gender', 'n': {'$sum': 1}}},
                 ],
                 'total': [{'$count': 'n'}],
             }}
         ]
-        bv_result   = list(main_db['2025'].aggregate(booth_voter_pipeline))
+        bv_result   = list(main_db['2025_new_mapped_notmapped_hmc'].aggregate(booth_voter_pipeline))
         bv_facet    = bv_result[0] if bv_result else {}
 
         hmc_map     = {g['_id']: g['n'] for g in bv_facet.get('hmc', [])}
@@ -1191,7 +1229,9 @@ def api_booth_dashboard(request):
         booth_total_voters = bv_facet['total'][0]['n'] if bv_facet.get('total') else 0
 
         total_electors = _num(booth_doc.get('totalElectors'))
-        coverage_pct   = round(total_reg / (total_electors or 1) * 100, 1)
+        # Use voter count from 2025_new_mapped_notmapped_hmc if WardBoothWise_2026 has no data
+        denom_electors = total_electors or booth_total_voters or 1
+        coverage_pct   = round(total_reg / denom_electors * 100, 1)
 
         # ── 4. Polled/NotPolled HMC from 2023_polled_notpolled for this booth ──
         # FIX: 2023_polled_notpolled is on the SURVEY cluster, not main db.
