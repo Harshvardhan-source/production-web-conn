@@ -1028,33 +1028,7 @@ def api_ward_dashboard(request):
         except Exception:
             ward_polled_hmc = None
 
-        # ── 5. Mapping counts from 2025_new_mapped_notmapped_hmc ──────────
-        # Query by Booth No (int) matching the ward’s booths.
-        ward_mapping = {'mapped': 0, 'notMapped': 0, 'total': 0,
-                        'pctMapped': 0.0, 'pctNotMapped': 0.0}
-        if ward_booths_list:
-            try:
-                col_hmc = db['2025_new_mapped_notmapped_hmc']
-                booth_ints_for_hmc = [int(b) for b in ward_booths_list if str(b).isdigit()]
-                mapping_pipeline = [
-                    {'$match': {'Booth No': {'$in': booth_ints_for_hmc}}},
-                    {'$group': {'_id': '$Mapping Status', 'count': {'$sum': 1}}},
-                ]
-                mmap = {r['_id']: r['count'] for r in col_hmc.aggregate(mapping_pipeline)}
-                _mapped     = mmap.get('MAPPED', 0)
-                _not_mapped = mmap.get('NOT MAPPED', 0)
-                _total_hmc  = _mapped + _not_mapped
-                ward_mapping = {
-                    'mapped':       _mapped,
-                    'notMapped':    _not_mapped,
-                    'total':        _total_hmc,
-                    'pctMapped':    round(_mapped     / _total_hmc * 100, 1) if _total_hmc else 0.0,
-                    'pctNotMapped': round(_not_mapped / _total_hmc * 100, 1) if _total_hmc else 0.0,
-                }
-            except Exception:
-                pass  # non-fatal — leave zeros
-
-        # ── 6. Coverage ───────────────────────────────────────────────────────
+        # ── 5. Coverage ───────────────────────────────────────────────────────
         denom        = total_voters or 1
         coverage_pct = round(total_reg / denom * 100, 1)
 
@@ -1086,7 +1060,6 @@ def api_ward_dashboard(request):
             'wardCoverage':     {ward_name: coverage_pct},
             'coveragePct':      coverage_pct,
             'ward2026':         ward_ref_2026,
-            'wardMapping':      ward_mapping,
         }
 
         _ward_dash_cache[ward] = {'data': result, 'ts': _t.time()}
@@ -1233,30 +1206,6 @@ def api_booth_dashboard(request):
         except Exception:
             booth_polled_hmc = None
 
-        # ── 5. Mapping counts from 2025_new_mapped_notmapped_hmc ──────────
-        booth_mapping = {'mapped': 0, 'notMapped': 0, 'total': 0,
-                         'pctMapped': 0.0, 'pctNotMapped': 0.0}
-        if booth_int is not None:
-            try:
-                col_hmc_b = main_db['2025_new_mapped_notmapped_hmc']
-                bmap_pipeline = [
-                    {'$match': {'Booth No': booth_int}},
-                    {'$group': {'_id': '$Mapping Status', 'count': {'$sum': 1}}},
-                ]
-                bmap = {r['_id']: r['count'] for r in col_hmc_b.aggregate(bmap_pipeline)}
-                _b_mapped     = bmap.get('MAPPED', 0)
-                _b_not_mapped = bmap.get('NOT MAPPED', 0)
-                _b_total      = _b_mapped + _b_not_mapped
-                booth_mapping = {
-                    'mapped':       _b_mapped,
-                    'notMapped':    _b_not_mapped,
-                    'total':        _b_total,
-                    'pctMapped':    round(_b_mapped     / _b_total * 100, 1) if _b_total else 0.0,
-                    'pctNotMapped': round(_b_not_mapped / _b_total * 100, 1) if _b_total else 0.0,
-                }
-            except Exception:
-                pass  # non-fatal
-
         result = {
             'wardNumber':        ward,
             'wardName':          ward_name,
@@ -1288,7 +1237,6 @@ def api_booth_dashboard(request):
             'boothHMC':          booth_hmc,
             # Polled/NotPolled HMC from 2023 election data
             'polledHMC':         booth_polled_hmc,
-            'boothMapping':      booth_mapping,
         }
 
         _booth_dash_cache[cache_key] = {'data': result, 'ts': _t.time()}
