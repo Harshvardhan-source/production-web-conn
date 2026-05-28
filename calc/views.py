@@ -4808,9 +4808,9 @@ def api_sir_form_extract(request):
         client = _get_anthropic()
         message = client.messages.create(
             model='claude-sonnet-4-20250514',
-            # 1500 tokens: Annexure-III has 4 sections × ~10 fields = ~40 fields.
-            # With keys + values the JSON can be ~1200 tokens; 1000 caused truncation.
-            max_tokens=1500,
+            # 1200 tokens is enough for Annexure-III (~40 fields × name+value).
+            # Lower token limit = faster response = stays well under Render's 30 s proxy timeout.
+            max_tokens=1200,
             system=SYSTEM_PROMPT,
             messages=[{
                 'role': 'user',
@@ -4829,7 +4829,11 @@ def api_sir_form_extract(request):
                     },
                 ],
             }],
-            timeout=45.0,   # bumped from 30s — large images on slow connections need more
+            # ⚠️  Keep well under Render's 30 s request timeout.
+            # If this call exceeds 30 s, Render's nginx returns a 504 *without*
+            # CORS headers → browser sees "No Access-Control-Allow-Origin".
+            # 25 s gives the view time to serialise and return before that happens.
+            timeout=25.0,
         )
         raw = ''.join(b.text for b in message.content if hasattr(b, 'text')).strip()
         # Strip any markdown code fences Claude might add despite the system prompt
