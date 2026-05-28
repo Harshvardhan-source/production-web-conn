@@ -4360,31 +4360,62 @@ def api_sir_confirm_match(request):
     """
     Persist a user-confirmed SIR match decision.
 
-    Payload:
-      record_2025    : dict | null   — the 2025 roll row the user ticked (null if absent)
-      record_2002    : dict | null   — the 2002 roll row the user ticked (null if absent)
+    Accepts two content types:
+
+    ── Multipart/form-data (preferred — includes GCS image upload in one call) ──
+      sir_data       : form field (JSON)  — confirmation payload (see below)
+      form_extraction: form field (JSON)  — optional AI-extracted form data
+      form_image     : file field         — optional compressed JPEG → GCS
+
+    ── application/json (no image) ──────────────────────────────────────────────
+      record_2025, record_2002, not_found_2025, not_found_2002, search_inputs
+
+    Payload fields (inside sir_data or JSON body):
+      record_2025    : dict | null   — the 2025 roll row the user ticked
+      record_2002    : dict | null   — the 2002 roll row the user ticked
       not_found_2025 : bool          — user explicitly marked "not in 2025"
       not_found_2002 : bool          — user explicitly marked "not in 2002"
-      search_inputs  : dict          — { name, epic, house, relation } typed by the user
+      search_inputs  : dict          — { name, epic, house, relation }
 
     Storage rules:
       • Both records confirmed      → SIR_ConfirmedMatches
       • One or both absent          → SIR_ConfirmedNotFound
-        (reuses the existing SIR_NotFound collection for "not found" verdicts)
     """
     user = _user_from_request(request)
     if not user:
         return _sir_cors(request, JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401))
 
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        return JsonResponse({'success': False, 'message': 'Invalid JSON'}, status=400)
+    # ── Detect multipart vs JSON ──────────────────────────────────────────────
+    is_multipart    = bool(request.FILES.get('form_image') or request.POST.get('sir_data'))
+    form_image_file = request.FILES.get('form_image')   # may be None
+    form_extraction = None
+    form_image_url  = None
+    form_image_error= None
 
-    rec25       = body.get('record_2025')   # dict or None
-    rec02       = body.get('record_2002')   # dict or None
-    nf25        = bool(body.get('not_found_2025', False))
-    nf02        = bool(body.get('not_found_2002', False))
+    if is_multipart:
+        raw_sir = request.POST.get('sir_data', '{}')
+        try:
+            body = json.loads(raw_sir)
+        except Exception:
+            return _sir_cors(request, JsonResponse({'success': False, 'message': 'Invalid sir_data JSON'}, status=400))
+        raw_ext = request.POST.get('form_extraction', '')
+        if raw_ext:
+            try:
+                form_extraction = json.loads(raw_ext)
+            except Exception:
+                form_extraction = None
+        print(f"[sir_confirm] MULTIPART | image={'yes' if form_image_file else 'no'} "
+              f"extraction={'yes' if form_extraction else 'no'}")
+    else:
+        try:
+            body = json.loads(request.body)
+        except Exception:
+            return _sir_cors(request, JsonResponse({'success': False, 'message': 'Invalid JSON'}, status=400))
+
+    rec25         = body.get('record_2025')
+    rec02         = body.get('record_2002')
+    nf25          = bool(body.get('not_found_2025', False))
+    nf02          = bool(body.get('not_found_2002', False))
     search_inputs = body.get('search_inputs', {})
 
     # Determine status
@@ -4392,7 +4423,7 @@ def api_sir_confirm_match(request):
     has02 = bool(rec02 and rec02.get('name'))
 
     if has25 and has02:
-        status = 'MATCHED'            # voter confirmed in both rolls
+        status = 'MATCHED'
     elif nf25 and nf02:
         status = 'NOT_FOUND_BOTH'
     elif nf25 or not has25:
@@ -4410,16 +4441,31 @@ def api_sir_confirm_match(request):
         'not_found_2002': nf02,
         'search_inputs':  search_inputs,
         'confirmed_at':   datetime.now(timezone.utc),
-        # Track who saved this record for audit trail
         'confirmed_by':   user.get('Username') or user.get('Email') or 'unknown',
-        # Convenience top-level fields for easy querying.
-        # When both rolls are "not found", rec25 and rec02 are both None, so we
-        # fall back to whatever the user typed in the search inputs.
         'name':     (rec25 or rec02 or {}).get('name', '') or search_inputs.get('name', ''),
         'voterid':  (rec25 or rec02 or {}).get('voterid', '') or search_inputs.get('epic', ''),
         'house':    (rec25 or rec02 or {}).get('house', '') or search_inputs.get('house', ''),
         'relation': (rec25 or rec02 or {}).get('relation', '') or search_inputs.get('relation', ''),
     }
+
+    # ── Upload form photo to GCS and embed URL in the same document ───────────
+    if form_image_file:
+        try:
+            ext       = _os.path.splitext(form_image_file.name)[1].lower() or '.jpg'
+            # Use a temp unique name — real _id not yet known, use timestamp + random suffix
+            blob_name = f"sir_form_photos/pending_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{_uuid.uuid4().hex[:8]}{ext}"
+            form_image_url = _upload_to_gcs(form_image_file, blob_name)
+            doc['form_image_url'] = form_image_url
+            print(f"[sir_confirm] ✓ GCS URL: {form_image_url}")
+        except Exception as gcs_err:
+            form_image_error = str(gcs_err)
+            print(f"[sir_confirm] ✗ GCS upload failed: {gcs_err}")
+
+    # ── Embed form extraction in the same document ────────────────────────────
+    if form_extraction:
+        doc['form_extraction']        = form_extraction
+        doc['form_extraction_at']     = datetime.now(timezone.utc)
+        doc['form_extraction_source'] = 'claude-vision-annexure-iii'
 
     try:
         survey_db = get_db()
@@ -4427,7 +4473,45 @@ def api_sir_confirm_match(request):
             result = survey_db['SIR_ConfirmedMatches'].insert_one(doc)
         else:
             result = survey_db['SIR_ConfirmedNotFound'].insert_one(doc)
-        return _sir_cors(request, JsonResponse({'success': True, 'status': status, 'doc_id': str(result.inserted_id)}))
+
+        # After insert, rename the GCS blob to use the real _id for traceability
+        if form_image_url and form_image_file:
+            try:
+                real_id   = str(result.inserted_id)
+                ext       = _os.path.splitext(form_image_file.name)[1].lower() or '.jpg'
+                new_blob  = f"sir_form_photos/{real_id}{ext}"
+                # Rename by copy + delete (GCS has no native rename)
+                from google.cloud import storage as _gcs_mod
+                bucket_name = _os.environ.get('GCS_BUCKET_NAME', '')
+                if bucket_name:
+                    import json as _j2
+                    from google.oauth2 import service_account as _sa2
+                    creds = _sa2.Credentials.from_service_account_info(
+                        _j2.loads(_os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON', '{}')),
+                        scopes=['https://www.googleapis.com/auth/cloud-platform'],
+                    )
+                    gcs   = _gcs_mod.Client(credentials=creds, project=creds.service_account_email.split('@')[0] if hasattr(creds, 'service_account_email') else None)
+                    bucket = gcs.bucket(bucket_name)
+                    old_b  = bucket.blob(form_image_url.split(bucket_name + '/')[1] if bucket_name in form_image_url else '')
+                    if old_b.name:
+                        new_b  = bucket.copy_blob(old_b, bucket, new_blob)
+                        new_b.make_public()
+                        new_url = new_b.public_url
+                        old_b.delete()
+                        # Update MongoDB with the cleaner URL
+                        coll = survey_db['SIR_ConfirmedMatches'] if status == 'MATCHED' else survey_db['SIR_ConfirmedNotFound']
+                        coll.update_one({'_id': result.inserted_id}, {'$set': {'form_image_url': new_url}})
+                        form_image_url = new_url
+            except Exception as rename_err:
+                print(f"[sir_confirm] ⚠ blob rename failed (non-fatal): {rename_err}")
+
+        return _sir_cors(request, JsonResponse({
+            'success':          True,
+            'status':           status,
+            'doc_id':           str(result.inserted_id),
+            'form_image_url':   form_image_url,    # null if no image or GCS failed
+            'form_image_error': form_image_error,  # diagnostic string if GCS failed
+        }))
     except Exception as exc:
         traceback.print_exc()
         return _sir_cors(request, JsonResponse({'success': False, 'message': str(exc)}, status=500))
