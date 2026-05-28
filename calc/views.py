@@ -4451,6 +4451,7 @@ def api_sir_confirm_match(request):
     # ── Upload form photo to GCS and embed URL in the same document ───────────
     if form_image_file:
         try:
+            import uuid as _uuid          # _uuid not at module level — import locally (same as api_save_survey)
             ext       = _os.path.splitext(form_image_file.name)[1].lower() or '.jpg'
             # Use a temp unique name — real _id not yet known, use timestamp + random suffix
             blob_name = f"sir_form_photos/pending_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{_uuid.uuid4().hex[:8]}{ext}"
@@ -4773,6 +4774,7 @@ def api_sir_attach_form(request):
     if form_image_file:
         # Multipart path — uses _upload_to_gcs (same function as Aadhaar in api_save_survey)
         try:
+            import uuid as _uuid          # _uuid not at module level — import locally
             ext       = _os.path.splitext(form_image_file.name)[1].lower() or '.jpg'
             blob_name = f"sir_form_photos/{safe_id}_{_uuid.uuid4().hex[:8]}{ext}"
             form_image_url = _upload_to_gcs(form_image_file, blob_name)
