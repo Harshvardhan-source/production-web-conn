@@ -2945,59 +2945,112 @@ def api_house_search(request):
                 break
 
         # ── Family cluster grouping ───────────────────────────────────────
-        # Within a house, voters are grouped into family units using Union-Find
-        # over name ↔ relationName links.
+        # Indian voter rolls encode family structure via two fields:
+        #   Name         — voter's own name
+        #   Relation     — type: Father / Mother / Husband / Wife / Son / Daughter
+        #   Relation Name — name of the relative they are linked to
         #
-        # Algorithm:
-        #   1. Build a name → member index lookup (normalised uppercase)
-        #   2. For each member, if their `relationName` matches another member's
-        #      `name`, union them into the same family cluster.
-        #   3. Members whose names appear as each other's `relationName` are
-        #      automatically in the same cluster (they point to each other).
-        #   4. Any remaining isolated members form single-person clusters.
+        # CHALLENGE: The household head (the anchor) is often NOT a registered
+        # voter, so their name appears only in other people's `Relation Name`
+        # fields but never as any voter's `Name`. Without handling this, every
+        # voter pointing to the same unregistered head forms a separate cluster.
         #
-        # Result: `family_id` (integer) on each member, `families` list on house.
+        # SOLUTION — Virtual Anchor Union-Find:
+        #   1. Build name → index map for all actual voters (normalised upper)
+        #   2. Also build a virtual node for every unique relation-name that
+        #      does NOT match any voter's name.  All voters pointing to the
+        #      same unregistered anchor get unioned through that virtual node.
+        #   3. Direct links (voter A's relation-name == voter B's name) union
+        #      A and B directly.
+        #   4. Fuzzy first-name match as additional pass: if exact full-name
+        #      match fails, try matching just the first word of the relation-name
+        #      against first words of voter names.
+        #   Result: one cluster per actual household, even when the head is absent.
 
-        # Step 1 — normalise name lookup  (name → list of indices)
+        n = len(members)
+
         def _norm_name(s):
             return ' '.join(str(s or '').upper().split())
 
-        name_to_idx = {}   # normalised_name → [member_index, ...]
+        def _first_word(s):
+            parts = s.split()
+            return parts[0] if parts else ''
+
+        # Step 1 — name → voter index map
+        name_to_idx   = {}   # exact full name → [idx, ...]
+        fname_to_idxs = {}   # first word → [idx, ...]  (for fuzzy fallback)
         for idx, m in enumerate(members):
             key = _norm_name(m['name'])
             if key:
                 name_to_idx.setdefault(key, []).append(idx)
+                fw = _first_word(key)
+                if fw:
+                    fname_to_idxs.setdefault(fw, []).append(idx)
 
-        # Step 2 — Union-Find
-        parent = list(range(len(members)))
+        # Step 2 — Union-Find over voters + virtual anchor nodes
+        # Voter nodes: 0 .. n-1
+        # Virtual anchor nodes: n .. n + len(unique_unregistered_anchors) - 1
+        anchor_to_virtual = {}   # anchor_name → virtual node index
+        extra_count = [0]        # mutable counter
+
+        def _get_virtual(anchor_name):
+            if anchor_name not in anchor_to_virtual:
+                anchor_to_virtual[anchor_name] = n + extra_count[0]
+                extra_count[0] += 1
+            return anchor_to_virtual[anchor_name]
+
+        total_nodes = n + len(set(
+            _norm_name(m.get('relationName', ''))
+            for m in members
+            if _norm_name(m.get('relationName', ''))
+               and _norm_name(m.get('relationName', '')) not in name_to_idx
+        ))
+        # Allocate generously — actual virtual count may be <= total_nodes - n
+        parent = list(range(n + len(members)))  # upper bound
+
         def _find(x):
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
                 x = parent[x]
             return x
+
         def _union(x, y):
             px, py = _find(x), _find(y)
             if px != py:
                 parent[px] = py
 
-        # Step 3 — union members who share a relation-name link
+        # Step 3 — union each voter with their relation-name target
         for idx, m in enumerate(members):
-            rel_name_key = _norm_name(m.get('relationName', ''))
-            if not rel_name_key:
+            rel_name = _norm_name(m.get('relationName', ''))
+            if not rel_name:
                 continue
-            # Find all members whose name == this member's relationName
-            for linked_idx in name_to_idx.get(rel_name_key, []):
-                _union(idx, linked_idx)
 
-        # Step 4 — assign stable family_id (0-based, ordered by first appearance)
+            # Case A: relation-name matches an actual voter's name → direct union
+            if rel_name in name_to_idx:
+                for linked_idx in name_to_idx[rel_name]:
+                    _union(idx, linked_idx)
+            else:
+                # Case B: unregistered anchor → union through virtual node
+                vnode = _get_virtual(rel_name)
+                _union(idx, vnode)
+
+                # Fuzzy fallback: try matching just first word
+                fw = _first_word(rel_name)
+                if fw and fw in fname_to_idxs:
+                    for linked_idx in fname_to_idxs[fw]:
+                        _union(idx, linked_idx)
+
+        # Step 4 — map only real voter nodes (0..n-1) to family ids
+        # Ignore virtual nodes — they're just bridges
         root_to_fid = {}
-        for idx in range(len(members)):
+        for idx in range(n):
             root = _find(idx)
+            # Normalise: if root is a virtual node, use it as-is for grouping
             if root not in root_to_fid:
                 root_to_fid[root] = len(root_to_fid)
             members[idx]['family_id'] = root_to_fid[root]
 
-        # Step 5 — build families list (sorted by size desc, then family_id)
+        # Step 5 — build families list (largest first)
         family_buckets = {}
         for m in members:
             fid = m['family_id']
@@ -3007,7 +3060,6 @@ def api_house_search(request):
              for fid, fmems in family_buckets.items()],
             key=lambda f: (-f['size'], f['family_id'])
         )
-        # Re-number family_id sequentially after sort
         for fi, fam in enumerate(families):
             fam['family_id'] = fi
             for m in fam['members']:
