@@ -2944,6 +2944,75 @@ def api_house_search(request):
                 house_survey_data = survey_rec_map[m['voterid']]
                 break
 
+        # ── Family cluster grouping ───────────────────────────────────────
+        # Within a house, voters are grouped into family units using Union-Find
+        # over name ↔ relationName links.
+        #
+        # Algorithm:
+        #   1. Build a name → member index lookup (normalised uppercase)
+        #   2. For each member, if their `relationName` matches another member's
+        #      `name`, union them into the same family cluster.
+        #   3. Members whose names appear as each other's `relationName` are
+        #      automatically in the same cluster (they point to each other).
+        #   4. Any remaining isolated members form single-person clusters.
+        #
+        # Result: `family_id` (integer) on each member, `families` list on house.
+
+        # Step 1 — normalise name lookup  (name → list of indices)
+        def _norm_name(s):
+            return ' '.join(str(s or '').upper().split())
+
+        name_to_idx = {}   # normalised_name → [member_index, ...]
+        for idx, m in enumerate(members):
+            key = _norm_name(m['name'])
+            if key:
+                name_to_idx.setdefault(key, []).append(idx)
+
+        # Step 2 — Union-Find
+        parent = list(range(len(members)))
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def _union(x, y):
+            px, py = _find(x), _find(y)
+            if px != py:
+                parent[px] = py
+
+        # Step 3 — union members who share a relation-name link
+        for idx, m in enumerate(members):
+            rel_name_key = _norm_name(m.get('relationName', ''))
+            if not rel_name_key:
+                continue
+            # Find all members whose name == this member's relationName
+            for linked_idx in name_to_idx.get(rel_name_key, []):
+                _union(idx, linked_idx)
+
+        # Step 4 — assign stable family_id (0-based, ordered by first appearance)
+        root_to_fid = {}
+        for idx in range(len(members)):
+            root = _find(idx)
+            if root not in root_to_fid:
+                root_to_fid[root] = len(root_to_fid)
+            members[idx]['family_id'] = root_to_fid[root]
+
+        # Step 5 — build families list (sorted by size desc, then family_id)
+        family_buckets = {}
+        for m in members:
+            fid = m['family_id']
+            family_buckets.setdefault(fid, []).append(m)
+        families = sorted(
+            [{'family_id': fid, 'members': fmems, 'size': len(fmems)}
+             for fid, fmems in family_buckets.items()],
+            key=lambda f: (-f['size'], f['family_id'])
+        )
+        # Re-number family_id sequentially after sort
+        for fi, fam in enumerate(families):
+            fam['family_id'] = fi
+            for m in fam['members']:
+                m['family_id'] = fi
+
         houses.append({
             'house_no':          hn,
             'ward':              sample.get('ward', ''),
@@ -2951,7 +3020,8 @@ def api_house_search(request):
             'total_members':     total,
             'surveyed':          surveyed,
             'remaining':         total - surveyed,
-            'members':           members,
+            'members':           members,       # flat list (family_id set on each)
+            'families':          families,      # grouped list
             'house_survey_data': house_survey_data,
         })
 
