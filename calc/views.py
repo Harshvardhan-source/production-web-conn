@@ -988,6 +988,7 @@ def api_ward_dashboard(request):
         # ── 3. Voter counts + HMC + large families from 2025_new_mapped_notmapped_hmc ──
         # Use Booth No field (int + str forms) mapped from WARD_FULL_DATA booth lists.
         # Community field → H/M/C via HMC_FROM_COMMUNITY $switch expression.
+        ward_num_key     = ward_int if ward_int is not None else (int(ward) if str(ward).isdigit() else None)
         ward_name_upper  = ward_name.upper().strip()
         ward_booths_list = WARD_NAME_TO_BOOTHS.get(ward_name_upper, [])
         if not ward_booths_list and ward_num_key:
@@ -1053,7 +1054,6 @@ def api_ward_dashboard(request):
         #         which fails because 2023 collection uses legacy ward names.
         #         Both int + str forms passed because MongoDB $in is type-strict.
         _survey_db_ward = get_survey_db()
-        ward_num_key = ward_int if ward_int is not None else (int(ward) if str(ward).isdigit() else None)
         ward_booths_for_polled = WARD_FULL_DATA.get(ward_num_key, {}).get("booths", [])
         try:
             if ward_booths_for_polled:
