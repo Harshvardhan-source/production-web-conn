@@ -1452,12 +1452,16 @@ def api_community_records(request):
                 search_or = [
                     {'Name':    {'$regex': re.escape(q), '$options': 'i'}},
                     {'Epic No': {'$regex': re.escape(q), '$options': 'i'}},
+                    {'EPIC No': {'$regex': re.escape(q), '$options': 'i'}},
+                    {'Epic NO': {'$regex': re.escape(q), '$options': 'i'}},
                     {'Booth No': booth_int},
                 ]
             except ValueError:
                 search_or = [
                     {'Name':    {'$regex': re.escape(q), '$options': 'i'}},
                     {'Epic No': {'$regex': re.escape(q), '$options': 'i'}},
+                    {'EPIC No': {'$regex': re.escape(q), '$options': 'i'}},
+                    {'Epic NO': {'$regex': re.escape(q), '$options': 'i'}},
                 ]
             # Merge community filter + search filter via $and
             mongo_filter = {'$and': [community_filter, {'$or': search_or}]}
@@ -1471,17 +1475,34 @@ def api_community_records(request):
         skip        = (page - 1) * limit
 
         projection  = {
-            '_id': 0, 'Serial No': 1, 'Epic No': 1, 'Name': 1,
-            'Relation Name': 1, 'Age': 1, 'Gender': 1,
-            'Booth No': 1, 'Category': 1, 'Community': 1,
+            '_id': 0, 'Serial No': 1, 'EPIC No': 1, 'Epic No': 1, 'Epic NO': 1, 'Name': 1,
+            'Relation Name': 1, 'Relative Name': 1, 'Relation': 1, 'Age': 1, 'Gender': 1,
+            'Booth No': 1, 'Ward No': 1, 'Part No': 1, 'Category': 1, 'Community': 1,
+            'Mapping Status': 1, 'House No': 1,
         }
 
-        records = list(collection.find(mongo_filter, projection).skip(skip).limit(limit))
-
-        for rec in records:
-            for k, v in rec.items():
+        raw_records = list(collection.find(mongo_filter, projection).skip(skip).limit(limit))
+        records = []
+        for rec in raw_records:
+            f = _flat_2025(rec)
+            out = {
+                'Serial No':    rec.get('Serial No', ''),
+                'Epic No':      f.get('voterid', ''),
+                'Name':         f.get('name', ''),
+                'Relation Name':f.get('relation', ''),
+                'Age':          f.get('age', ''),
+                'Gender':       f.get('gender', ''),
+                'Booth No':     f.get('booth', ''),
+                'Ward No':      f.get('ward', ''),
+                'House No':     f.get('house', ''),
+                'Category':     rec.get('Category', ''),
+                'Community':    rec.get('Community', ''),
+                'Mapping Status': f.get('mapping_status', ''),
+            }
+            for k, v in out.items():
                 if not isinstance(v, (str, int, float, bool, type(None))):
-                    rec[k] = str(v)
+                    out[k] = str(v)
+            records.append(out)
 
         return JsonResponse({
             'success':     True,
@@ -1538,7 +1559,7 @@ def api_serial_number(request):
     if voterid:
         # Try to find the voter in the 2025 roll and return their Serial No
         voter_2025 = get_db()['2025'].find_one(
-            {'Epic NO': voterid},
+            {'$or': [{'Epic NO': voterid}, {'Epic No': voterid}, {'EPIC No': voterid}]},
             {'Serial No': 1, 'Sl No': 1}
         )
         if voter_2025:
@@ -2411,19 +2432,24 @@ def api_data_view(request):
             db       = get_db()
             coll     = db['2025']
             PROJ = {
-                'Name': 1, 'Epic NO': 1, 'House No': 1,
-                'Gender': 1, 'Age': 1, 'Booth No': 1, 'Part No': 1,
-                'Relation Name': 1, 'Address': 1,
-                'Sl No': 1, 'Serial No': 1,
+                'Name': 1, 'Epic NO': 1, 'Epic No': 1, 'EPIC No': 1, 'House No': 1,
+                'Gender': 1, 'Age': 1, 'Booth No': 1, 'Part No': 1, 'Ward No': 1,
+                'Relation Name': 1, 'Relative Name': 1, 'Address': 1,
+                'Voter Address': 1, 'Sl No': 1, 'Serial No': 1,
+                'Mapping Status': 1,
             }
             if search:
                 regex = {'$regex': search.strip(), '$options': 'i'}
                 query = {'$or': [
                     {'Name':          regex},
                     {'Epic NO':       regex},
+                    {'Epic No':       regex},
+                    {'EPIC No':       regex},
                     {'House No':      regex},
                     {'Relation Name': regex},
+                    {'Relative Name': regex},
                     {'Address':       regex},
+                    {'Voter Address': regex},
                 ]}
             else:
                 query = {}
@@ -2589,11 +2615,15 @@ def api_voter_search(request):
 
     regex = {'$regex': q, '$options': 'i'}
     query = {'$or': [
-        {'Name':         regex},
-        {'Epic NO':      regex},
-        {'House No':     regex},
+        {'Name':          regex},
+        {'Epic NO':       regex},
+        {'Epic No':       regex},
+        {'EPIC No':       regex},
+        {'House No':      regex},
         {'Relation Name': regex},
-        {'Address':      regex},
+        {'Relative Name': regex},
+        {'Address':       regex},
+        {'Voter Address': regex},
     ]}
 
     total = coll.count_documents(query)
@@ -2603,26 +2633,28 @@ def api_voter_search(request):
     voters = []
     for doc in docs:
         d = bson_clean(doc)
-        # Normalise to consistent frontend keys using actual 2025 field names
+        f = _flat_2025(d)  # normalise all field aliases in one pass
+        # Normalise to consistent frontend keys
         voters.append({
-            'Voter_Name':    d.get('Name', ''),
-            'VoterID':       d.get('Epic NO', ''),
-            'House_No':      d.get('House No', ''),
-            'Relation_Name': d.get('Relation Name', ''),
-            'Booth_No':      str(d.get('Booth No', '')),
-            'Age':           d.get('Age', ''),
-            'Gender':        d.get('Gender', ''),
-            'Address':       d.get('Address', ''),
-            'Part_No':       str(d.get('Part No', '')),
-            'Section_name':  d.get('Section name', ''),
-            'Polling_Station_Name':    d.get('polling Station Name', ''),
-            'Polling_Station_Address': d.get('Polling Statuin Address', ''),
+            'Voter_Name':    f.get('name', ''),
+            'VoterID':       f.get('voterid', ''),
+            'House_No':      f.get('house', ''),
+            'Relation_Name': f.get('relation', ''),
+            'Booth_No':      f.get('booth', ''),
+            'Age':           f.get('age', ''),
+            'Gender':        f.get('gender', ''),
+            'Address':       d.get('Voter Address', d.get('Address', '')),
+            'Part_No':       f.get('ward', ''),
+            'Section_name':  d.get('Section Name', d.get('Section name', '')),
+            'Polling_Station_Name':    d.get('Polling Station Name', d.get('polling Station Name', '')),
+            'Polling_Station_Address': d.get('Polling Station Address', d.get('Polling Statuin Address', '')),
             'Source_PDF_Name':         d.get('Source PDF Name', ''),
             'Page_No_of_card':         d.get('Page No of card', ''),
             'Predicted_Religion':      d.get('Predicted_Religion', ''),
             'Predicted_Religion_Label':d.get('Predicted_Religion_Label', ''),
             'Serial_No':     d.get('Serial No', ''),
             'Relation':      d.get('Relation', ''),
+            'mapping_status': f.get('mapping_status', ''),
         })
 
     return JsonResponse({'success': True, 'voters': voters, 'total': total, 'page': page})
@@ -2662,7 +2694,7 @@ def api_house_search(request):
     survey_col = get_survey_db()['SurveyRecords']
 
     exact_voter = voter_col.find_one(
-        {'Epic NO': q},
+        {'$or': [{'Epic NO': q}, {'Epic No': q}, {'EPIC No': q}]},
         {'House No': 1}
     )
     if exact_voter:
@@ -2673,9 +2705,13 @@ def api_house_search(request):
         match_query = {'$or': [
             {'Name':          regex},
             {'Epic NO':       regex},
+            {'Epic No':       regex},
+            {'EPIC No':       regex},
             {'House No':      regex},
             {'Relation Name': regex},
+            {'Relative Name': regex},
             {'Address':       regex},
+            {'Voter Address': regex},
         ]}
         matched = voter_col.find(
             match_query,
@@ -2700,29 +2736,31 @@ def api_house_search(request):
     all_voter_ids = []
     for doc in all_member_docs:
         d  = bson_clean(doc)
-        hn = str(d.get('House No', '')).strip()
+        f  = _flat_2025(d)   # normalise all field aliases in one pass
+        hn = f.get('house', '') or str(d.get('House No', '')).strip()
         if not hn:
             continue
-        vid = str(d.get('Epic NO', '')).strip()
-        _relation      = str(d.get('Relation',      '')).strip()   # e.g. "Father", "Husband"
-        _relation_name = str(d.get('Relation Name', '')).strip()   # e.g. "HARISHCHANDRA"
+        vid            = f.get('voterid', '')
+        _relation      = str(d.get('Relation', '')).strip()   # e.g. "Father", "Husband"
+        _relation_name = f.get('relation', '')                 # relative's name
         member = {
-            'name':               str(d.get('Name', '')).strip(),
+            'name':               f.get('name', ''),
             'relation':           _relation,
             'relationName':       _relation_name,
             'voterid':            vid,
-            'gender':             str(d.get('Gender', '')),
-            'age':                d.get('Age', ''),
-            'booth':              str(d.get('Booth No', '')),
-            'ward':               str(d.get('Part No', '')),
+            'gender':             f.get('gender', ''),
+            'age':                f.get('age', ''),
+            'booth':              f.get('booth', ''),
+            'ward':               f.get('ward', ''),
             'house_no':           hn,
-            'address':            str(d.get('Address', '')),
+            'address':            d.get('Voter Address', d.get('Address', '')),
             'serial_no':          d.get('Serial No') or d.get('Sl No', ''),
+            'mapping_status':     f.get('mapping_status', ''),
             # ── 2025 voter roll enrichment fields ──────────────────────────
-            'partNo':             str(d.get('Part No', '')).strip(),
-            'sectionName':        str(d.get('Section name', '')).strip(),
-            'pollingStation':     str(d.get('polling Station Name', '')).strip(),
-            'pollingStationAddr': str(d.get('Polling Statuin Address', '')).strip(),
+            'partNo':             f.get('ward', ''),
+            'sectionName':        str(d.get('Section Name', d.get('Section name', ''))).strip(),
+            'pollingStation':     str(d.get('Polling Station Name', d.get('polling Station Name', ''))).strip(),
+            'pollingStationAddr': str(d.get('Polling Station Address', d.get('Polling Statuin Address', ''))).strip(),
             'sourcePdfName':      str(d.get('Source PDF Name', '')).strip(),
             'pageNoOfCard':       str(d.get('Page No of card', '')).strip(),
             'predictedReligion':  str(d.get('Predicted_Religion_Label', '')).strip(),
@@ -2813,12 +2851,13 @@ def _norm(v):
 def _flat_2025(doc):
     """Normalise a raw 2025 roll document into a consistent flat dict.
 
-    Handles two field-name schemas transparently:
+    Handles all known field-name schemas transparently:
     ┌─────────────────┬───────────────────────────────┬──────────────────────────────┐
-    │ Field           │ Old ('2025')                  │ New ('2025_new_..._hmc')      │
+    │ Field           │ Old ('2025')                  │ New (re-uploaded 2025 list)  │
     ├─────────────────┼───────────────────────────────┼──────────────────────────────┤
-    │ Voter ID        │ Epic NO                       │ Epic No                      │
-    │ Relation / rel  │ Relation Name                 │ Relative Name                │
+    │ Voter ID        │ Epic NO / Epic No             │ EPIC No                      │
+    │ Relation name   │ Relative Name / Relation Name │ Relation Name                │
+    │ Mapping Status  │ Mapped / Not Mapped           │ MAPPED / NOT MAPPED          │
     │ All others      │ Name / House No / Gender / …  │ same                         │
     └─────────────────┴───────────────────────────────┴──────────────────────────────┘
     """
@@ -2831,16 +2870,26 @@ def _flat_2025(doc):
             if v is not None and str(v).strip() not in ('', 'nan', 'NaN', 'NAN'):
                 return str(v)
         return ''
+    # Normalise mapping_status to a consistent lowercase value regardless of
+    # whether the collection stores "Mapped"/"Not Mapped" (old) or
+    # "MAPPED"/"NOT MAPPED" (new re-uploaded list).
+    raw_ms = _g('Mapping Status')
+    if raw_ms.upper() in ('MAPPED', 'MAPPED '):
+        norm_ms = 'Mapped'
+    elif raw_ms.upper() in ('NOT MAPPED', 'NOTMAPPED', 'NOT_MAPPED'):
+        norm_ms = 'Not Mapped'
+    else:
+        norm_ms = raw_ms  # pass through anything unexpected unchanged
     return {
         'name':           _norm(_g('Name')),
-        'relation':       _norm(_g('Relative Name', 'Relation Name')),
+        'relation':       _norm(_g('Relation Name', 'Relative Name')),
         'house':          _norm(_g('House No')),
-        'voterid':        _norm(_g('Epic No', 'Epic NO')),
+        'voterid':        _norm(_g('EPIC No', 'Epic No', 'Epic NO')),
         'gender':         _norm(_g('Gender')),
         'age':            _g('Age'),
         'booth':          _g('Booth No'),
         'ward':           _g('Ward No', 'Part No'),
-        'mapping_status': _g('Mapping Status'),
+        'mapping_status': norm_ms,
     }
 
 
@@ -3277,7 +3326,7 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
     _PROJ = {
         'Name': 1,
         'Relation Name': 1, 'Relative Name': 1,   # old / new schema
-        'Epic NO': 1,       'Epic No': 1,          # old / new schema
+        'Epic NO': 1,       'Epic No': 1,  'EPIC No': 1,  # old / new schema
         'House No': 1, 'Gender': 1, 'Age': 1,
         'Booth No': 1, 'Part No': 1, 'Ward No': 1,
         'Mapping Status': 1,
@@ -3286,7 +3335,7 @@ def _find_voter_in_2025(col, voterid, name, house, relation=''):
     # ── Tier 1: EPIC exact ────────────────────────────────────────────────────
     if voterid:
         doc = col.find_one(
-            {'$or': [{'Epic NO': voterid}, {'Epic No': voterid}]}, _PROJ
+            {'$or': [{'Epic NO': voterid}, {'Epic No': voterid}, {'EPIC No': voterid}]}, _PROJ
         )
         if doc:
             return bson_clean(doc)
@@ -3579,7 +3628,7 @@ def _run_sir_analysis(voterid, name, house, ward, booth, serial, relation='',
             suspicious.append({'flag': 'OUT_OF_STATE_EPIC', 'label': 'Out-of-State EPIC',
                                 'detail': f'Prefix "{prefix}" is not a Karnataka code.',
                                 'value': voterid})
-        dup = col_2025.count_documents({'$or': [{'Epic NO': voterid}, {'Epic No': voterid}]})
+        dup = col_2025.count_documents({'$or': [{'Epic NO': voterid}, {'Epic No': voterid}, {'EPIC No': voterid}]})
         if dup > 1:
             suspicious.append({'flag': 'DUPLICATE_EPIC', 'label': 'Duplicate EPIC',
                                 'detail': f'EPIC "{voterid}" appears {dup} times in the 2025 list.',
@@ -3681,7 +3730,7 @@ def api_check_sir(request):
     _PROJ_25 = {
         'Name': 1,
         'Relation Name': 1, 'Relative Name': 1,   # old / new schema
-        'Epic NO': 1,       'Epic No': 1,          # old / new schema
+        'Epic NO': 1,       'Epic No': 1,  'EPIC No': 1,  # old / new schema
         'House No': 1, 'Gender': 1, 'Age': 1,
         'Booth No': 1, 'Part No': 1, 'Ward No': 1,
         'Mapping Status': 1,
@@ -3776,7 +3825,7 @@ def api_check_sir(request):
 
             if voterid:
                 _add(col_2025.find(
-                    {'$or': [{'Epic NO': voterid}, {'Epic No': voterid}]},
+                    {'$or': [{'Epic NO': voterid}, {'Epic No': voterid}, {'EPIC No': voterid}]},
                     _PROJ_25
                 ).limit(5))
 
@@ -3895,7 +3944,7 @@ def api_check_sir(request):
                 'detail': 'Prefix "{}" is not a recognised Karnataka EPIC code.'.format(prefix),
                 'value': voterid,
             })
-        dup = col_2025.count_documents({'$or': [{'Epic NO': voterid}, {'Epic No': voterid}]})
+        dup = col_2025.count_documents({'$or': [{'Epic NO': voterid}, {'Epic No': voterid}, {'EPIC No': voterid}]})
         if dup > 1:
             suspicious.append({
                 'flag': 'DUPLICATE_EPIC', 'label': 'Duplicate EPIC',
@@ -4688,7 +4737,7 @@ def api_sir_confirmed_list(request):
                or _g(r25, 'Name')
                or _g(r02, 'Voter Name') or '')
     voterid = (doc.get('voterid') or doc.get('survey_voterid')
-               or _g(r25, 'Epic NO')
+               or _g(r25, 'EPIC No', 'Epic No', 'Epic NO')
                or _g(r02, 'Voter ID / EPIC No') or '')
     house   = (doc.get('house')   or doc.get('survey_house')
                or _g(r25, 'House No')
