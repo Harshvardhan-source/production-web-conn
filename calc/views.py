@@ -1006,16 +1006,28 @@ def api_ward_dashboard(request):
 
         if ward_booths_list:
             booth_match = {'Booth No': {'$in': booth_ints + booth_strs}}
+            # ── Large families: find houses in this ward's booths, count ALL
+            # voters per house (a house can span multiple booths).
+            lf_house_nos = db['2025'].distinct(
+                'House No',
+                {**booth_match, 'House No': {'$exists': True, '$ne': None, '$ne': ''}}
+            )
+            large_family_count = 0
+            if lf_house_nos:
+                lf_count_pipeline = [
+                    {'$match': {'House No': {'$in': lf_house_nos}}},
+                    {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
+                    {'$match': {'count': {'$gt': 15}}},
+                    {'$count': 'n'},
+                ]
+                lf_count_res = list(db['2025'].aggregate(lf_count_pipeline))
+                large_family_count = lf_count_res[0]['n'] if lf_count_res else 0
+
+            # HMC + voter gender + total still from 2025_new_mapped_notmapped_hmc
             lf_pipeline = [
                 {'$match': booth_match},
                 {'$addFields': {'_hmc': HMC_FROM_COMMUNITY}},
                 {'$facet': {
-                    'large_families': [
-                        {'$match': {'House No': {'$exists': True, '$ne': None, '$ne': ''}}},
-                        {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
-                        {'$match': {'count': {'$gt': 15}}},
-                        {'$count': 'n'},
-                    ],
                     'hmc': [
                         {'$group': {'_id': '$_hmc', 'n': {'$sum': 1}}},
                     ],
@@ -1028,7 +1040,6 @@ def api_ward_dashboard(request):
             lf_result = list(db['2025_new_mapped_notmapped_hmc'].aggregate(lf_pipeline))
             if lf_result:
                 r = lf_result[0]
-                large_family_count = r['large_families'][0]['n'] if r.get('large_families') else 0
                 hmc_map = {g['_id']: g['n'] for g in r.get('hmc', [])}
                 ward_hmc = {
                     'H': hmc_map.get('H', 0),
@@ -1214,16 +1225,26 @@ def api_booth_dashboard(request):
         bv_result   = list(main_db['2025_new_mapped_notmapped_hmc'].aggregate(booth_voter_pipeline))
         bv_facet    = bv_result[0] if bv_result else {}
 
-        # ── Large families count for this booth (from primary 2025 collection) ─
-        lf_booth_pipeline = [
-            {'$match': {'Booth No': {'$in': booth_vals},
-                        'House No': {'$exists': True, '$ne': None, '$ne': ''}}},
-            {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
-            {'$match': {'count': {'$gt': 15}}},
-            {'$count': 'n'},
-        ]
-        lf_result = list(get_db()['2025'].aggregate(lf_booth_pipeline))
-        booth_large_family_count = lf_result[0]['n'] if lf_result else 0
+        # ── Large families count for this booth ──────────────────────────────
+        # A house can span multiple booths — first find all houses that have ANY
+        # voter in this booth, then count ALL voters for those houses (any booth).
+        # This gives the true household size, not just the per-booth subset.
+        house_nos_in_booth = get_db()['2025'].distinct(
+            'House No',
+            {'Booth No': {'$in': booth_vals},
+             'House No': {'$exists': True, '$ne': None, '$ne': ''}}
+        )
+        if house_nos_in_booth:
+            lf_total_pipeline = [
+                {'$match': {'House No': {'$in': house_nos_in_booth}}},
+                {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
+                {'$match': {'count': {'$gt': 15}}},
+                {'$count': 'n'},
+            ]
+            lf_result = list(get_db()['2025'].aggregate(lf_total_pipeline))
+            booth_large_family_count = lf_result[0]['n'] if lf_result else 0
+        else:
+            booth_large_family_count = 0
 
         hmc_map     = {g['_id']: g['n'] for g in bv_facet.get('hmc', [])}
         booth_hmc   = {
@@ -1349,39 +1370,67 @@ def api_large_families(request):
     try:
         db = get_db()
 
-        # ── Build initial $match ─────────────────────────────────────────────
-        base_match = {'House No': {'$exists': True, '$ne': None, '$ne': ''}}
+        # ── Build aggregation pipeline ────────────────────────────────────────
+        # IMPORTANT: A single house can span multiple booths (voters in the same
+        # household registered under different booth numbers). We must always count
+        # ALL voters per house, not just those in one booth.
+        #
+        # Strategy:
+        #   booth filter → step 1: find all distinct House No values that have at
+        #                           least one voter in that booth
+        #                  step 2: count ALL voters for those houses (any booth)
+        #   ward filter  → filter by Ward No, then group by House No (single pass)
+        #   no filter    → group by House No across whole collection
 
         if filter_booth:
-            # Match both int and str form of booth number
+            # Step 1: find all house numbers that have at least one voter in this booth
             b_int = int(filter_booth) if filter_booth.isdigit() else None
             booth_vals = [filter_booth]
             if b_int is not None:
                 booth_vals.append(b_int)
-            base_match['Booth No'] = {'$in': booth_vals}
-        elif filter_ward:
-            # Match both int and str form of ward number
-            w_int = int(filter_ward) if filter_ward.isdigit() else None
-            ward_vals = [filter_ward]
-            if w_int is not None:
-                ward_vals.append(w_int)
-            base_match['Ward No'] = {'$in': ward_vals}
 
-        # Single aggregation: group by house, keep ward + booth, filter >15 members.
-        # New schema:  Ward No (int/str), Booth No (int/str)
-        # Old schema:  Part No (ward-ish), Booth No
-        pipeline = [
-            {'$match': base_match},
-            {'$group': {
-                '_id': '$House No',
-                'count':   {'$sum': 1},
-                'ward_no': {'$first': '$Ward No'},    # new schema — direct ward number
-                'booth':   {'$first': '$Booth No'},   # new schema — booth number
-                'part_no': {'$first': '$Part No'},    # old schema fallback
-            }},
-            {'$match': {'count': {'$gt': 15}}},
-            {'$sort': {'count': -1}},
-        ]
+            house_nos_in_booth = db['2025'].distinct(
+                'House No',
+                {'Booth No': {'$in': booth_vals},
+                 'House No': {'$exists': True, '$ne': None, '$ne': ''}}
+            )
+            if not house_nos_in_booth:
+                return JsonResponse({'success': True, 'total': 0, 'byWard': []})
+
+            # Step 2: count ALL voters for those houses (any booth)
+            pipeline = [
+                {'$match': {'House No': {'$in': house_nos_in_booth}}},
+                {'$group': {
+                    '_id':     '$House No',
+                    'count':   {'$sum': 1},
+                    'ward_no': {'$first': '$Ward No'},
+                    'booth':   {'$first': '$Booth No'},   # primary booth for display
+                    'part_no': {'$first': '$Part No'},
+                }},
+                {'$match': {'count': {'$gt': 15}}},
+                {'$sort': {'count': -1}},
+            ]
+        else:
+            base_match = {'House No': {'$exists': True, '$ne': None, '$ne': ''}}
+            if filter_ward:
+                w_int = int(filter_ward) if filter_ward.isdigit() else None
+                ward_vals = [filter_ward]
+                if w_int is not None:
+                    ward_vals.append(w_int)
+                base_match['Ward No'] = {'$in': ward_vals}
+
+            pipeline = [
+                {'$match': base_match},
+                {'$group': {
+                    '_id':     '$House No',
+                    'count':   {'$sum': 1},
+                    'ward_no': {'$first': '$Ward No'},
+                    'booth':   {'$first': '$Booth No'},
+                    'part_no': {'$first': '$Part No'},
+                }},
+                {'$match': {'count': {'$gt': 15}}},
+                {'$sort': {'count': -1}},
+            ]
 
         raw = list(db['2025'].aggregate(pipeline))
 
