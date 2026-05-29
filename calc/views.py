@@ -2890,7 +2890,15 @@ def api_house_search(request):
             'sourcePdfName':      str(d.get('Source PDF Name', '')).strip(),
             'pageNoOfCard':       str(d.get('Page No of card', '')).strip(),
             'predictedReligion':  str(d.get('Predicted_Religion_Label', '')).strip(),
-            'religion':           {'H': 'Hindu', 'M': 'Muslim', 'C': 'Christian', 'J': 'Jain', 'B': 'Buddhist', 'S': 'Sikh'}.get(str(d.get('Predicted_Religion_Label', '')).strip(), ''),
+            'religion':           {'H': 'Hindu', 'M': 'Muslim', 'C': 'Christian', 'J': 'Jain', 'B': 'Buddhist', 'S': 'Sikh'}.get(str(d.get('Predicted_Religion_Label', d.get('Religion', ''))).strip(), ''),
+            # ── New schema enrichment fields ───────────────────────────────
+            'community':          str(d.get('Community',        '')).strip(),
+            'category':           str(d.get('Category',         '')).strip(),
+            'ward_class':         str(d.get('Ward Classification', '')).strip(),
+            'risk_status':        str(d.get('Risk Status',      '')).strip(),
+            'action_priority':    str(d.get('Action Priority',  '')).strip(),
+            'poll_status_2023':   str(d.get('Poll Status 2023', '')).strip(),
+            'ward_name':          str(d.get('Ward Name',        '')).strip(),
             'surveyed':           False,
         }
         house_map.setdefault(hn, []).append(member)
