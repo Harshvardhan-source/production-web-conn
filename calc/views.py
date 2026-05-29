@@ -1398,13 +1398,14 @@ def api_large_families(request):
                 return JsonResponse({'success': True, 'total': 0, 'byWard': []})
 
             # Step 2: count ALL voters for those houses (any booth)
+            # Collect all booths per house so we can show the correct set.
             pipeline = [
                 {'$match': {'House No': {'$in': house_nos_in_booth}}},
                 {'$group': {
                     '_id':     '$House No',
                     'count':   {'$sum': 1},
                     'ward_no': {'$first': '$Ward No'},
-                    'booth':   {'$first': '$Booth No'},   # primary booth for display
+                    'booths':  {'$addToSet': '$Booth No'},  # ALL booths this house spans
                     'part_no': {'$first': '$Part No'},
                 }},
                 {'$match': {'count': {'$gt': 15}}},
@@ -1425,7 +1426,7 @@ def api_large_families(request):
                     '_id':     '$House No',
                     'count':   {'$sum': 1},
                     'ward_no': {'$first': '$Ward No'},
-                    'booth':   {'$first': '$Booth No'},
+                    'booths':  {'$addToSet': '$Booth No'},  # ALL booths this house spans
                     'part_no': {'$first': '$Part No'},
                 }},
                 {'$match': {'count': {'$gt': 15}}},
@@ -1437,12 +1438,28 @@ def api_large_families(request):
         # Group results by ward
         ward_map = {}   # ward_number → { wardName, houses: [] }
         for doc in raw:
-            booth_val = str(doc.get('booth', '') or '').strip()
+            # All booths this house spans — sorted as strings for display
+            all_booths = [str(b).strip() for b in (doc.get('booths') or []) if str(b).strip()]
+            all_booths_sorted = sorted(set(all_booths), key=lambda x: int(x) if x.isdigit() else x)
+
+            # When filtering by a specific booth, always use that booth as the
+            # display booth (not a random $first). For unfiltered/ward views,
+            # use the numerically smallest booth (most consistent choice).
+            if filter_booth:
+                display_booth = str(filter_booth)
+            else:
+                display_booth = all_booths_sorted[0] if all_booths_sorted else ''
 
             # ── Resolve ward number ───────────────────────────────────────────
+            # Try Ward No field first, then look up each booth in BOOTH_TO_WARD
             ward_no_direct = str(doc.get('ward_no', '') or '').strip()
-            ward_no_from_booth = BOOTH_TO_WARD.get(booth_val, '') or BOOTH_TO_WARD.get(
-                int(booth_val) if booth_val.isdigit() else booth_val, '')
+            # Try all booths — they all belong to the same ward
+            ward_no_from_booth = ''
+            for b in all_booths_sorted:
+                ward_no_from_booth = (BOOTH_TO_WARD.get(b, '') or
+                                      BOOTH_TO_WARD.get(int(b) if b.isdigit() else b, ''))
+                if ward_no_from_booth:
+                    break
             part_val = str(doc.get('part_no', '') or '').strip()
             ward_no_from_part = BOOTH_TO_WARD.get(part_val, '') or BOOTH_TO_WARD.get(
                 int(part_val) if part_val.isdigit() else part_val, '')
@@ -1461,7 +1478,8 @@ def api_large_families(request):
             ward_map[ward_no]['houses'].append({
                 'houseNo':     doc['_id'],
                 'memberCount': doc['count'],
-                'booth':       booth_val,
+                'booth':       display_booth,
+                'booths':      all_booths_sorted,   # full list for tooltip / debugging
             })
 
         by_ward = sorted(
