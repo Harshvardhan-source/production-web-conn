@@ -1214,6 +1214,17 @@ def api_booth_dashboard(request):
         bv_result   = list(main_db['2025_new_mapped_notmapped_hmc'].aggregate(booth_voter_pipeline))
         bv_facet    = bv_result[0] if bv_result else {}
 
+        # ── Large families count for this booth (from primary 2025 collection) ─
+        lf_booth_pipeline = [
+            {'$match': {'Booth No': {'$in': booth_vals},
+                        'House No': {'$exists': True, '$ne': None, '$ne': ''}}},
+            {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
+            {'$match': {'count': {'$gt': 15}}},
+            {'$count': 'n'},
+        ]
+        lf_result = list(get_db()['2025'].aggregate(lf_booth_pipeline))
+        booth_large_family_count = lf_result[0]['n'] if lf_result else 0
+
         hmc_map     = {g['_id']: g['n'] for g in bv_facet.get('hmc', [])}
         booth_hmc   = {
             'H': hmc_map.get('H', 0),
@@ -1277,6 +1288,8 @@ def api_booth_dashboard(request):
             'boothHMC':          booth_hmc,
             # Polled/NotPolled HMC from 2023 election data
             'polledHMC':         booth_polled_hmc,
+            # Large families (houses with 15+ registered voters)
+            'largeFamilyCount':  booth_large_family_count,
         }
 
         _booth_dash_cache[cache_key] = {'data': result, 'ts': _t.time()}
@@ -1295,7 +1308,12 @@ def api_large_families(request):
     """
     GET /api/large-families/
     Returns every house with >15 members, grouped by ward.
- 
+
+    Optional query params:
+      ?ward=25      — filter to a single ward number only
+      ?booth=1      — filter to a single booth number only
+      ?refresh=1    — bypass cache
+
     Response shape:
     {
       "success": true,
@@ -1317,23 +1335,43 @@ def api_large_families(request):
     import time as _t
     global _large_families_cache
 
-    # ── Allow cache busting via ?refresh=1 ───────────────────────────────────
+    filter_ward  = request.GET.get('ward',  '').strip()
+    filter_booth = request.GET.get('booth', '').strip()
     force_refresh = request.GET.get('refresh') == '1'
- 
-    # ── Cache hit ─────────────────────────────────────────────────────────────
-    cached = _large_families_cache.get('data')
-    if cached and not force_refresh and (_t.time() - _large_families_cache.get('ts', 0)) < _LF_CACHE_TTL:
-        return JsonResponse({'success': True, 'total': _large_families_cache['total'], 'byWard': cached})
- 
+
+    # ── Cache only for unfiltered (constituency-wide) requests ───────────────
+    use_cache = not filter_ward and not filter_booth
+    if use_cache and not force_refresh:
+        cached = _large_families_cache.get('data')
+        if cached and (_t.time() - _large_families_cache.get('ts', 0)) < _LF_CACHE_TTL:
+            return JsonResponse({'success': True, 'total': _large_families_cache['total'], 'byWard': cached})
+
     try:
         db = get_db()
- 
+
+        # ── Build initial $match ─────────────────────────────────────────────
+        base_match = {'House No': {'$exists': True, '$ne': None, '$ne': ''}}
+
+        if filter_booth:
+            # Match both int and str form of booth number
+            b_int = int(filter_booth) if filter_booth.isdigit() else None
+            booth_vals = [filter_booth]
+            if b_int is not None:
+                booth_vals.append(b_int)
+            base_match['Booth No'] = {'$in': booth_vals}
+        elif filter_ward:
+            # Match both int and str form of ward number
+            w_int = int(filter_ward) if filter_ward.isdigit() else None
+            ward_vals = [filter_ward]
+            if w_int is not None:
+                ward_vals.append(w_int)
+            base_match['Ward No'] = {'$in': ward_vals}
+
         # Single aggregation: group by house, keep ward + booth, filter >15 members.
         # New schema:  Ward No (int/str), Booth No (int/str)
         # Old schema:  Part No (ward-ish), Booth No
-        # We collect all three so we can resolve the ward regardless of schema.
         pipeline = [
-            {'$match': {'House No': {'$exists': True, '$ne': None, '$ne': ''}}},
+            {'$match': base_match},
             {'$group': {
                 '_id': '$House No',
                 'count':   {'$sum': 1},
@@ -1344,21 +1382,18 @@ def api_large_families(request):
             {'$match': {'count': {'$gt': 15}}},
             {'$sort': {'count': -1}},
         ]
- 
+
         raw = list(db['2025'].aggregate(pipeline))
- 
+
         # Group results by ward
         ward_map = {}   # ward_number → { wardName, houses: [] }
         for doc in raw:
             booth_val = str(doc.get('booth', '') or '').strip()
 
             # ── Resolve ward number ───────────────────────────────────────────
-            # Priority 1: Ward No field (new schema) — direct and authoritative
             ward_no_direct = str(doc.get('ward_no', '') or '').strip()
-            # Priority 2: Booth No → BOOTH_TO_WARD lookup
             ward_no_from_booth = BOOTH_TO_WARD.get(booth_val, '') or BOOTH_TO_WARD.get(
                 int(booth_val) if booth_val.isdigit() else booth_val, '')
-            # Priority 3: Part No → BOOTH_TO_WARD (old schema where Part No held booth)
             part_val = str(doc.get('part_no', '') or '').strip()
             ward_no_from_part = BOOTH_TO_WARD.get(part_val, '') or BOOTH_TO_WARD.get(
                 int(part_val) if part_val.isdigit() else part_val, '')
@@ -1379,21 +1414,24 @@ def api_large_families(request):
                 'memberCount': doc['count'],
                 'booth':       booth_val,
             })
- 
+
         by_ward = sorted(
             [{'wardNumber': v['wardNumber'], 'wardName': v['wardName'],
               'count': len(v['houses']), 'houses': v['houses']}
              for v in ward_map.values()],
             key=lambda x: (x['wardNumber'] == 'Unknown', -x['count'])
         )
- 
+
         total = sum(w['count'] for w in by_ward)
-        _large_families_cache['data'] = by_ward
-        _large_families_cache['total'] = total
-        _large_families_cache['ts'] = _t.time()
- 
+
+        # Cache only unfiltered (constituency-wide) results
+        if use_cache:
+            _large_families_cache['data'] = by_ward
+            _large_families_cache['total'] = total
+            _large_families_cache['ts'] = _t.time()
+
         return JsonResponse({'success': True, 'total': total, 'byWard': by_ward})
- 
+
     except Exception as exc:
         traceback.print_exc()
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
