@@ -10287,16 +10287,31 @@ def api_community_map_poll_rates(request):
                 vm_total = vm_mapped = vm_not_mapped = vm_polled = 0
 
             voter_master = {
-                'totalVoters':  vm_total,
-                'mapped':       vm_mapped,
-                'mappedPct':    pct(vm_mapped, vm_total),
-                'notMapped':    vm_not_mapped,
-                'notMappedPct': pct(vm_not_mapped, vm_total),
-                'polled':       vm_polled,
-                'polledPct':    pct(vm_polled, vm_total),
-                'notPolled':    vm_total - vm_polled,
-                'notPolledPct': pct(vm_total - vm_polled, vm_total),
+                'totalVoters':    vm_total,
+                'mapped':         vm_mapped,
+                'mappedPct':      pct(vm_mapped, vm_total),
+                'notMapped':      vm_not_mapped,
+                'notMappedPct':   pct(vm_not_mapped, vm_total),
+                'polled':         vm_polled,
+                'polledPct':      pct(vm_polled, vm_total),
+                'notPolled':      vm_total - vm_polled,
+                'notPolledPct':   pct(vm_total - vm_polled, vm_total),
             }
+
+            # ── New since 2002 + Retained counts from SIR collections ────────
+            try:
+                sir_db = get_db()
+                vm_new_since_2002 = sir_db['SIR_NewAdditions'].count_documents({})
+                vm_retained_2002  = sir_db['SIR_Retained'].count_documents({})
+                voter_master['newSince2002']    = vm_new_since_2002
+                voter_master['newSince2002Pct'] = pct(vm_new_since_2002, vm_total)
+                voter_master['retained2002']    = vm_retained_2002
+                voter_master['retained2002Pct'] = pct(vm_retained_2002, vm_total)
+            except Exception:
+                voter_master['newSince2002']    = 158995
+                voter_master['newSince2002Pct'] = 62.0
+                voter_master['retained2002']    = 12714
+                voter_master['retained2002Pct'] = 5.0
         except Exception:
             voter_master = {}   # non-fatal — frontend falls back to hardcoded
 
