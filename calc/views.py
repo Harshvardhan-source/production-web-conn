@@ -10138,8 +10138,9 @@ def api_community_map_poll_rates(request):
     import time as _t
 
     cache_key = 'global'
+    force_refresh = request.GET.get('refresh') == '1'
     cached = _comm_map_poll_cache.get(cache_key)
-    if cached and (_t.time() - cached['ts']) < _COMM_MAP_POLL_CACHE_TTL:
+    if cached and not force_refresh and (_t.time() - cached['ts']) < _COMM_MAP_POLL_CACHE_TTL:
         return JsonResponse({'success': True, **cached['data']})
 
     try:
@@ -10191,7 +10192,7 @@ def api_community_map_poll_rates(request):
             if not row.get('community'):
                 row['community'] = 'Unclassified'
 
-        # ── Overall summary ───────────────────────────────────────────────────
+        # ── Overall summary from 2025_new_mapped_notmapped_hmc ───────────────
         # Count unique House No across the ENTIRE collection in one pass.
         summary_pipeline = [
             {'$group': {
@@ -10239,7 +10240,67 @@ def api_community_map_poll_rates(request):
             'notPolledPct':  pct(total_v - polled_v, total_v),
         }
 
-        result = {'summary': summary, 'communities': communities}
+        # ── Voter master summary from primary '2025' collection ───────────────
+        # This is the re-uploaded voter list and is the authoritative source
+        # for the Voter Master Data KPI cards shown in the dashboard.
+        try:
+            coll_2025 = db['2025']
+            vm_pipeline = [
+                {'$group': {
+                    '_id':    None,
+                    'total':  {'$sum': 1},
+                    'mapped': {'$sum': {
+                        '$cond': [
+                            {'$or': [
+                                {'$eq': ['$Mapping Status', 'MAPPED']},
+                                {'$eq': ['$Mapping Status', 'Mapped']},
+                            ]}, 1, 0
+                        ]
+                    }},
+                    'not_mapped': {'$sum': {
+                        '$cond': [
+                            {'$or': [
+                                {'$eq': ['$Mapping Status', 'NOT MAPPED']},
+                                {'$eq': ['$Mapping Status', 'Not Mapped']},
+                                {'$eq': ['$Mapping Status', 'NOT_MAPPED']},
+                            ]}, 1, 0
+                        ]
+                    }},
+                    'polled': {'$sum': {
+                        '$cond': [
+                            {'$or': [
+                                {'$eq': ['$Poll Status 2023', 'POLLED']},
+                                {'$eq': ['$Poll Status 2023', 'Polled']},
+                            ]}, 1, 0
+                        ]
+                    }},
+                }},
+            ]
+            vm_rows = list(coll_2025.aggregate(vm_pipeline))
+            if vm_rows:
+                vm = vm_rows[0]
+                vm_total      = vm.get('total', 0)
+                vm_mapped     = vm.get('mapped', 0)
+                vm_not_mapped = vm.get('not_mapped', 0)
+                vm_polled     = vm.get('polled', 0)
+            else:
+                vm_total = vm_mapped = vm_not_mapped = vm_polled = 0
+
+            voter_master = {
+                'totalVoters':  vm_total,
+                'mapped':       vm_mapped,
+                'mappedPct':    pct(vm_mapped, vm_total),
+                'notMapped':    vm_not_mapped,
+                'notMappedPct': pct(vm_not_mapped, vm_total),
+                'polled':       vm_polled,
+                'polledPct':    pct(vm_polled, vm_total),
+                'notPolled':    vm_total - vm_polled,
+                'notPolledPct': pct(vm_total - vm_polled, vm_total),
+            }
+        except Exception:
+            voter_master = {}   # non-fatal — frontend falls back to hardcoded
+
+        result = {'summary': summary, 'communities': communities, 'voter_master': voter_master}
         _comm_map_poll_cache[cache_key] = {'data': result, 'ts': _t.time()}
         return JsonResponse({'success': True, **result})
 
