@@ -1316,25 +1316,30 @@ def api_large_families(request):
     """
     import time as _t
     global _large_families_cache
+
+    # ── Allow cache busting via ?refresh=1 ───────────────────────────────────
+    force_refresh = request.GET.get('refresh') == '1'
  
     # ── Cache hit ─────────────────────────────────────────────────────────────
     cached = _large_families_cache.get('data')
-    if cached and (_t.time() - _large_families_cache.get('ts', 0)) < _LF_CACHE_TTL:
+    if cached and not force_refresh and (_t.time() - _large_families_cache.get('ts', 0)) < _LF_CACHE_TTL:
         return JsonResponse({'success': True, 'total': _large_families_cache['total'], 'byWard': cached})
  
     try:
         db = get_db()
  
-        # Use module-level WARD_NUM_TO_NAME and BOOTH_TO_WARD — no local copies needed
- 
-        # Single aggregation: group by house, keep booth, filter >15 members
+        # Single aggregation: group by house, keep ward + booth, filter >15 members.
+        # New schema:  Ward No (int/str), Booth No (int/str)
+        # Old schema:  Part No (ward-ish), Booth No
+        # We collect all three so we can resolve the ward regardless of schema.
         pipeline = [
             {'$match': {'House No': {'$exists': True, '$ne': None, '$ne': ''}}},
             {'$group': {
                 '_id': '$House No',
-                'count': {'$sum': 1},
-                # Grab one Part No per house to determine ward
-                'booth': {'$first': '$Part No'},
+                'count':   {'$sum': 1},
+                'ward_no': {'$first': '$Ward No'},    # new schema — direct ward number
+                'booth':   {'$first': '$Booth No'},   # new schema — booth number
+                'part_no': {'$first': '$Part No'},    # old schema fallback
             }},
             {'$match': {'count': {'$gt': 15}}},
             {'$sort': {'count': -1}},
@@ -1345,25 +1350,41 @@ def api_large_families(request):
         # Group results by ward
         ward_map = {}   # ward_number → { wardName, houses: [] }
         for doc in raw:
-            booth = str(doc.get('booth', '') or '')
-            ward_no = BOOTH_TO_WARD.get(booth, 'Unknown')
+            booth_val = str(doc.get('booth', '') or '').strip()
+
+            # ── Resolve ward number ───────────────────────────────────────────
+            # Priority 1: Ward No field (new schema) — direct and authoritative
+            ward_no_direct = str(doc.get('ward_no', '') or '').strip()
+            # Priority 2: Booth No → BOOTH_TO_WARD lookup
+            ward_no_from_booth = BOOTH_TO_WARD.get(booth_val, '') or BOOTH_TO_WARD.get(
+                int(booth_val) if booth_val.isdigit() else booth_val, '')
+            # Priority 3: Part No → BOOTH_TO_WARD (old schema where Part No held booth)
+            part_val = str(doc.get('part_no', '') or '').strip()
+            ward_no_from_part = BOOTH_TO_WARD.get(part_val, '') or BOOTH_TO_WARD.get(
+                int(part_val) if part_val.isdigit() else part_val, '')
+
+            ward_no = ward_no_direct or ward_no_from_booth or ward_no_from_part or 'Unknown'
+
             if ward_no not in ward_map:
                 ward_map[ward_no] = {
                     'wardNumber': ward_no,
-                    'wardName': WARD_NUM_TO_NAME.get(ward_no, f'Ward {ward_no}'),
+                    'wardName': WARD_NUM_TO_NAME.get(ward_no, WARD_NUM_TO_NAME.get(
+                        str(int(ward_no)) if str(ward_no).isdigit() else ward_no,
+                        f'Ward {ward_no}' if ward_no != 'Unknown' else 'Unknown'
+                    )),
                     'houses': [],
                 }
             ward_map[ward_no]['houses'].append({
-                'houseNo': doc['_id'],
+                'houseNo':     doc['_id'],
                 'memberCount': doc['count'],
-                'booth': booth,
+                'booth':       booth_val,
             })
  
         by_ward = sorted(
             [{'wardNumber': v['wardNumber'], 'wardName': v['wardName'],
               'count': len(v['houses']), 'houses': v['houses']}
              for v in ward_map.values()],
-            key=lambda x: -x['count']
+            key=lambda x: (x['wardNumber'] == 'Unknown', -x['count'])
         )
  
         total = sum(w['count'] for w in by_ward)
