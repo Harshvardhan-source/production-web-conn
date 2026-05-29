@@ -743,7 +743,7 @@ def _registration_analytics(db=None):
                 'large_families': [
                     {'$match': {'House No': {'$exists': True, '$ne': None}}},
                     {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
-                    {'$match': {'count': {'$gt': 15}}},
+                    {'$match': {'count': {'$gte': 15}}},
                     {'$count': 'n'},
                 ],
             }
@@ -1017,7 +1017,7 @@ def api_ward_dashboard(request):
                 lf_count_pipeline = [
                     {'$match': {'House No': {'$in': lf_house_nos}}},
                     {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
-                    {'$match': {'count': {'$gt': 15}}},
+                    {'$match': {'count': {'$gte': 15}}},
                     {'$count': 'n'},
                 ]
                 lf_count_res = list(db['2025'].aggregate(lf_count_pipeline))
@@ -1238,7 +1238,7 @@ def api_booth_dashboard(request):
             lf_total_pipeline = [
                 {'$match': {'House No': {'$in': house_nos_in_booth}}},
                 {'$group': {'_id': '$House No', 'count': {'$sum': 1}}},
-                {'$match': {'count': {'$gt': 15}}},
+                {'$match': {'count': {'$gte': 15}}},
                 {'$count': 'n'},
             ]
             lf_result = list(get_db()['2025'].aggregate(lf_total_pipeline))
@@ -1408,7 +1408,7 @@ def api_large_families(request):
                     'booths':  {'$addToSet': '$Booth No'},  # ALL booths this house spans
                     'part_no': {'$first': '$Part No'},
                 }},
-                {'$match': {'count': {'$gt': 15}}},
+                {'$match': {'count': {'$gte': 15}}},
                 {'$sort': {'count': -1}},
             ]
         else:
@@ -1429,7 +1429,7 @@ def api_large_families(request):
                     'booths':  {'$addToSet': '$Booth No'},  # ALL booths this house spans
                     'part_no': {'$first': '$Part No'},
                 }},
-                {'$match': {'count': {'$gt': 15}}},
+                {'$match': {'count': {'$gte': 15}}},
                 {'$sort': {'count': -1}},
             ]
 
@@ -1479,7 +1479,8 @@ def api_large_families(request):
                 'houseNo':     doc['_id'],
                 'memberCount': doc['count'],
                 'booth':       display_booth,
-                'booths':      all_booths_sorted,   # full list for tooltip / debugging
+                'booths':      all_booths_sorted,
+                'wardNumber':  ward_no,       # always set — used to scope member fetch
             })
 
         by_ward = sorted(
@@ -2808,16 +2809,36 @@ def api_house_search(request):
     """
     Optimised: 3 DB queries total regardless of result size.
       Q1 — match search term → collect unique house numbers (projection only)
-      Q2 — fetch ALL members for those houses in one $in query
+      Q2 — fetch ALL members for those houses, scoped by ward/booths if provided
       Q3 — fetch all surveyed voter IDs for those members in one $in query
+
+    Optional params:
+      ?ward=25          — only return members whose Ward No == 25
+      ?booths=56,58     — only return members whose Booth No is in the list
+                          (overrides ward when both given)
     """
-    q = request.GET.get('q', '').strip()
+    q      = request.GET.get('q',      '').strip()
+    ward   = request.GET.get('ward',   '').strip()
+    booths = request.GET.get('booths', '').strip()   # comma-separated booth nos
+
     if len(q) < 2:
         return JsonResponse({'success': True, 'houses': [], 'total_houses': 0})
 
     db         = get_db()
     voter_col  = db['2025']
     survey_col = get_survey_db()['SurveyRecords']
+
+    # ── Build scope filter (ward or booths) ──────────────────────────────────
+    scope_filter = {}
+    if booths:
+        booth_list = [b.strip() for b in booths.split(',') if b.strip()]
+        booth_ints = [int(b) for b in booth_list if b.isdigit()]
+        booth_strs = booth_list
+        scope_filter['Booth No'] = {'$in': booth_ints + booth_strs}
+    elif ward:
+        w_int = int(ward) if ward.isdigit() else None
+        ward_vals = [ward] + ([w_int] if w_int is not None else [])
+        scope_filter['Ward No'] = {'$in': ward_vals}
 
     exact_voter = voter_col.find_one(
         {'$or': [{'Epic NO': q}, {'Epic No': q}, {'EPIC No': q}]},
@@ -2828,7 +2849,7 @@ def api_house_search(request):
         house_nos = {hn} if hn else set()
     else:
         regex       = {'$regex': re.escape(q), '$options': 'i'}
-        match_query = {'$or': [
+        base_query  = {'$or': [
             {'Name':          regex},
             {'Epic NO':       regex},
             {'Epic No':       regex},
@@ -2839,10 +2860,9 @@ def api_house_search(request):
             {'Address':       regex},
             {'Voter Address': regex},
         ]}
-        matched = voter_col.find(
-            match_query,
-            {'House No': 1}
-        ).limit(100)
+        # Narrow to ward/booths scope for the initial match too
+        match_query = {'$and': [base_query, scope_filter]} if scope_filter else base_query
+        matched = voter_col.find(match_query, {'House No': 1}).limit(100)
 
         house_nos = set()
         for doc in matched:
@@ -2855,7 +2875,10 @@ def api_house_search(request):
 
     hn_list = list(house_nos)
     hn_ints = [int(h) for h in hn_list if h.isdigit()]
+    # Scope the member fetch: only voters in the specified ward/booths AND house
     house_query = {'House No': {'$in': hn_list + hn_ints}}
+    if scope_filter:
+        house_query.update(scope_filter)
     all_member_docs = list(voter_col.find(house_query))
 
     house_map = {}
