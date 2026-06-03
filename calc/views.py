@@ -10831,3 +10831,204 @@ def api_polled_summary(request):
     except Exception as exc:
         traceback.print_exc()
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+# ─── SIR AI OVERVIEW ─────────────────────────────────────────────────────────
+# POST /api/sir/ai-overview/
+#
+# Accepts: { "sirData": "<serialised stats string>" }
+# Returns: { "success": true, "overview": { headline, summary, bullets, callout } }
+#
+# Aggregates live SIR stats (ward × category × religion) from the DB,
+# then calls Claude claude-haiku-4-5-20251001 for a structured strategic overview.
+#
+# Add to urls.py:
+#   path('sir/ai-overview/', views.api_sir_ai_overview, name='api_sir_ai_overview'),
+# ─────────────────────────────────────────────────────────────────────────────
+
+@csrf_exempt
+@require_http_methods(['POST', 'OPTIONS'])
+def api_sir_ai_overview(request):
+    """POST /api/sir/ai-overview/"""
+    import re as _re_sir
+
+    if request.method == 'OPTIONS':
+        return _sir_options(request)
+
+    user = _user_from_request(request)
+    if not user:
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401))
+
+    try:
+        body     = json.loads(request.body)
+        sir_data = (body.get('sirData') or '').strip()
+    except Exception:
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'Invalid JSON'}, status=400))
+
+    if not sir_data:
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'sirData is required'}, status=400))
+
+    # ── Gather live DB stats to enrich the prompt ─────────────────────────────
+    try:
+        survey_db = get_survey_db()
+        main_db   = get_db()
+
+        # Overall counts per category
+        cat_counts = {
+            'New Additions':  survey_db['SIR_NewAdditions'].count_documents({}),
+            'Retained':       survey_db['SIR_Retained'].count_documents({}),
+            'Modified':       survey_db['SIR_Modified'].count_documents({}),
+            'Deleted':        survey_db['SIR_Deleted'].count_documents({}),
+            'Suspicious':     survey_db['SIR_Suspicious'].count_documents({}),
+            'Not Found':      survey_db['SIR_NotFound'].count_documents({}),
+        }
+        total_sir = sum(cat_counts.values())
+        voters_2002 = main_db['2002'].count_documents({})
+        voters_2025 = main_db['2025'].count_documents({})
+
+        # ── Ward-level breakdown: new additions per ward (most insightful for SIR) ──
+        ward_pipeline = [
+            {'$group': {
+                '_id': '$ward',
+                'count': {'$sum': 1},
+            }},
+            {'$sort': {'count': -1}},
+            {'$limit': 15},
+        ]
+        ward_new_rows = list(survey_db['SIR_NewAdditions'].aggregate(ward_pipeline))
+
+        # ── Religion breakdown from SIR_NewAdditions (Predicted_Religion_Label or Religion) ──
+        rel_pipeline = [
+            {'$addFields': {
+                'rel_key': {
+                    '$ifNull': ['$Predicted_Religion_Label', '$Religion']
+                }
+            }},
+            {'$group': {
+                '_id': '$rel_key',
+                'count': {'$sum': 1},
+            }},
+        ]
+        rel_rows = list(survey_db['SIR_NewAdditions'].aggregate(rel_pipeline))
+        rel_norm = {'H':'Hindu','h':'Hindu','Hindu':'Hindu',
+                    'M':'Muslim','m':'Muslim','Muslim':'Muslim',
+                    'C':'Christian','c':'Christian','Christian':'Christian'}
+        rel_counts = {}
+        for row in rel_rows:
+            k = rel_norm.get(str(row['_id']).strip() if row['_id'] else '', 'Other')
+            rel_counts[k] = rel_counts.get(k, 0) + row['count']
+
+        # ── Booth-level breakdown: top booths with new additions ──────────────
+        booth_pipeline = [
+            {'$group': {
+                '_id': '$booth',
+                'count': {'$sum': 1},
+            }},
+            {'$sort': {'count': -1}},
+            {'$limit': 10},
+        ]
+        booth_new_rows = list(survey_db['SIR_NewAdditions'].aggregate(booth_pipeline))
+
+        # ── Build enriched data string for the AI ────────────────────────────
+        lines = ['=== SIR Live Database Statistics ===']
+        lines.append(f'Total SIR Records Processed: {total_sir:,}')
+        lines.append(f'2002 Voter Roll: {voters_2002:,} | 2025 Voter Roll: {voters_2025:,}')
+        lines.append(f'Net Change: {voters_2025 - voters_2002:+,} voters ({round((voters_2025 - voters_2002) / voters_2002 * 100, 1) if voters_2002 else 0:+.1f}%)')
+        lines.append('')
+        lines.append('--- Category Breakdown ---')
+        for cat, cnt in cat_counts.items():
+            pct = round(cnt / total_sir * 100, 1) if total_sir else 0
+            lines.append(f'{cat}: {cnt:,} ({pct}%)')
+        lines.append('')
+        lines.append('--- Religion Breakdown (New Additions) ---')
+        total_rel = sum(rel_counts.values()) or 1
+        for rel, cnt in sorted(rel_counts.items(), key=lambda x: -x[1]):
+            lines.append(f'{rel}: {cnt:,} ({round(cnt / total_rel * 100, 1)}%)')
+        lines.append('')
+        lines.append('--- Top Wards by New Additions ---')
+        lines.append('Ward | New Additions')
+        for row in ward_new_rows:
+            ward_id   = str(row['_id']) if row['_id'] else 'Unknown'
+            ward_name = WARD_NUM_TO_NAME.get(ward_id, ward_id)
+            lines.append(f'{ward_name} (Ward {ward_id}): {row["count"]:,}')
+        lines.append('')
+        lines.append('--- Top Booths by New Additions ---')
+        lines.append('Booth | New Additions')
+        for row in booth_new_rows:
+            lines.append(f'Booth {row["_id"]}: {row["count"]:,}')
+        lines.append('')
+        lines.append('=== Frontend UI Data (ward classification + progress) ===')
+        lines.append(sir_data[:3000])   # cap frontend payload
+
+        full_data = '\n'.join(lines)
+
+    except Exception as db_exc:
+        # If DB enrichment fails, fall back to just the frontend data
+        full_data = sir_data[:4000]
+
+    # ── Build prompts ─────────────────────────────────────────────────────────
+    system_prompt = (
+        "You are a senior political analyst overseeing the Special Intensive Revision (SIR) "
+        "process for Mangaluru City South constituency (Constituency 175, Karnataka). "
+        "SIR is the process of auditing the voter roll by comparing the 2002 and 2025 voter lists "
+        "to identify new additions, deletions, modifications, suspicious entries, and retained voters.\n\n"
+        "TASK: Analyse the SIR progress and provide a strategic intelligence overview. Focus on:\n"
+        "1. Overall completion and scale — how many voters processed vs total roll.\n"
+        "2. Which wards and booths have the most new additions (suspicious high-volume areas).\n"
+        "3. Religion-wise breakdown of new additions — are they demographically skewed?\n"
+        "4. Suspicious vs genuine additions — what percentage needs further scrutiny.\n"
+        "5. Key risks for BJP — which wards with new additions are Congress-leaning?\n"
+        "6. Actionable priorities — which wards/booths need immediate SIR field verification.\n\n"
+        "Every insight MUST cite a real ward name, booth number, count, or percentage from the data. "
+        "Do not invent numbers.\n\n"
+        "Return ONLY a valid JSON object — no markdown fences, no preamble:\n"
+        "{\n"
+        "  \"headline\": \"12-15 word headline citing a real number — e.g. total processed, top ward\",\n"
+        "  \"summary\": \"2-3 sentence strategic overview — cite specific ward names, religion %, vote counts\",\n"
+        "  \"bullets\": [\n"
+        "    {\"icon\":\"📊\",\"text\":\"Overall SIR completion status with specific counts\"},\n"
+        "    {\"icon\":\"🏘️\",\"text\":\"Top ward for new additions with count and political classification\"},\n"
+        "    {\"icon\":\"🕌\",\"text\":\"Religion-wise new addition pattern — cite Hindu/Muslim/Christian %\"},\n"
+        "    {\"icon\":\"⚠️\",\"text\":\"Suspicious entries risk — count and which wards are affected\"},\n"
+        "    {\"icon\":\"🎯\",\"text\":\"Single highest-priority ward/booth for immediate field verification\"}\n"
+        "  ],\n"
+        "  \"callout\": {\n"
+        "    \"label\": \"SIR Bottom Line\",\n"
+        "    \"text\": \"1 sentence with the single most critical finding, citing a real number\",\n"
+        "    \"color\": \"#f59e0b\"\n"
+        "  }\n"
+        "}"
+    )
+
+    user_prompt = (
+        f"Tab: SIR — Special Intensive Revision\n\n"
+        f"=== SIR DATA ===\n{full_data}"
+    )
+
+    try:
+        client  = _get_anthropic()
+        message = client.messages.create(
+            model      = 'claude-haiku-4-5-20251001',
+            max_tokens = 1200,
+            system     = system_prompt,
+            messages   = [{'role': 'user', 'content': user_prompt}],
+        )
+        raw = ''.join(b.text for b in message.content if hasattr(b, 'text')).strip()
+        raw = _re_sir.sub(r'^```(?:json)?\s*', '', raw)
+        raw = _re_sir.sub(r'\s*```$',          '', raw)
+        raw = raw.strip()
+        m   = _re_sir.search(r'\{[\s\S]*\}', raw)
+        if m:
+            raw = m.group(0)
+        try:
+            overview = json.loads(raw)
+        except json.JSONDecodeError:
+            overview = {
+                'headline': 'SIR Analysis — Special Intensive Revision',
+                'summary':  'The AI response could not be parsed. Please regenerate.',
+                'bullets':  [],
+                'callout':  None,
+            }
+        return _sir_cors(request, JsonResponse({'success': True, 'overview': overview}))
+    except Exception as exc:
+        traceback.print_exc()
+        return _sir_cors(request, JsonResponse({'success': False, 'message': str(exc)}, status=500))

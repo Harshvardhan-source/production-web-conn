@@ -115,7 +115,7 @@ urlpatterns = [
     path('ai/query-insight/',        views.api_ai_query_insight,      name='api_ai_query_insight'),
     path('ai/birdseye-view/',        views.api_ai_birdseye_view,      name='api_ai_birdseye_view'),
     path('ai/swot-overview/',        views.api_swot_overview,         name='api_swot_overview'),
-
+    path('sir/ai-overview/', views.api_sir_ai_overview, name='api_sir_ai_overview'),
     # AI Chat
     path('ai/chat/',                 views.api_ai_chat,               name='api_ai_chat'),
     path('ai/chat/export/',          views.api_ai_chat_export,        name='api_ai_chat_export'),
