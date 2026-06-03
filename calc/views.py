@@ -895,6 +895,92 @@ def _sir_cache_set(key_tuple, data):
 
 
 @require_http_methods(['GET'])
+def api_election_analytics(request):
+    """
+    GET /api/election-analytics/
+    Live 2025 voter roll stats from '2025' collection.
+    2023 polling data is hardcoded on the frontend.
+    """
+    try:
+        db  = get_db()
+        col = db['2025']
+
+        total_2025 = col.count_documents({})
+
+        # Gender
+        gender_raw = {r['_id']: r['count'] for r in col.aggregate([
+            {'$group': {'_id': '$Gender', 'count': {'$sum': 1}}}
+        ])}
+        male   = gender_raw.get('Male',   0)
+        female = gender_raw.get('Female', 0)
+
+        # Age groups
+        age_raw = {str(r['_id']): r['count'] for r in col.aggregate([
+            {'$bucket': {
+                'groupBy': '$Age',
+                'boundaries': [0, 18, 26, 36, 46, 56, 66, 200],
+                'default': 'Other',
+                'output': {'count': {'$sum': 1}},
+            }}
+        ])}
+        age_groups = [
+            {'label': '18-25', 'count': age_raw.get('18', 0)},
+            {'label': '26-35', 'count': age_raw.get('26', 0)},
+            {'label': '36-45', 'count': age_raw.get('36', 0)},
+            {'label': '46-55', 'count': age_raw.get('46', 0)},
+            {'label': '56-65', 'count': age_raw.get('56', 0)},
+            {'label': '65+',   'count': age_raw.get('66', 0)},
+        ]
+
+        # Community breakdown (top 10)
+        community = [
+            {'name': r['_id'] or 'Unclassified', 'count': r['count']}
+            for r in col.aggregate([
+                {'$group': {'_id': '$Community', 'count': {'$sum': 1}}},
+                {'$sort': {'count': -1}},
+                {'$limit': 10},
+            ])
+        ]
+
+        # Mapping status
+        map_raw    = {r['_id']: r['count'] for r in col.aggregate([
+            {'$group': {'_id': '$Mapping Status', 'count': {'$sum': 1}}}
+        ])}
+        mapped     = map_raw.get('MAPPED',     0)
+        not_mapped = map_raw.get('NOT MAPPED', 0)
+
+        # Poll Status 2023 stored in 2025 collection
+        poll_raw  = {r['_id']: r['count'] for r in col.aggregate([
+            {'$group': {'_id': '$Poll Status 2023', 'count': {'$sum': 1}}}
+        ])}
+        polled_23 = poll_raw.get('POLLED',     0)
+        not_pol23 = poll_raw.get('NOT POLLED', 0)
+
+        return JsonResponse({
+            'success':        True,
+            'total':          total_2025,
+            'gender':         {'male': male, 'female': female},
+            'ageGroups':      age_groups,
+            'community':      community,
+            'mapping':        {
+                'mapped':    mapped,
+                'notMapped': not_mapped,
+                'pctMapped': round(mapped / total_2025 * 100, 1) if total_2025 else 0,
+            },
+            'pollStatus2023': {
+                'polled':    polled_23,
+                'notPolled': not_pol23,
+                'rate':      round(polled_23 / (polled_23 + not_pol23) * 100, 1)
+                             if (polled_23 + not_pol23) else 0,
+            },
+        })
+    except Exception as exc:
+        import traceback
+        return JsonResponse({'success': False, 'error': str(exc),
+                             'traceback': traceback.format_exc()}, status=500)
+
+
+@require_http_methods(['GET'])
 def api_ward_dashboard(request):
     import time as _t
     ward = request.GET.get('ward', '').strip()

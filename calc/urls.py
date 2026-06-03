@@ -83,6 +83,9 @@ urlpatterns = [
     # GET /api/polled-breakdown/?ward=<N>&booth=<B>  → single booth
     path('polled-breakdown/',        views.api_polled_breakdown,        name='api_polled_breakdown'),
 
+    # ── Election Analytics (2025 live roll stats) ─────────────────────────────────
+    path('election-analytics/',      views.api_election_analytics,      name='api_election_analytics'),
+
     # ── Community Mapping & Poll Rates (2025_new_mapped_notmapped_hmc) ───────────
     # GET /api/community-map-poll-rates/
     # Returns per-community unique house counts + mapped% + polled%
