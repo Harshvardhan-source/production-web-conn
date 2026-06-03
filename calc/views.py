@@ -10839,11 +10839,59 @@ def api_polled_summary(request):
 # Returns: { "success": true, "overview": { headline, summary, bullets, callout } }
 #
 # Aggregates live SIR stats (ward × category × religion) from the DB,
-# then calls Claude claude-haiku-4-5-20251001 for a structured strategic overview.
-#
-# Add to urls.py:
-#   path('sir/ai-overview/', views.api_sir_ai_overview, name='api_sir_ai_overview'),
+# INCLUDING SIR_ConfirmedMatches and SIR_ConfirmedNotFound for accurate counts
+# and predicted religion breakdown from voter names.
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── Religion prediction from Mangaluru name patterns ─────────────────────────
+_MUSLIM_NAME_TOKENS = {
+    'mohammed','mohammad','muhammed','muhamad','md','syed','shaikh','sheikh',
+    'khan','patel','ali','hussain','hasan','hassan','begum','banu','bibi',
+    'fathima','fatima','ayesha','aisha','rahimulla','rahimullah','rasheed',
+    'rashid','irfan','imran','asif','asad','nazeer','nazir','farooq','faruk',
+    'saleem','salim','basheer','bashir','shafi','shafiq','abdulla','abdullah',
+    'hameed','hamid','majeed','majid','kaleem','kareem','karim','rafiq',
+    'rafeeq','niyaz','niyas','riyas','riyaz','shabeer','shabbir','muzammil',
+    'shoaib','shoeb','jahangir','sultan','nawab','mir','mulla','moulvi',
+    'hakeem','hakim','ismail','ibrahim','idris','yusuf','yunus','usman',
+    'uthman','ansar','ansari','sayyid','sayyed','khadija','khadeeja',
+    'zainab','ruqayya','mariam','maryam','amina','ameena','sabiya','sabina',
+    'naseema','naseema','zubaida','sumaiya','samiya','hiba','hina','rabia',
+    'rabiya','tahseen','tahsin','rehan','riyaz','mobin','mubin','iqbal',
+    'tanveer','tanvir','shamsuddin','salahuddin','nizamuddin','tajuddin',
+}
+_CHRISTIAN_NAME_TOKENS = {
+    'dsouza','d\'souza','rodrigues','fernandez','fernandes','pinto','dias',
+    'noronha','lobo','sequeira','mascarenhas','furtado','gonsalves','saldanha',
+    'menezes','pereira','monteiro','miranda','coelho','frank','franklyn',
+    'stany','stanislaus','cyril','cyriac','lancy','melwyn','melvin','melwyn',
+    'alwyn','alvin','aloysius','ignatius','pascal','xavier','xaviour','kevin',
+    'sheryl','sheryl','sherly','noel','noel','christmas','nativity','dsilva',
+    'dcunha','dcosta','dcosta','dmello','dpinto','dsousa','drose','antony',
+    'anthony','stephen','steven','george','joseph','thomas','johnson',
+    'wilson','nelson','darwin','christy','christel','clarence','clement',
+    'rosario','madonna','gracia','gracilda','cecilia','dolores','lourdes',
+    'saviour','salvadore','benicio','benhur','boniface','cletus','crispin',
+    'crispino','jovito','jovina','jovita','livia','livitha','melita',
+    'remigio','remigius','santhosh','satish','savvy','sherry','silvester',
+    'simona','simonetta','silas','titus','yvonne','vivienne','zelda',
+}
+
+def _predict_religion_from_name(name: str) -> str:
+    """
+    Predict Hindu / Muslim / Christian from a voter name string.
+    Uses token-level matching against curated Mangaluru name banks.
+    Returns 'Muslim', 'Christian', or 'Hindu' (default).
+    """
+    if not name:
+        return 'Hindu'
+    tokens = set(re.sub(r'[^a-z\s]', '', name.lower()).split())
+    if tokens & _MUSLIM_NAME_TOKENS:
+        return 'Muslim'
+    if tokens & _CHRISTIAN_NAME_TOKENS:
+        return 'Christian'
+    return 'Hindu'
+
 
 @csrf_exempt
 @require_http_methods(['POST', 'OPTIONS'])
@@ -10872,7 +10920,7 @@ def api_sir_ai_overview(request):
         survey_db = get_survey_db()
         main_db   = get_db()
 
-        # Overall counts per category
+        # Overall counts per SIR category collection
         cat_counts = {
             'New Additions':  survey_db['SIR_NewAdditions'].count_documents({}),
             'Retained':       survey_db['SIR_Retained'].count_documents({}),
@@ -10885,44 +10933,95 @@ def api_sir_ai_overview(request):
         voters_2002 = main_db['2002'].count_documents({})
         voters_2025 = main_db['2025'].count_documents({})
 
-        # ── Ward-level breakdown: new additions per ward (most insightful for SIR) ──
-        ward_pipeline = [
-            {'$group': {
-                '_id': '$ward',
-                'count': {'$sum': 1},
+        # ── SIR_ConfirmedMatches — field-verified confirmed records ───────────
+        confirmed_coll   = survey_db['SIR_ConfirmedMatches']
+        confirmed_total  = confirmed_coll.count_documents({})
+
+        # Status breakdown (MATCHED / NOT_FOUND_2025 / NOT_FOUND_2002 / NOT_FOUND_BOTH)
+        confirmed_status_pipeline = [
+            {'$group': {'_id': '$status', 'count': {'$sum': 1}}},
+        ]
+        confirmed_status_rows = list(confirmed_coll.aggregate(confirmed_status_pipeline))
+        confirmed_status = {str(r['_id']): r['count'] for r in confirmed_status_rows}
+
+        # Religion prediction for confirmed matches (use 'name' field)
+        confirmed_religion = {'Hindu': 0, 'Muslim': 0, 'Christian': 0}
+        for doc in confirmed_coll.find({}, {'name': 1, '_id': 0}):
+            rel = _predict_religion_from_name(doc.get('name', ''))
+            confirmed_religion[rel] = confirmed_religion.get(rel, 0) + 1
+
+        # Ward breakdown for confirmed matches (via record_2025.booth or record_2002.booth)
+        confirmed_ward_pipeline = [
+            {'$addFields': {
+                'booth_val': {
+                    '$ifNull': [
+                        '$record_2025.booth',
+                        {'$ifNull': ['$record_2002.booth', '$booth']}
+                    ]
+                }
             }},
+            {'$match': {'booth_val': {'$ne': None}}},
+            {'$group': {'_id': '$booth_val', 'count': {'$sum': 1}}},
+        ]
+        confirmed_booth_rows = list(confirmed_coll.aggregate(confirmed_ward_pipeline))
+
+        # Map booths → wards for confirmed records
+        confirmed_ward_counts = {}
+        for row in confirmed_booth_rows:
+            booth_str = str(row['_id'])
+            ward_str  = BOOTH_TO_WARD.get(booth_str) or BOOTH_TO_WARD.get(row['_id'])
+            if ward_str:
+                confirmed_ward_counts[ward_str] = confirmed_ward_counts.get(ward_str, 0) + row['count']
+        top_confirmed_wards = sorted(confirmed_ward_counts.items(), key=lambda x: -x[1])[:10]
+
+        # ── SIR_ConfirmedNotFound — confirmed not-found records ───────────────
+        not_found_coll  = survey_db['SIR_ConfirmedNotFound']
+        not_found_total = not_found_coll.count_documents({})
+
+        # Religion prediction for not-found records
+        nf_religion = {'Hindu': 0, 'Muslim': 0, 'Christian': 0}
+        for doc in not_found_coll.find({}, {'name': 1, '_id': 0}):
+            rel = _predict_religion_from_name(doc.get('name', ''))
+            nf_religion[rel] = nf_religion.get(rel, 0) + 1
+
+        # ── Ward-level breakdown: new additions per ward ──────────────────────
+        ward_pipeline = [
+            {'$group': {'_id': '$ward', 'count': {'$sum': 1}}},
             {'$sort': {'count': -1}},
             {'$limit': 15},
         ]
         ward_new_rows = list(survey_db['SIR_NewAdditions'].aggregate(ward_pipeline))
 
-        # ── Religion breakdown from SIR_NewAdditions (Predicted_Religion_Label or Religion) ──
+        # ── Religion breakdown from SIR_NewAdditions ──────────────────────────
         rel_pipeline = [
             {'$addFields': {
-                'rel_key': {
-                    '$ifNull': ['$Predicted_Religion_Label', '$Religion']
-                }
+                'rel_key': {'$ifNull': ['$Predicted_Religion_Label', '$Religion']}
             }},
-            {'$group': {
-                '_id': '$rel_key',
-                'count': {'$sum': 1},
-            }},
+            {'$group': {'_id': '$rel_key', 'count': {'$sum': 1}}},
         ]
         rel_rows = list(survey_db['SIR_NewAdditions'].aggregate(rel_pipeline))
         rel_norm = {'H':'Hindu','h':'Hindu','Hindu':'Hindu',
                     'M':'Muslim','m':'Muslim','Muslim':'Muslim',
                     'C':'Christian','c':'Christian','Christian':'Christian'}
-        rel_counts = {}
+        new_add_rel_counts = {}
         for row in rel_rows:
             k = rel_norm.get(str(row['_id']).strip() if row['_id'] else '', 'Other')
-            rel_counts[k] = rel_counts.get(k, 0) + row['count']
+            new_add_rel_counts[k] = new_add_rel_counts.get(k, 0) + row['count']
+
+        # Predict religion for new additions with no label using name field
+        unlabelled_cursor = survey_db['SIR_NewAdditions'].find(
+            {'Predicted_Religion_Label': None, 'Religion': None},
+            {'name': 1, '_id': 0}
+        ).limit(500)
+        for doc in unlabelled_cursor:
+            rel = _predict_religion_from_name(doc.get('name', ''))
+            new_add_rel_counts[rel] = new_add_rel_counts.get(rel, 0) + 1
+        other_count = new_add_rel_counts.pop('Other', 0)
+        new_add_rel_counts['Hindu'] = new_add_rel_counts.get('Hindu', 0) + other_count  # treat Other as Hindu
 
         # ── Booth-level breakdown: top booths with new additions ──────────────
         booth_pipeline = [
-            {'$group': {
-                '_id': '$booth',
-                'count': {'$sum': 1},
-            }},
+            {'$group': {'_id': '$booth', 'count': {'$sum': 1}}},
             {'$sort': {'count': -1}},
             {'$limit': 10},
         ]
@@ -10930,77 +11029,104 @@ def api_sir_ai_overview(request):
 
         # ── Build enriched data string for the AI ────────────────────────────
         lines = ['=== SIR Live Database Statistics ===']
-        lines.append(f'Total SIR Records Processed: {total_sir:,}')
-        lines.append(f'2002 Voter Roll: {voters_2002:,} | 2025 Voter Roll: {voters_2025:,}')
-        lines.append(f'Net Change: {voters_2025 - voters_2002:+,} voters ({round((voters_2025 - voters_2002) / voters_2002 * 100, 1) if voters_2002 else 0:+.1f}%)')
+        lines.append(f'Total SIR Records Processed (all categories): {total_sir:,}')
+        lines.append(f'2002 Voter Roll: {voters_2002:,}  |  2025 Voter Roll: {voters_2025:,}')
+        delta = voters_2025 - voters_2002
+        lines.append(f'Net Roll Change: {delta:+,} voters ({round(delta / voters_2002 * 100, 1) if voters_2002 else 0:+.1f}%)')
         lines.append('')
-        lines.append('--- Category Breakdown ---')
+        lines.append('--- SIR Category Breakdown ---')
         for cat, cnt in cat_counts.items():
             pct = round(cnt / total_sir * 100, 1) if total_sir else 0
-            lines.append(f'{cat}: {cnt:,} ({pct}%)')
+            lines.append(f'  {cat}: {cnt:,}  ({pct}%)')
+
         lines.append('')
-        lines.append('--- Religion Breakdown (New Additions) ---')
-        total_rel = sum(rel_counts.values()) or 1
-        for rel, cnt in sorted(rel_counts.items(), key=lambda x: -x[1]):
-            lines.append(f'{rel}: {cnt:,} ({round(cnt / total_rel * 100, 1)}%)')
+        lines.append('--- Field-Confirmed Records (SIR_ConfirmedMatches) ---')
+        lines.append(f'  Total confirmed field verifications: {confirmed_total:,}')
+        for status_key, cnt in confirmed_status.items():
+            lines.append(f'  Status "{status_key}": {cnt:,}')
+        lines.append('  Religion prediction from confirmed voter names:')
+        cf_total_rel = sum(confirmed_religion.values()) or 1
+        for rel, cnt in sorted(confirmed_religion.items(), key=lambda x: -x[1]):
+            lines.append(f'    {rel}: {cnt:,}  ({round(cnt/cf_total_rel*100,1)}%)')
+        lines.append(f'  Top wards by confirmed record count:')
+        for ward_str, cnt in top_confirmed_wards:
+            wname = WARD_NUM_TO_NAME.get(ward_str, f'Ward {ward_str}')
+            lines.append(f'    {wname} (Ward {ward_str}): {cnt:,}')
+
+        lines.append('')
+        lines.append('--- Confirmed Not-Found Records (SIR_ConfirmedNotFound) ---')
+        lines.append(f'  Total confirmed not-found: {not_found_total:,}')
+        nf_total_rel = sum(nf_religion.values()) or 1
+        lines.append('  Religion prediction from not-found voter names:')
+        for rel, cnt in sorted(nf_religion.items(), key=lambda x: -x[1]):
+            lines.append(f'    {rel}: {cnt:,}  ({round(cnt/nf_total_rel*100,1)}%)')
+
+        lines.append('')
+        lines.append('--- Religion Breakdown (New Additions — predicted) ---')
+        total_rel = sum(new_add_rel_counts.values()) or 1
+        for rel, cnt in sorted(new_add_rel_counts.items(), key=lambda x: -x[1]):
+            lines.append(f'  {rel}: {cnt:,}  ({round(cnt/total_rel*100,1)}%)')
+
         lines.append('')
         lines.append('--- Top Wards by New Additions ---')
-        lines.append('Ward | New Additions')
         for row in ward_new_rows:
             ward_id   = str(row['_id']) if row['_id'] else 'Unknown'
             ward_name = WARD_NUM_TO_NAME.get(ward_id, ward_id)
-            lines.append(f'{ward_name} (Ward {ward_id}): {row["count"]:,}')
+            lines.append(f'  {ward_name} (Ward {ward_id}): {row["count"]:,}')
+
         lines.append('')
         lines.append('--- Top Booths by New Additions ---')
-        lines.append('Booth | New Additions')
         for row in booth_new_rows:
-            lines.append(f'Booth {row["_id"]}: {row["count"]:,}')
+            lines.append(f'  Booth {row["_id"]}: {row["count"]:,}')
+
         lines.append('')
-        lines.append('=== Frontend UI Data (ward classification + progress) ===')
-        lines.append(sir_data[:3000])   # cap frontend payload
+        lines.append('=== Ward Classification + BLO Progress (frontend data) ===')
+        lines.append(sir_data[:2500])
 
         full_data = '\n'.join(lines)
 
     except Exception as db_exc:
-        # If DB enrichment fails, fall back to just the frontend data
+        traceback.print_exc()
         full_data = sir_data[:4000]
 
     # ── Build prompts ─────────────────────────────────────────────────────────
     system_prompt = (
         "You are a senior political analyst overseeing the Special Intensive Revision (SIR) "
-        "process for Mangaluru City South constituency (Constituency 175, Karnataka). "
-        "SIR is the process of auditing the voter roll by comparing the 2002 and 2025 voter lists "
-        "to identify new additions, deletions, modifications, suspicious entries, and retained voters.\n\n"
-        "TASK: Analyse the SIR progress and provide a strategic intelligence overview. Focus on:\n"
-        "1. Overall completion and scale — how many voters processed vs total roll.\n"
-        "2. Which wards and booths have the most new additions (suspicious high-volume areas).\n"
-        "3. Religion-wise breakdown of new additions — are they demographically skewed?\n"
-        "4. Suspicious vs genuine additions — what percentage needs further scrutiny.\n"
-        "5. Key risks for BJP — which wards with new additions are Congress-leaning?\n"
-        "6. Actionable priorities — which wards/booths need immediate SIR field verification.\n\n"
-        "Every insight MUST cite a real ward name, booth number, count, or percentage from the data. "
-        "Do not invent numbers.\n\n"
-        "Return ONLY a valid JSON object — no markdown fences, no preamble:\n"
+        "process for Mangaluru City South constituency (Constituency 175, Karnataka).\n\n"
+        "SIR compares the 2002 and 2025 voter rolls to classify voters as: New Addition, Retained, "
+        "Modified, Deleted, Suspicious, or Not Found.\n\n"
+        "You also have data from SIR_ConfirmedMatches (field-verified matches) and "
+        "SIR_ConfirmedNotFound (confirmed absences), with PREDICTED RELIGION derived from voter names.\n\n"
+        "TASK: Produce a clear, accurate strategic intelligence overview. Focus on:\n"
+        "1. Real completion — how many of the 59,921 net new voters have been field-verified?\n"
+        "2. What do ConfirmedMatches tell us? Which wards have the most confirmed verifications?\n"
+        "3. Religion pattern in confirmed + new additions — Hindu/Muslim/Christian split, any demographic skew?\n"
+        "4. Suspicious entries and Not-Found risk — counts and affected wards.\n"
+        "5. BJP risk assessment — which wards with high new additions are Congress-leaning?\n"
+        "6. Top actionable priority — one specific ward/booth for immediate ground verification.\n\n"
+        "CRITICAL: Every number cited must come from the data provided. Do NOT invent figures.\n"
+        "Write clearly — a field worker should understand each bullet in under 5 seconds.\n\n"
+        "Return ONLY a valid JSON object — no markdown, no preamble:\n"
         "{\n"
-        "  \"headline\": \"12-15 word headline citing a real number — e.g. total processed, top ward\",\n"
-        "  \"summary\": \"2-3 sentence strategic overview — cite specific ward names, religion %, vote counts\",\n"
+        "  \"headline\": \"One punchy 12-15 word headline with a real number from the data\",\n"
+        "  \"summary\": \"2-3 sentences. Cover: total field-verified vs total roll, top religion in confirmed records, and single biggest risk ward.\",\n"
         "  \"bullets\": [\n"
-        "    {\"icon\":\"📊\",\"text\":\"Overall SIR completion status with specific counts\"},\n"
-        "    {\"icon\":\"🏘️\",\"text\":\"Top ward for new additions with count and political classification\"},\n"
-        "    {\"icon\":\"🕌\",\"text\":\"Religion-wise new addition pattern — cite Hindu/Muslim/Christian %\"},\n"
-        "    {\"icon\":\"⚠️\",\"text\":\"Suspicious entries risk — count and which wards are affected\"},\n"
-        "    {\"icon\":\"🎯\",\"text\":\"Single highest-priority ward/booth for immediate field verification\"}\n"
+        "    {\"icon\":\"📊\",\"text\":\"Completion: X of Y total records field-verified (Z%); 2002→2025 roll grew by N voters\"},\n"
+        "    {\"icon\":\"✅\",\"text\":\"Confirmed matches: top ward by count, status breakdown (MATCHED vs absent), and which religion dominates\"},\n"
+        "    {\"icon\":\"🕌\",\"text\":\"Religion prediction across new additions and confirmed records — cite Hindu/Muslim/Christian %\"},\n"
+        "    {\"icon\":\"⚠️\",\"text\":\"Suspicious + Not-Found entries — exact count, % of total, ward with most suspicious records\"},\n"
+        "    {\"icon\":\"🎯\",\"text\":\"Single highest-priority ward/booth for immediate field action — cite ward name, classification, and reason\"}\n"
         "  ],\n"
         "  \"callout\": {\n"
         "    \"label\": \"SIR Bottom Line\",\n"
-        "    \"text\": \"1 sentence with the single most critical finding, citing a real number\",\n"
+        "    \"text\": \"One plain-language sentence. What is the single most important thing to act on right now?\",\n"
         "    \"color\": \"#f59e0b\"\n"
         "  }\n"
         "}"
     )
 
     user_prompt = (
-        f"Tab: SIR — Special Intensive Revision\n\n"
+        "Tab: SIR — Special Intensive Revision\n\n"
         f"=== SIR DATA ===\n{full_data}"
     )
 
@@ -11008,7 +11134,7 @@ def api_sir_ai_overview(request):
         client  = _get_anthropic()
         message = client.messages.create(
             model      = 'claude-haiku-4-5-20251001',
-            max_tokens = 1200,
+            max_tokens = 1400,
             system     = system_prompt,
             messages   = [{'role': 'user', 'content': user_prompt}],
         )
