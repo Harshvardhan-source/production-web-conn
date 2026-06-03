@@ -10666,3 +10666,168 @@ def api_community_map_poll_rates(request):
     except Exception as exc:
         traceback.print_exc()
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+# ─── POLLED SUMMARY — constituency-level (2023_polled_notpolled_caste_comm_hmc) ─
+# GET /api/polled-summary/
+#
+# Returns total voters, polled, notPolled + breakdowns by religion (H/M/C),
+# community, category, gender, and age group — all from the single authoritative
+# collection 2023_polled_notpolled_caste_comm_hmc (246,960 records).
+#
+# Add to urls.py:
+#   path('api/polled-summary/', views.api_polled_summary),
+# ─────────────────────────────────────────────────────────────────────────────────
+
+_polled_summary_cache     = {}   # 'data' / 'ts'
+_POLLED_SUMMARY_CACHE_TTL = 600  # 10 min (data doesn't change)
+
+@require_http_methods(['GET'])
+def api_polled_summary(request):
+    """
+    Constituency-wide aggregation of 2023_polled_notpolled_caste_comm_hmc.
+    Replaces the hardcoded DATA_2023 block in the frontend Dashboard.
+    """
+    import time as _t
+
+    cached = _polled_summary_cache.get('ts')
+    if cached and (_t.time() - cached) < _POLLED_SUMMARY_CACHE_TTL:
+        return JsonResponse({'success': True, **_polled_summary_cache['data']})
+
+    try:
+        db   = get_db()
+        coll = db['2023_polled_notpolled_caste_comm_hmc']
+
+        # ── Helper: group by field × Polling Status → {key: {polled, notPolled}} ──
+        def _agg(group_field):
+            pipeline = [
+                {'$group': {
+                    '_id': {
+                        'key':    f'${group_field}',
+                        'status': '$Polling Status',
+                    },
+                    'n': {'$sum': 1},
+                }},
+            ]
+            rows = list(coll.aggregate(pipeline, allowDiskUse=True))
+            bucket = {}
+            for row in rows:
+                key    = row['_id'].get('key') or 'Unclassified'
+                status = row['_id'].get('status', '')
+                n      = row['n']
+                if key not in bucket:
+                    bucket[key] = {'polled': 0, 'notPolled': 0}
+                if status == 'Polled':
+                    bucket[key]['polled']    += n
+                else:
+                    bucket[key]['notPolled'] += n
+            return sorted(
+                [{'key': k, 'polled': v['polled'], 'notPolled': v['notPolled'],
+                  'total': v['polled'] + v['notPolled']}
+                 for k, v in bucket.items()],
+                key=lambda x: -x['total'],
+            )
+
+        # ── HMC breakdown ─────────────────────────────────────────────────────
+        rel_raw  = _agg('religion')
+        rel_norm = {'h':'H','m':'M','c':'C','H':'H','M':'M','C':'C',
+                    'Hindu':'H','Muslim':'M','Christian':'C'}
+        hmc = {
+            'H':     {'polled':0,'notPolled':0,'total':0},
+            'M':     {'polled':0,'notPolled':0,'total':0},
+            'C':     {'polled':0,'notPolled':0,'total':0},
+            'total': {'polled':0,'notPolled':0,'total':0},
+        }
+        for row in rel_raw:
+            k = rel_norm.get(str(row['key']).strip())
+            if not k:
+                continue
+            hmc[k]['polled']          += row['polled']
+            hmc[k]['notPolled']       += row['notPolled']
+            hmc['total']['polled']    += row['polled']
+            hmc['total']['notPolled'] += row['notPolled']
+        for k in ('H','M','C','total'):
+            hmc[k]['total'] = hmc[k]['polled'] + hmc[k]['notPolled']
+
+        # ── Community & Category breakdowns ───────────────────────────────────
+        community = _agg('Community')
+        category  = _agg('Category')
+
+        # ── Gender breakdown ──────────────────────────────────────────────────
+        # gender field stores "F" / "M" single letters — normalise to full words
+        gender_raw_agg = _agg('gender')
+        _gender_norm = {'F':'Female','f':'Female','Female':'Female',
+                        'M':'Male',  'm':'Male',   'Male':'Male'}
+        _gender_bucket = {}
+        for _gr in gender_raw_agg:
+            _lbl = _gender_norm.get(str(_gr['key']).strip(), 'Other')
+            if _lbl not in _gender_bucket:
+                _gender_bucket[_lbl] = {'polled':0,'notPolled':0,'total':0}
+            _gender_bucket[_lbl]['polled']    += _gr['polled']
+            _gender_bucket[_lbl]['notPolled'] += _gr['notPolled']
+            _gender_bucket[_lbl]['total']     += _gr['total']
+        gender_raw = [
+            {'key': k, 'polled': v['polled'], 'notPolled': v['notPolled'], 'total': v['total']}
+            for k, v in sorted(_gender_bucket.items(), key=lambda x: -x[1]['total'])
+        ]
+
+        # ── Age group breakdown ───────────────────────────────────────────────
+        age_pipeline = [
+            {'$addFields': {
+                'ageInt': {'$toInt': {'$ifNull': ['$age', -1]}},
+            }},
+            {'$bucket': {
+                'groupBy': '$ageInt',
+                'boundaries': [0, 18, 26, 36, 46, 56, 66, 1000],
+                'default': 'Other',
+                'output': {
+                    'polled':    {'$sum': {'$cond': [{'$eq': ['$Polling Status','Polled']}, 1, 0]}},
+                    'notPolled': {'$sum': {'$cond': [{'$ne': ['$Polling Status','Polled']}, 1, 0]}},
+                    'total':     {'$sum': 1},
+                },
+            }},
+        ]
+        age_labels = {0:'<18', 18:'18-25', 26:'26-35', 36:'36-45',
+                      46:'46-55', 56:'56-65', 66:'65+'}
+        age_rows   = list(coll.aggregate(age_pipeline, allowDiskUse=True))
+        age_groups = []
+        for row in age_rows:
+            bid = row['_id']
+            if bid == 'Other' or bid == 0:
+                continue
+            label = age_labels.get(bid, str(bid))
+            total = row['total']
+            p     = row['polled']
+            rate  = round(p / total * 100, 1) if total else 0.0
+            age_groups.append({
+                'label':     label,
+                'polled':    p,
+                'notPolled': row['notPolled'],
+                'total':     total,
+                'rate':      rate,
+            })
+
+        # ── Overall totals ────────────────────────────────────────────────────
+        total_voters  = hmc['total']['total']
+        total_polled  = hmc['total']['polled']
+        total_notpoll = hmc['total']['notPolled']
+        avg_poll_rate = round(total_polled / total_voters * 100, 1) if total_voters else 0.0
+
+        result = {
+            'totalVoters':  total_voters,
+            'polled':       total_polled,
+            'notPolled':    total_notpoll,
+            'avgPollRate':  avg_poll_rate,
+            'hmc':          hmc,
+            'community':    community,
+            'category':     category,
+            'gender':       gender_raw,
+            'ageGroups':    age_groups,
+        }
+
+        _polled_summary_cache['data'] = result
+        _polled_summary_cache['ts']   = _t.time()
+        return JsonResponse({'success': True, **result})
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)

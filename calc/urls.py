@@ -82,7 +82,7 @@ urlpatterns = [
     # GET /api/polled-breakdown/?ward=<N>            → all booths for that ward
     # GET /api/polled-breakdown/?ward=<N>&booth=<B>  → single booth
     path('polled-breakdown/',        views.api_polled_breakdown,        name='api_polled_breakdown'),
-
+    path('polled-summary/',          views.api_polled_summary,          name='api_polled_summary'),
     # ── Election Analytics (2025 live roll stats) ─────────────────────────────────
     path('election-analytics/',      views.api_election_analytics,      name='api_election_analytics'),
 
