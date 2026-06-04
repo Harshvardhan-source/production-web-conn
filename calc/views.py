@@ -11421,3 +11421,95 @@ def api_sir_ai_overview(request):
     except Exception as exc:
         traceback.print_exc()
         return _sir_cors(request, JsonResponse({'success': False, 'message': str(exc)}, status=500))
+
+# ─── ADD TO urls.py: path('api/progeny/voters/', views.api_progeny_voters) ──────
+@csrf_exempt
+@require_http_methods(['GET', 'OPTIONS'])
+def api_progeny_voters(request):
+    """
+    GET /api/progeny/voters/?page=1&limit=20&search=<text>&ward=<int>&booth=<int>
+
+    Returns paginated progeny voter records from the 'progeny' collection in SurveyDataBase.
+
+    Query params:
+      page   — page number (default 1)
+      limit  — records per page, max 50 (default 20)
+      search — search across Voter Name, Epic / Voter ID, House No, Relative Name (case-insensitive)
+      ward   — filter by Ward number (int)
+      booth  — filter by Booth number (int)
+
+    Response:
+    {
+      success: true,
+      records: [ { ... full progeny document ... }, ... ],
+      total: <int>,
+      page: <int>,
+      pages: <int>
+    }
+    """
+    if request.method == 'OPTIONS':
+        return _sir_options(request)
+
+    user = _user_from_request(request)
+    if not user:
+        return _sir_cors(request, JsonResponse({'success': False, 'message': 'Authentication required.'}, status=401))
+
+    page   = max(1, int(request.GET.get('page',  1)))
+    limit  = min(50, max(1, int(request.GET.get('limit', 20))))
+    skip   = (page - 1) * limit
+    search = request.GET.get('search', '').strip()
+    ward   = request.GET.get('ward',   '').strip()
+    booth  = request.GET.get('booth',  '').strip()
+
+    try:
+        db   = get_db()
+        coll = db['progeny']
+
+        # ── Build query filter ────────────────────────────────────────────────
+        query = {}
+
+        if search:
+            regex = {'$regex': re.escape(search), '$options': 'i'}
+            query['$or'] = [
+                {'Voter Name':    regex},
+                {'Epic / Voter ID': regex},
+                {'House No':      regex},
+                {'Relative Name': regex},
+                {'Name in 2025':  regex},
+            ]
+
+        if ward:
+            try:
+                query['Ward'] = int(ward)
+            except ValueError:
+                pass
+
+        if booth:
+            try:
+                query['Booth'] = int(booth)
+            except ValueError:
+                pass
+
+        total   = coll.count_documents(query)
+        cursor  = coll.find(query).sort([('Ward', 1), ('Booth', 1), ('Voter Name', 1)]).skip(skip).limit(limit)
+
+        records = []
+        for doc in cursor:
+            doc['_id'] = str(doc['_id'])
+            # Safely convert any non-serialisable types
+            for k, v in list(doc.items()):
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    doc[k] = None
+            records.append(doc)
+
+        return _sir_cors(request, JsonResponse({
+            'success': True,
+            'records': records,
+            'total':   total,
+            'page':    page,
+            'pages':   math.ceil(total / limit) if limit else 1,
+        }))
+
+    except Exception as exc:
+        traceback.print_exc()
+        return _sir_cors(request, JsonResponse({'success': False, 'message': str(exc)}, status=500))

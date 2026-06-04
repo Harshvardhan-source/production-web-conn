@@ -123,4 +123,6 @@ urlpatterns = [
     path('ward-places/',             views.api_ward_places,           name='api_ward_places'),
     path('local-places-summary/',    views.api_local_places_summary,  name='api_local_places_summary'),
     path('swot/beneficiaries/',      views.api_beneficiary_list,      name='api_beneficiary_list'),
+    # ✅ CORRECT — resolves to /api/progeny/voters/
+    path('progeny/voters/', views.api_progeny_voters, name='api_progeny_voters'),
 ]
