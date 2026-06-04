@@ -3041,6 +3041,10 @@ def api_house_search(request):
     house_nos_t1 = set()
     house_nos_t2 = set()
 
+    # Score maps populated only in the name-search path (house_no -> best int score)
+    _hs_t0_scores = None  # type: dict|None
+    _hs_t1_scores = None  # type: dict|None
+
     # ══════════════════════════════════════════════════════════════════════════
     # CASE A — EPIC No (Voter ID)
     # ══════════════════════════════════════════════════════════════════════════
@@ -3097,13 +3101,46 @@ def api_house_search(request):
         sig_tokens = [w for w in words if len(w) >= 2]
         first_tok  = sig_tokens[0].upper() if sig_tokens else ''
         prefixes   = list(_gen_prefixes(first_tok)) if first_tok else []
+        q_up_tokens = [t.upper() for t in sig_tokens]
 
-        _t0_nos  = [set()]
-        _t1_nos  = [set()]
-        _t2_nos  = [set()]
+        def _name_score(name_up):
+            """
+            Score how closely a voter's Name matches the query.
+            Higher = more relevant.  Used to rank T0/T1 before the 25-cap.
+
+            5 — exact full name match (normalised)
+            4 — all tokens present AND first token starts the name
+            3 — all tokens present anywhere (standard T0)
+            2 — first token starts the name but not all tokens present
+            1 — at least one token present
+            0 — nothing
+            """
+            if not name_up or not q_up_tokens:
+                return 0
+            all_present  = all(t in name_up for t in q_up_tokens)
+            starts_first = name_up.startswith(q_up_tokens[0])
+            # Exact: the name IS the query tokens joined (handles middle initials loosely)
+            norm_name  = ' '.join(name_up.split())
+            norm_query = ' '.join(q_up_tokens)
+            if norm_name == norm_query:
+                return 5
+            if all_present and starts_first:
+                return 4
+            if all_present:
+                return 3
+            if starts_first:
+                return 2
+            if any(t in name_up for t in q_up_tokens):
+                return 1
+            return 0
+
+        # scored result: dict {house_no: best_score}
+        _t0_scored = [{}]
+        _t1_scored = [{}]
+        _t2_nos    = [set()]
 
         def _run_t0():
-            """T0: ALL words must appear in Name."""
+            """T0: ALL tokens must appear in Name. Collect with per-house best score."""
             if not sig_tokens:
                 return
             if len(sig_tokens) == 1:
@@ -3112,10 +3149,18 @@ def api_house_search(request):
             else:
                 conds = [{'Name': {'$regex': re.escape(w), '$options': 'i'}} for w in sig_tokens]
                 q0    = _scoped({'$and': conds})
-            _t0_nos[0] = _collect_house_nos(q0, 500)
+            scored = {}
+            for doc in voter_col.find(q0, {'House No': 1, 'Name': 1}).limit(500):
+                hn = str(doc.get('House No', '')).strip()
+                if not hn:
+                    continue
+                sc = _name_score(str(doc.get('Name', '')).upper())
+                if hn not in scored or sc > scored[hn]:
+                    scored[hn] = sc
+            _t0_scored[0] = scored
 
         def _run_t1():
-            """T1: ALL words must appear in Relation Name."""
+            """T1: ALL tokens must appear in Relation Name / Relative Name."""
             if not sig_tokens:
                 return
             if len(sig_tokens) == 1:
@@ -3128,14 +3173,22 @@ def api_house_search(request):
                 conds_rn  = [{'Relation Name': {'$regex': re.escape(w), '$options': 'i'}} for w in sig_tokens]
                 conds_rel = [{'Relative Name': {'$regex': re.escape(w), '$options': 'i'}} for w in sig_tokens]
                 q1 = _scoped({'$or': [{'$and': conds_rn}, {'$and': conds_rel}]})
-            _t1_nos[0] = _collect_house_nos(q1, 500)
+            scored = {}
+            for doc in voter_col.find(q1, {'House No': 1, 'Relation Name': 1, 'Relative Name': 1}).limit(500):
+                hn = str(doc.get('House No', '')).strip()
+                if not hn:
+                    continue
+                rel = str(doc.get('Relation Name', doc.get('Relative Name', ''))).upper()
+                sc  = _name_score(rel)
+                if hn not in scored or sc > scored[hn]:
+                    scored[hn] = sc
+            _t1_scored[0] = scored
 
         def _run_t2():
             """T2: phonetic prefix variants on first token + surname token."""
             clauses = []
             for p in prefixes:
                 clauses.append({'Name': {'$regex': f'^{re.escape(p)}', '$options': 'i'}})
-            # Surname (last token) as fallback
             if len(sig_tokens) >= 2:
                 surname = sig_tokens[-1]
                 clauses.append({'Name': {'$regex': re.escape(surname), '$options': 'i'}})
@@ -3150,15 +3203,33 @@ def api_house_search(request):
         _ta.start(); _tb.start(); _tc.start()
         _ta.join();  _tb.join();  _tc.join()
 
-        house_nos_t0 = _t0_nos[0]
-        house_nos_t1 = _t1_nos[0] - house_nos_t0
+        _hs_t0_scores = _t0_scored[0]   # assign to outer for cap-sort
+        _hs_t1_scores = _t1_scored[0]
+        house_nos_t0 = set(_hs_t0_scores.keys())
+        house_nos_t1 = set(_hs_t1_scores.keys()) - house_nos_t0
         house_nos_t2 = _t2_nos[0] - house_nos_t0 - house_nos_t1
 
-    # ── Cap output at 25 houses — T0 + T1 first, T2 fills remainder ──────────
-    MAX_HOUSES   = 25
-    exact_family = sorted(house_nos_t0) + sorted(house_nos_t1 - house_nos_t0)
-    similar      = sorted(house_nos_t2 - house_nos_t0 - house_nos_t1)
+    # ── Cap output at 25 houses — ranked by relevance score, T0 first ─────────
+    #
+    # Critical: sort by SCORE DESC (most relevant first) before slicing to 25.
+    # Without this, alphabetically-early houses (e.g. "1-22-...") crowd out the
+    # actual match (e.g. "17-12-..." NILESH D KAMATH) even though both are T0.
+    #
+    MAX_HOUSES = 25
 
+    if _hs_t0_scores is not None:
+        # Name-search path: sort by relevance score DESC so most-relevant houses
+        # come first before the 25-cap slices — "NILESH D KAMATH" (score 3-5)
+        # beats "AISHWARYA ASHWIN KAMATH" (score 1) even if alphabetically later.
+        exact_family = (
+            [hn for hn, _ in sorted(_hs_t0_scores.items(), key=lambda x: (-x[1], x[0]))]
+            + [hn for hn, _ in sorted(_hs_t1_scores.items(), key=lambda x: (-x[1], x[0]))]
+        )
+    else:
+        # EPIC / House-number path — no scoring, plain string sort is fine
+        exact_family = sorted(house_nos_t0) + sorted(house_nos_t1 - house_nos_t0)
+
+    similar    = sorted(house_nos_t2 - house_nos_t0 - house_nos_t1)
     chosen_t01 = exact_family[:MAX_HOUSES]
     remaining  = MAX_HOUSES - len(chosen_t01)
     chosen_t2  = similar[:remaining] if remaining > 0 else []
@@ -3250,10 +3321,18 @@ def api_house_search(request):
                     'familyIncome': rec.get('familyIncome', ''),
                 }
 
-    # ── Assemble houses, sorted by tier then house number ────────────────────
+    # ── Assemble houses, sorted by tier → score desc → house string ─────────
+    # For name searches _hs_t0_scores/_hs_t1_scores give per-house relevance;
+    # use them so high-scoring houses always precede low-scoring ones in the
+    # output even when both share tier 0.
     def _tier_key(hn):
         tier, _ = tier_info.get(hn, (0, ''))
-        return (tier, hn)
+        # Score: higher is more relevant → negate for ascending sort
+        if _hs_t0_scores is not None:
+            sc = _hs_t0_scores.get(hn) or (_hs_t1_scores.get(hn) if _hs_t1_scores else None) or 0
+        else:
+            sc = 0
+        return (tier, -sc, hn)
 
     houses = []
     for hn in sorted(house_map.keys(), key=_tier_key):
