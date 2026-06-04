@@ -2816,61 +2816,143 @@ def api_data_view(request):
 
 @require_http_methods(['GET'])
 def api_voter_search(request):
-    q      = request.GET.get('q', '').strip()
-    page   = int(request.GET.get('page', 1))
-    limit  = 50
+    """
+    Robust voter search over the '2025' collection (SurveyDataBase).
 
-    if not q:
+    Searches (case-insensitive) across:
+      Name, EPIC No / Epic No / Epic NO, House No,
+      Relation Name / Relative Name, Voter Address / Address,
+      Ward Name, Section Name.
+
+    Exact EPIC-No match is tried first (index hit < 1 ms).
+    Multi-word names use lookahead regex so "neelesh kamath" matches
+    "NEELESH KAMATH" regardless of word order.
+    Results are paginated (50 per page).
+    """
+    q     = request.GET.get('q', '').strip()
+    page  = max(1, int(request.GET.get('page', 1)))
+    LIMIT = 50
+
+    if not q or len(q) < 2:
         return JsonResponse({'success': True, 'voters': [], 'total': 0})
 
     db   = get_db()
     coll = db['2025']
 
-    regex = {'$regex': q, '$options': 'i'}
-    query = {'$or': [
-        {'Name':          regex},
-        {'Epic NO':       regex},
-        {'Epic No':       regex},
-        {'EPIC No':       regex},
-        {'House No':      regex},
-        {'Relation Name': regex},
-        {'Relative Name': regex},
-        {'Address':       regex},
-        {'Voter Address': regex},
-    ]}
+    # ── 1. Exact EPIC No match (fastest path — hits the index) ──────────────
+    q_upper = q.upper().strip()
+    exact = coll.find_one(
+        {'$or': [
+            {'EPIC No': q_upper},   # new schema (capital I)
+            {'Epic No': q_upper},   # legacy variant 1
+            {'Epic NO': q_upper},   # legacy variant 2
+        ]},
+        {'_id': 0}
+    )
+    if exact:
+        d = bson_clean(exact)
+        f = _flat_2025(d)
+        return JsonResponse({
+            'success': True,
+            'voters': [_format_voter_result(d, f)],
+            'total':  1,
+            'page':   1,
+        })
 
+    # ── 2. Flexible regex search ─────────────────────────────────────────────
+    query = _build_voter_search_query(q)
     total = coll.count_documents(query)
-    skip  = (page - 1) * limit
-    docs  = list(coll.find(query).skip(skip).limit(limit))
+    skip  = (page - 1) * LIMIT
+    docs  = list(coll.find(query, {'_id': 0}).skip(skip).limit(LIMIT))
 
     voters = []
     for doc in docs:
         d = bson_clean(doc)
-        f = _flat_2025(d)  # normalise all field aliases in one pass
-        # Normalise to consistent frontend keys
-        voters.append({
-            'Voter_Name':    f.get('name', ''),
-            'VoterID':       f.get('voterid', ''),
-            'House_No':      f.get('house', ''),
-            'Relation_Name': f.get('relation', ''),
-            'Booth_No':      f.get('booth', ''),
-            'Age':           f.get('age', ''),
-            'Gender':        f.get('gender', ''),
-            'Address':       d.get('Voter Address', d.get('Address', '')),
-            'Part_No':       f.get('ward', ''),
-            'Section_name':  d.get('Section Name', d.get('Section name', '')),
-            'Polling_Station_Name':    d.get('Polling Station Name', d.get('polling Station Name', '')),
-            'Polling_Station_Address': d.get('Polling Station Address', d.get('Polling Statuin Address', '')),
-            'Source_PDF_Name':         d.get('Source PDF Name', ''),
-            'Page_No_of_card':         d.get('Page No of card', ''),
-            'Predicted_Religion':      d.get('Predicted_Religion', ''),
-            'Predicted_Religion_Label':d.get('Predicted_Religion_Label', ''),
-            'Serial_No':     d.get('Serial No', ''),
-            'Relation':      d.get('Relation', ''),
-            'mapping_status': f.get('mapping_status', ''),
-        })
+        f = _flat_2025(d)
+        voters.append(_format_voter_result(d, f))
 
-    return JsonResponse({'success': True, 'voters': voters, 'total': total, 'page': page})
+    return JsonResponse({
+        'success': True,
+        'voters':  voters,
+        'total':   total,
+        'page':    page,
+    })
+
+
+def _build_voter_search_query(q):
+    """
+    Build the MongoDB $or query for a voter search string q.
+
+    Name / Relation Name  → word-boundary regex (avoids false positives)
+    Multi-word input      → lookahead chain (all words required, any order)
+    EPIC / House / Address → simple substring regex (flexible)
+    """
+    escaped = re.escape(q)
+    words   = q.split()
+
+    if len(words) > 1:
+        # Require ALL words at word boundaries, any order
+        lookaheads = ''.join(
+            f'(?=.*\\b{re.escape(w)}\\b)' for w in words
+        )
+        name_pat = {'$regex': lookaheads + '.*', '$options': 'i'}
+    else:
+        name_pat = {'$regex': r'\b' + escaped + r'\b', '$options': 'i'}
+
+    sub_pat = {'$regex': escaped, '$options': 'i'}
+
+    return {'$or': [
+        # Name
+        {'Name':           name_pat},
+        # EPIC / Voter ID — all known field-name variants
+        {'EPIC No':        sub_pat},   # new schema
+        {'Epic No':        sub_pat},   # legacy
+        {'Epic NO':        sub_pat},   # legacy
+        # House number
+        {'House No':       sub_pat},
+        # Relation / relative name
+        {'Relation Name':  name_pat},
+        {'Relative Name':  name_pat},
+        # Address
+        {'Voter Address':  sub_pat},
+        {'Address':        sub_pat},
+        # Ward / Section — useful for ward-name or section browsing
+        {'Ward Name':      sub_pat},
+        {'Section Name':   sub_pat},
+    ]}
+
+
+def _format_voter_result(d, f):
+    """Convert raw MongoDB doc + _flat_2025 dict → frontend-expected shape."""
+    return {
+        'Voter_Name':    f.get('name', ''),
+        'VoterID':       f.get('voterid', ''),
+        'House_No':      f.get('house', ''),
+        'Relation_Name': f.get('relation', ''),
+        'Booth_No':      f.get('booth', ''),
+        'Age':           f.get('age', ''),
+        'Gender':        f.get('gender', ''),
+        'Address':       d.get('Voter Address', d.get('Address', '')),
+        'Part_No':       f.get('ward', ''),
+        'Ward_Name':     d.get('Ward Name', ''),
+        'Section_name':  d.get('Section Name', d.get('Section name', '')),
+        'Polling_Station_Name':     d.get('Polling Station Name', d.get('polling Station Name', '')),
+        'Polling_Station_Address':  d.get('Polling Station Address', d.get('Polling Statuin Address', '')),
+        'Source_PDF_Name':          d.get('Source PDF Name', ''),
+        'Page_No_of_card':          d.get('Page No of card', ''),
+        'Predicted_Religion':       d.get('Predicted_Religion', ''),
+        'Predicted_Religion_Label': d.get('Predicted_Religion_Label', ''),
+        'Serial_No':     d.get('Serial No', ''),
+        'Relation':      d.get('Relation', ''),
+        'mapping_status': f.get('mapping_status', ''),
+        # New schema fields present in re-uploaded 2025 collection
+        'Community':           d.get('Community', ''),
+        'Category':            d.get('Category', ''),
+        'Ward_Classification': d.get('Ward Classification', ''),
+        'Risk_Status':         d.get('Risk Status', ''),
+        'Action_Priority':     d.get('Action Priority', ''),
+        'Poll_Status_2023':    d.get('Poll Status 2023', ''),
+    }
 
 
 # ─── VOTER FAMILY ─────────────────────────────────────────────────────────────
@@ -2893,19 +2975,22 @@ def api_voter_family(request):
 @require_http_methods(['GET'])
 def api_house_search(request):
     """
-    Optimised: 3 DB queries total regardless of result size.
-      Q1 — match search term → collect unique house numbers (projection only)
-      Q2 — fetch ALL members for those houses, scoped by ward/booths if provided
-      Q3 — fetch all surveyed voter IDs for those members in one $in query
+    Optimised house-grouped voter search over the '2025' collection.
+    3 DB queries total regardless of result size.
 
     Optional params:
-      ?ward=25          — only return members whose Ward No == 25
-      ?booths=56,58     — only return members whose Booth No is in the list
+      ?ward=25          — restrict to members whose Ward No == 25
+      ?booths=56,58     — restrict to members whose Booth No is in the list
                           (overrides ward when both given)
+
+    Pipeline:
+      Q1 — match search term → collect unique House No values (max 200)
+      Q2 — fetch ALL members for those houses, scoped by ward/booths
+      Q3 — batch-check surveyed voter IDs in one $in query
     """
     q      = request.GET.get('q',      '').strip()
     ward   = request.GET.get('ward',   '').strip()
-    booths = request.GET.get('booths', '').strip()   # comma-separated booth nos
+    booths = request.GET.get('booths', '').strip()
 
     if len(q) < 2:
         return JsonResponse({'success': True, 'houses': [], 'total_houses': 0})
@@ -2915,40 +3000,35 @@ def api_house_search(request):
     survey_col = get_survey_db()['SurveyRecords']
 
     # ── Build scope filter (ward or booths) ──────────────────────────────────
+    # New schema stores Booth No and Ward No as integers; handle both forms.
     scope_filter = {}
     if booths:
         booth_list = [b.strip() for b in booths.split(',') if b.strip()]
         booth_ints = [int(b) for b in booth_list if b.isdigit()]
-        booth_strs = booth_list
-        scope_filter['Booth No'] = {'$in': booth_ints + booth_strs}
+        scope_filter['Booth No'] = {'$in': booth_ints + booth_list}
     elif ward:
         w_int = int(ward) if ward.isdigit() else None
         ward_vals = [ward] + ([w_int] if w_int is not None else [])
         scope_filter['Ward No'] = {'$in': ward_vals}
 
+    # ── Step 1: Exact EPIC No → resolve house number instantly ───────────────
+    q_upper = q.upper().strip()
     exact_voter = voter_col.find_one(
-        {'$or': [{'Epic NO': q}, {'Epic No': q}, {'EPIC No': q}]},
+        {'$or': [
+            {'EPIC No': q_upper},   # new schema
+            {'Epic No': q_upper},   # legacy
+            {'Epic NO': q_upper},   # legacy
+        ]},
         {'House No': 1}
     )
     if exact_voter:
         hn = str(exact_voter.get('House No', '')).strip()
         house_nos = {hn} if hn else set()
     else:
-        regex       = {'$regex': re.escape(q), '$options': 'i'}
-        base_query  = {'$or': [
-            {'Name':          regex},
-            {'Epic NO':       regex},
-            {'Epic No':       regex},
-            {'EPIC No':       regex},
-            {'House No':      regex},
-            {'Relation Name': regex},
-            {'Relative Name': regex},
-            {'Address':       regex},
-            {'Voter Address': regex},
-        ]}
-        # Narrow to ward/booths scope for the initial match too
+        # ── Flexible regex ────────────────────────────────────────────────────
+        base_query  = _build_voter_search_query(q)
         match_query = {'$and': [base_query, scope_filter]} if scope_filter else base_query
-        matched = voter_col.find(match_query, {'House No': 1}).limit(100)
+        matched     = voter_col.find(match_query, {'House No': 1}).limit(200)
 
         house_nos = set()
         for doc in matched:
@@ -2959,25 +3039,26 @@ def api_house_search(request):
     if not house_nos:
         return JsonResponse({'success': True, 'houses': [], 'total_houses': 0})
 
+    # ── Step 2: Fetch ALL members of matched houses ───────────────────────────
     hn_list = list(house_nos)
-    hn_ints = [int(h) for h in hn_list if h.isdigit()]
-    # Scope the member fetch: only voters in the specified ward/booths AND house
+    hn_ints = [int(h) for h in hn_list if str(h).isdigit()]
     house_query = {'House No': {'$in': hn_list + hn_ints}}
     if scope_filter:
         house_query.update(scope_filter)
     all_member_docs = list(voter_col.find(house_query))
 
-    house_map = {}
+    house_map     = {}
     all_voter_ids = []
+
     for doc in all_member_docs:
         d  = bson_clean(doc)
-        f  = _flat_2025(d)   # normalise all field aliases in one pass
+        f  = _flat_2025(d)
         hn = f.get('house', '') or str(d.get('House No', '')).strip()
         if not hn:
             continue
         vid            = f.get('voterid', '')
-        _relation      = str(d.get('Relation', '')).strip()   # e.g. "Father", "Husband"
-        _relation_name = f.get('relation', '')                 # relative's name
+        _relation      = str(d.get('Relation', '')).strip()
+        _relation_name = f.get('relation', '')
         member = {
             'name':               f.get('name', ''),
             'relation':           _relation,
@@ -2991,7 +3072,7 @@ def api_house_search(request):
             'address':            d.get('Voter Address', d.get('Address', '')),
             'serial_no':          d.get('Serial No') or d.get('Sl No', ''),
             'mapping_status':     f.get('mapping_status', ''),
-            # ── 2025 voter roll enrichment fields ──────────────────────────
+            # ── 2025 voter roll enrichment fields ────────────────────────────
             'partNo':             f.get('ward', ''),
             'sectionName':        str(d.get('Section Name', d.get('Section name', ''))).strip(),
             'pollingStation':     str(d.get('Polling Station Name', d.get('polling Station Name', ''))).strip(),
@@ -2999,21 +3080,23 @@ def api_house_search(request):
             'sourcePdfName':      str(d.get('Source PDF Name', '')).strip(),
             'pageNoOfCard':       str(d.get('Page No of card', '')).strip(),
             'predictedReligion':  str(d.get('Predicted_Religion_Label', '')).strip(),
-            'religion':           {'H': 'Hindu', 'M': 'Muslim', 'C': 'Christian', 'J': 'Jain', 'B': 'Buddhist', 'S': 'Sikh'}.get(str(d.get('Predicted_Religion_Label', d.get('Religion', ''))).strip(), ''),
-            # ── New schema enrichment fields ───────────────────────────────
-            'community':          str(d.get('Community',        '')).strip(),
-            'category':           str(d.get('Category',         '')).strip(),
+            'religion':           {'H': 'Hindu', 'M': 'Muslim', 'C': 'Christian', 'J': 'Jain', 'B': 'Buddhist', 'S': 'Sikh'}.get(
+                                      str(d.get('Predicted_Religion_Label', d.get('Religion', ''))).strip(), ''),
+            # ── New schema enrichment fields ──────────────────────────────────
+            'community':          str(d.get('Community',           '')).strip(),
+            'category':           str(d.get('Category',            '')).strip(),
             'ward_class':         str(d.get('Ward Classification', '')).strip(),
-            'risk_status':        str(d.get('Risk Status',      '')).strip(),
-            'action_priority':    str(d.get('Action Priority',  '')).strip(),
-            'poll_status_2023':   str(d.get('Poll Status 2023', '')).strip(),
-            'ward_name':          str(d.get('Ward Name',        '')).strip(),
+            'ward_name':          str(d.get('Ward Name',           '')).strip(),
+            'risk_status':        str(d.get('Risk Status',         '')).strip(),
+            'action_priority':    str(d.get('Action Priority',     '')).strip(),
+            'poll_status_2023':   str(d.get('Poll Status 2023',    '')).strip(),
             'surveyed':           False,
         }
         house_map.setdefault(hn, []).append(member)
         if vid:
             all_voter_ids.append(vid)
 
+    # ── Step 3: Batch surveyed-status lookup ──────────────────────────────────
     surveyed_ids   = set()
     survey_rec_map = {}
     if all_voter_ids:
@@ -3037,6 +3120,24 @@ def api_house_search(request):
                     'familyIncome': rec.get('familyIncome', ''),
                 }
 
+    # ── Assemble house result objects with family clustering ─────────────────
+    #
+    # Indian voter rolls encode family structure via:
+    #   Name         — voter's own name
+    #   Relation     — type: Father / Mother / Husband / Wife / Son / Daughter
+    #   Relation Name — name of the relative they are linked to
+    #
+    # CHALLENGE: The household head is often NOT a registered voter, so their
+    # name appears only in other people's Relation Name fields.
+    #
+    # SOLUTION — Virtual Anchor Union-Find:
+    #   1. Build name → index map for all actual voters (normalised upper)
+    #   2. Create virtual nodes for unregistered relation-name anchors.
+    #   3. Direct links: if voter A's relation-name == voter B's name, union them.
+    #   4. Virtual links: voters pointing to the same unregistered anchor get
+    #      unioned through that virtual node.
+    #   5. Fuzzy first-word match as a fallback pass.
+
     houses = []
     for hn in sorted(house_map.keys()):
         members = house_map[hn]
@@ -3053,29 +3154,7 @@ def api_house_search(request):
                 house_survey_data = survey_rec_map[m['voterid']]
                 break
 
-        # ── Family cluster grouping ───────────────────────────────────────
-        # Indian voter rolls encode family structure via two fields:
-        #   Name         — voter's own name
-        #   Relation     — type: Father / Mother / Husband / Wife / Son / Daughter
-        #   Relation Name — name of the relative they are linked to
-        #
-        # CHALLENGE: The household head (the anchor) is often NOT a registered
-        # voter, so their name appears only in other people's `Relation Name`
-        # fields but never as any voter's `Name`. Without handling this, every
-        # voter pointing to the same unregistered head forms a separate cluster.
-        #
-        # SOLUTION — Virtual Anchor Union-Find:
-        #   1. Build name → index map for all actual voters (normalised upper)
-        #   2. Also build a virtual node for every unique relation-name that
-        #      does NOT match any voter's name.  All voters pointing to the
-        #      same unregistered anchor get unioned through that virtual node.
-        #   3. Direct links (voter A's relation-name == voter B's name) union
-        #      A and B directly.
-        #   4. Fuzzy first-name match as additional pass: if exact full-name
-        #      match fails, try matching just the first word of the relation-name
-        #      against first words of voter names.
-        #   Result: one cluster per actual household, even when the head is absent.
-
+        # ── Family cluster grouping ───────────────────────────────────────────
         n = len(members)
 
         def _norm_name(s):
@@ -3086,8 +3165,8 @@ def api_house_search(request):
             return parts[0] if parts else ''
 
         # Step 1 — name → voter index map
-        name_to_idx   = {}   # exact full name → [idx, ...]
-        fname_to_idxs = {}   # first word → [idx, ...]  (for fuzzy fallback)
+        name_to_idx   = {}
+        fname_to_idxs = {}
         for idx, m in enumerate(members):
             key = _norm_name(m['name'])
             if key:
@@ -3098,77 +3177,71 @@ def api_house_search(request):
 
         # Step 2 — Union-Find over voters + virtual anchor nodes
         # Voter nodes: 0 .. n-1
-        # Virtual anchor nodes: n .. n + len(unique_unregistered_anchors) - 1
-        anchor_to_virtual = {}   # anchor_name → virtual node index
-        extra_count = [0]        # mutable counter
+        parent = list(range(n))
 
-        def _get_virtual(anchor_name):
-            if anchor_name not in anchor_to_virtual:
-                anchor_to_virtual[anchor_name] = n + extra_count[0]
-                extra_count[0] += 1
-            return anchor_to_virtual[anchor_name]
-
-        total_nodes = n + len(set(
-            _norm_name(m.get('relationName', ''))
-            for m in members
-            if _norm_name(m.get('relationName', ''))
-               and _norm_name(m.get('relationName', '')) not in name_to_idx
-        ))
-        # Allocate generously — actual virtual count may be <= total_nodes - n
-        parent = list(range(n + len(members)))  # upper bound
-
-        def _find(x):
+        def find(x):
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
                 x = parent[x]
             return x
 
-        def _union(x, y):
-            px, py = _find(x), _find(y)
-            if px != py:
-                parent[px] = py
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
 
-        # Step 3 — union each voter with their relation-name target
+        virtual         = {}
+        virtual_counter = [n]
+
+        def get_virtual(anchor):
+            if anchor not in virtual:
+                idx = virtual_counter[0]
+                virtual_counter[0] += 1
+                parent.append(idx)
+                virtual[anchor] = idx
+            return virtual[anchor]
+
         for idx, m in enumerate(members):
-            rel_name = _norm_name(m.get('relationName', ''))
-            if not rel_name:
+            rn = _norm_name(m.get('relationName', ''))
+            if not rn:
                 continue
-
-            # Case A: relation-name matches an actual voter's name → direct union
-            if rel_name in name_to_idx:
-                for linked_idx in name_to_idx[rel_name]:
-                    _union(idx, linked_idx)
+            linked = name_to_idx.get(rn)
+            if linked:
+                for li in linked:
+                    union(idx, li)
             else:
-                # Case B: unregistered anchor → union through virtual node
-                vnode = _get_virtual(rel_name)
-                _union(idx, vnode)
-
-                # Fuzzy fallback: try matching just first word
-                fw = _first_word(rel_name)
+                v  = get_virtual(rn)
+                union(idx, v)
+                fw = _first_word(rn)
                 if fw and fw in fname_to_idxs:
-                    for linked_idx in fname_to_idxs[fw]:
-                        _union(idx, linked_idx)
+                    for li in fname_to_idxs[fw]:
+                        union(li, v)
 
-        # Step 4 — map only real voter nodes (0..n-1) to family ids
-        # Ignore virtual nodes — they're just bridges
-        root_to_fid = {}
+        # Step 3 — group by root
+        cluster_map = {}
         for idx in range(n):
-            root = _find(idx)
-            # Normalise: if root is a virtual node, use it as-is for grouping
-            if root not in root_to_fid:
-                root_to_fid[root] = len(root_to_fid)
-            members[idx]['family_id'] = root_to_fid[root]
+            root = find(idx)
+            cluster_map.setdefault(root, []).append(idx)
 
-        # Step 5 — build families list (largest first)
-        family_buckets = {}
-        for m in members:
-            fid = m['family_id']
-            family_buckets.setdefault(fid, []).append(m)
-        families = sorted(
-            [{'family_id': fid, 'members': fmems, 'size': len(fmems)}
-             for fid, fmems in family_buckets.items()],
-            key=lambda f: (-f['size'], f['family_id'])
-        )
+        def _serial(idx):
+            v = members[idx].get('serial_no')
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return 9_999_999
+
+        clusters = sorted(cluster_map.values(), key=lambda c: min(_serial(i) for i in c))
+
+        families = []
+        for fi, cluster in enumerate(clusters):
+            fam_members = [members[i] for i in sorted(cluster, key=_serial)]
+            families.append({
+                'family_id': fi,
+                'size':      len(fam_members),
+                'members':   fam_members,
+            })
+
+        families.sort(key=lambda f: (-f['size'], f['family_id']))
         for fi, fam in enumerate(families):
             fam['family_id'] = fi
             for m in fam['members']:
@@ -3181,8 +3254,8 @@ def api_house_search(request):
             'total_members':     total,
             'surveyed':          surveyed,
             'remaining':         total - surveyed,
-            'members':           members,       # flat list (family_id set on each)
-            'families':          families,      # grouped list
+            'members':           members,
+            'families':          families,
             'house_survey_data': house_survey_data,
         })
 
@@ -3191,6 +3264,7 @@ def api_house_search(request):
         'houses':       houses,
         'total_houses': len(houses),
     })
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
