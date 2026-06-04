@@ -2945,23 +2945,60 @@ def api_voter_family(request):
 
 
 # ─── HOUSE SEARCH ──────────────────────────────────────────────────────────────
+#
+# Search strategy (mirrors the SIR Live Check algo):
+#
+#   TIER 0 — EXACT MATCH    voter's own Name contains ALL query words
+#                            OR exact EPIC No match
+#                            OR exact / prefix House No match
+#   TIER 1 — FAMILY MEMBER  voter's Relation Name contains ALL query words
+#   TIER 2 — SIMILAR NAME   phonetic prefix variant on first name token
+#                            (only added when T0+T1 < 25, keeps noise low)
+#
+# Key improvements over the old version
+#   • EPIC No detected by KA-prefix pattern → instant single-house result
+#   • House-number queries get a dedicated fast path (exact + prefix)
+#   • Multi-word name queries use phonetic prefix variants (_gen_prefixes)
+#     so "VEDHAVYAS" finds "VEDAVYAS", "RAJESH" finds "RAJESH SHETTY" etc.
+#   • T0/T1 candidate limit raised to 500 each; T2 kept at 150 to cap noise
+#   • Final output capped at 25 houses (T0+T1 first, T2 fills remainder)
+#   • All DB queries run in parallel threads
+#
+_HS_KA_PREFIXES = {
+    'NUX','KAX','KAP','SCX','SXK','JWX','XKA','ZMK','YHX','TFX',
+    'KXA','NUK','KAZ','SKA','KAS','AKA','NAX','ZKA','ST',
+}
+_HS_EPIC_RE = re.compile(
+    r'^([A-Z]{2,4})\d',
+    re.IGNORECASE
+)
+_HS_HOUSE_RE = re.compile(
+    r'^[\d][-/\d]',   # starts with digit then dash/slash/digit  e.g. 1-10-609  4-7
+)
+
+
+def _hs_is_epic(q: str) -> bool:
+    """Return True if q looks like a Voter-ID / EPIC No."""
+    qu = q.upper().strip()
+    m  = _HS_EPIC_RE.match(qu)
+    if m and m.group(1).upper() in _HS_KA_PREFIXES:
+        return True
+    # Also accept anything that is all-alpha + digits without spaces
+    if re.match(r'^[A-Z]{2,4}\d{7,10}$', qu):
+        return True
+    return False
+
+
+def _hs_is_house(q: str) -> bool:
+    """Return True if q looks like a house number (e.g. 1-10-609, 4-7, 620-1)."""
+    return bool(_HS_HOUSE_RE.match(q.strip()))
+
 
 @require_http_methods(['GET'])
 def api_house_search(request):
     """
     House-grouped voter search — results sorted by relevance tier.
-
-    TIER 0 — EXACT MATCH   : voter's own Name contains ALL search words
-    TIER 1 — FAMILY MEMBER : voter's Relation Name contains ALL search words
-                             (i.e. they are the family of the searched person)
-    TIER 2 — SIMILAR NAME  : voter's Name contains the last word (surname)
-                             → surfaces more records with the same surname
-
-    Within each tier, houses are sorted by house number.
-    Each house carries match_tier + match_reason so the frontend can render
-    a relevance badge.
-
-    EPIC No exact match bypasses tiering (single hit, returned immediately).
+    Output capped at 25 houses (exact+family first, similar fills remainder).
     """
     q      = request.GET.get('q',      '').strip()
     ward   = request.GET.get('ward',   '').strip()
@@ -2988,7 +3025,8 @@ def api_house_search(request):
     def _scoped(q_dict):
         return {'$and': [q_dict, scope_filter]} if scope_filter else q_dict
 
-    def _collect_house_nos(query, limit=200):
+    def _collect_house_nos(query, limit=500):
+        """Collect unique house numbers from voter_col matching query."""
         nos = set()
         for doc in voter_col.find(query, {'House No': 1}).limit(limit):
             hn = str(doc.get('House No', '')).strip()
@@ -2996,69 +3034,149 @@ def api_house_search(request):
                 nos.add(hn)
         return nos
 
-    # ── Exact EPIC No → single house ─────────────────────────────────────────
     q_upper = q.upper().strip()
-    exact_voter = voter_col.find_one(
-        {'$or': [
-            {'EPIC No': q_upper},
-            {'Epic No': q_upper},
-            {'Epic NO': q_upper},
-        ]},
-        {'House No': 1}
-    )
+    words   = [w for w in q.split() if len(w) >= 1]
 
-    words = q.split()
+    house_nos_t0 = set()
+    house_nos_t1 = set()
+    house_nos_t2 = set()
 
-    if exact_voter:
-        hn_exact = str(exact_voter.get('House No', '')).strip()
-        house_nos_t0 = {hn_exact} if hn_exact else set()
+    # ══════════════════════════════════════════════════════════════════════════
+    # CASE A — EPIC No (Voter ID)
+    # ══════════════════════════════════════════════════════════════════════════
+    if _hs_is_epic(q):
+        exact_voter = voter_col.find_one(
+            {'$or': [
+                {'EPIC No': q_upper},
+                {'Epic No': q_upper},
+                {'Epic NO': q_upper},
+            ]},
+            {'House No': 1}
+        )
+        if exact_voter:
+            hn = str(exact_voter.get('House No', '')).strip()
+            if hn:
+                house_nos_t0 = {hn}
+        else:
+            # Prefix match (partial EPIC typed)
+            pfx_rx = {'$regex': f'^{re.escape(q_upper)}', '$options': 'i'}
+            pfx_q  = {'$or': [{'EPIC No': pfx_rx}, {'Epic No': pfx_rx}, {'Epic NO': pfx_rx}]}
+            house_nos_t0 = _collect_house_nos(_scoped(pfx_q), 50)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CASE B — House Number
+    # ══════════════════════════════════════════════════════════════════════════
+    elif _hs_is_house(q):
+        # Exact match first
+        exact_q   = _scoped({'House No': q})
+        exact_nos = _collect_house_nos(exact_q, 300)
+
+        # Prefix match (catches "1-10" matching "1-10-609", "1-10-620" etc.)
+        pfx_rx  = {'$regex': f'^{re.escape(q)}', '$options': 'i'}
+        pfx_q   = _scoped({'House No': pfx_rx})
+        pfx_nos = _collect_house_nos(pfx_q, 300)
+
+        # Substring match for house addresses containing the fragment
+        sub_rx  = {'$regex': re.escape(q), '$options': 'i'}
+        sub_q   = _scoped({'$or': [
+            {'House No':      sub_rx},
+            {'Voter Address': sub_rx},
+            {'Address':       sub_rx},
+        ]})
+        sub_nos = _collect_house_nos(sub_q, 200)
+
+        house_nos_t0 = exact_nos | pfx_nos
         house_nos_t1 = set()
-        house_nos_t2 = set()
+        house_nos_t2 = sub_nos - house_nos_t0
 
-    elif len(words) >= 2:
-        # ── TIERED SEARCH ────────────────────────────────────────────────────
-        #
-        # T0: voter's Name has ALL words (the person themselves)
-        t0_conds = [{'Name': {'$regex': re.escape(w), '$options': 'i'}} for w in words]
-        t0_query = _scoped({'$and': t0_conds})
-        house_nos_t0 = _collect_house_nos(t0_query, 150)
-
-        # T1: voter's Relation Name has ALL words (their family member)
-        t1_conds = [{'Relation Name': {'$regex': re.escape(w), '$options': 'i'}} for w in words]
-        t1_query = _scoped({'$and': t1_conds})
-        house_nos_t1 = _collect_house_nos(t1_query, 100) - house_nos_t0
-
-        # T2: surname (last word) in voter's Name → more similar results
-        # Also try first name in case user typed "first last" but only surname is known
-        surname    = words[-1]
-        first_name = words[0]
-        t2_conds = {'$or': [
-            {'Name': {'$regex': re.escape(surname),    '$options': 'i'}},
-            {'Name': {'$regex': re.escape(first_name), '$options': 'i'}},
-        ]}
-        t2_query = _scoped(t2_conds)
-        house_nos_t2 = _collect_house_nos(t2_query, 150) - house_nos_t0 - house_nos_t1
-
+    # ══════════════════════════════════════════════════════════════════════════
+    # CASE C — Name (single or multi-word)
+    # ══════════════════════════════════════════════════════════════════════════
     else:
-        # ── SINGLE WORD ───────────────────────────────────────────────────────
-        base = _build_voter_search_query(q)
-        house_nos_t0 = _collect_house_nos(_scoped(base), 200)
-        house_nos_t1 = set()
-        house_nos_t2 = set()
+        # Build phonetic prefix variants from first significant token
+        sig_tokens = [w for w in words if len(w) >= 2]
+        first_tok  = sig_tokens[0].upper() if sig_tokens else ''
+        prefixes   = list(_gen_prefixes(first_tok)) if first_tok else []
 
-    all_house_nos = house_nos_t0 | house_nos_t1 | house_nos_t2
+        _t0_nos  = [set()]
+        _t1_nos  = [set()]
+        _t2_nos  = [set()]
 
-    if not all_house_nos:
+        def _run_t0():
+            """T0: ALL words must appear in Name."""
+            if not sig_tokens:
+                return
+            if len(sig_tokens) == 1:
+                rx = {'$regex': re.escape(sig_tokens[0]), '$options': 'i'}
+                q0 = _scoped({'Name': rx})
+            else:
+                conds = [{'Name': {'$regex': re.escape(w), '$options': 'i'}} for w in sig_tokens]
+                q0    = _scoped({'$and': conds})
+            _t0_nos[0] = _collect_house_nos(q0, 500)
+
+        def _run_t1():
+            """T1: ALL words must appear in Relation Name."""
+            if not sig_tokens:
+                return
+            if len(sig_tokens) == 1:
+                rx = {'$regex': re.escape(sig_tokens[0]), '$options': 'i'}
+                q1 = _scoped({'$or': [
+                    {'Relation Name': rx},
+                    {'Relative Name': rx},
+                ]})
+            else:
+                conds_rn  = [{'Relation Name': {'$regex': re.escape(w), '$options': 'i'}} for w in sig_tokens]
+                conds_rel = [{'Relative Name': {'$regex': re.escape(w), '$options': 'i'}} for w in sig_tokens]
+                q1 = _scoped({'$or': [{'$and': conds_rn}, {'$and': conds_rel}]})
+            _t1_nos[0] = _collect_house_nos(q1, 500)
+
+        def _run_t2():
+            """T2: phonetic prefix variants on first token + surname token."""
+            clauses = []
+            for p in prefixes:
+                clauses.append({'Name': {'$regex': f'^{re.escape(p)}', '$options': 'i'}})
+            # Surname (last token) as fallback
+            if len(sig_tokens) >= 2:
+                surname = sig_tokens[-1]
+                clauses.append({'Name': {'$regex': re.escape(surname), '$options': 'i'}})
+            if not clauses:
+                return
+            q2 = _scoped({'$or': clauses})
+            _t2_nos[0] = _collect_house_nos(q2, 300)
+
+        _ta = threading.Thread(target=_run_t0, daemon=True)
+        _tb = threading.Thread(target=_run_t1, daemon=True)
+        _tc = threading.Thread(target=_run_t2, daemon=True)
+        _ta.start(); _tb.start(); _tc.start()
+        _ta.join();  _tb.join();  _tc.join()
+
+        house_nos_t0 = _t0_nos[0]
+        house_nos_t1 = _t1_nos[0] - house_nos_t0
+        house_nos_t2 = _t2_nos[0] - house_nos_t0 - house_nos_t1
+
+    # ── Cap output at 25 houses — T0 + T1 first, T2 fills remainder ──────────
+    MAX_HOUSES   = 25
+    exact_family = sorted(house_nos_t0) + sorted(house_nos_t1 - house_nos_t0)
+    similar      = sorted(house_nos_t2 - house_nos_t0 - house_nos_t1)
+
+    chosen_t01 = exact_family[:MAX_HOUSES]
+    remaining  = MAX_HOUSES - len(chosen_t01)
+    chosen_t2  = similar[:remaining] if remaining > 0 else []
+
+    selected_house_nos = set(chosen_t01) | set(chosen_t2)
+    total_found        = len(house_nos_t0 | house_nos_t1 | house_nos_t2)
+
+    if not selected_house_nos:
         return JsonResponse({'success': True, 'houses': [], 'total_houses': 0})
 
     # Tier lookup for each house
     tier_info = {}
-    for hn in house_nos_t0: tier_info[hn] = (0, 'Exact Match')
-    for hn in house_nos_t1: tier_info[hn] = (1, 'Family Member')
-    for hn in house_nos_t2: tier_info[hn] = (2, 'Similar Name')
+    for hn in house_nos_t0:                                  tier_info[hn] = (0, 'Exact Match')
+    for hn in (house_nos_t1 - house_nos_t0):                 tier_info[hn] = (1, 'Family Member')
+    for hn in (house_nos_t2 - house_nos_t0 - house_nos_t1): tier_info[hn] = (2, 'Similar Name')
 
     # ── Q2: Fetch ALL members of matched houses ───────────────────────────────
-    hn_list = list(all_house_nos)
+    hn_list = list(selected_house_nos)
     hn_ints = [int(h) for h in hn_list if str(h).isdigit()]
     house_query = {'House No': {'$in': hn_list + hn_ints}}
     if scope_filter:
@@ -3253,7 +3371,7 @@ def api_house_search(request):
     return JsonResponse({
         'success':      True,
         'houses':       houses,
-        'total_houses': len(houses),
+        'total_houses': total_found,
     })
 
 
