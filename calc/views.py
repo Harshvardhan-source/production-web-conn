@@ -3518,6 +3518,19 @@ def _flat_2025(doc):
         'booth':          _g('Booth No'),
         'ward':           _g('Ward No', 'Part No'),
         'mapping_status': norm_ms,
+        'serial':                 _g('Serial No'),
+        'ward_name':               _g('Ward Name'),
+        'community':               _g('Community'),
+        'category':                _g('Category'),
+        'ward_classification':     _g('Ward Classification'),
+        'risk_status':             _g('Risk Status'),
+        'action_priority':         _g('Action Priority'),
+        'poll_status_2023':        _g('Poll Status 2023'),
+        'religion':                _g('Religion'),
+        'section_name':            _g('Section Name'),
+        'polling_station_name':    _g('Polling Station Name'),
+        'polling_station_address': _g('Polling Station Address'),
+        'voter_address':           _g('Voter Address'),
     }
 
 
@@ -4362,6 +4375,11 @@ def api_check_sir(request):
         'House No': 1, 'Gender': 1, 'Age': 1,
         'Booth No': 1, 'Part No': 1, 'Ward No': 1,
         'Mapping Status': 1,
+        'Serial No': 1, 'Ward Name': 1, 'Community': 1, 'Category': 1,
+        'Ward Classification': 1, 'Risk Status': 1, 'Action Priority': 1,
+        'Poll Status 2023': 1, 'Religion': 1, 'Section Name': 1,
+        'Polling Station Name': 1, 'Polling Station Address': 1,
+        'Voter Address': 1,
     }
     _PROJ_02 = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
                 'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,
@@ -4824,7 +4842,20 @@ def api_check_sir(request):
             'part':   _f25['ward'],
             'score':  round(min(100.0, _c25)),
             'matched_by': flags,
-            'mapping_status': _f25['mapping_status'],
+            'mapping_status':           _f25['mapping_status'],
+            'serial':                   _f25['serial'],
+            'ward_name':                _f25['ward_name'],
+            'community':                _f25['community'],
+            'category':                 _f25['category'],
+            'ward_classification':      _f25['ward_classification'],
+            'risk_status':              _f25['risk_status'],
+            'action_priority':          _f25['action_priority'],
+            'poll_status_2023':         _f25['poll_status_2023'],
+            'religion':                 _f25['religion'],
+            'section_name':             _f25['section_name'],
+            'polling_station_name':     _f25['polling_station_name'],
+            'polling_station_address':  _f25['polling_station_address'],
+            'voter_address':            _f25['voter_address'],
         }))
 
     _scored25.sort(key=lambda x: (-x[0], -x[1]))
