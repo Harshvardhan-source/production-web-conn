@@ -54,6 +54,10 @@ urlpatterns = [
     path('sir-bulk/',                views.api_sir_bulk,           name='api_sir_bulk'),
     path('sir/records/',             views.api_sir_records,        name='api_sir_records'),
     path('sir/stats/',               views.api_sir_stats,          name='api_sir_stats'),
+    # DK-wide (entire Dakshina Kannada) SIR search now runs on Elasticsearch —
+    # this rebuilds the ES indices from the DK Mongo collections. Admin only.
+    # POST body: {"timeline": "both"|"2025"|"2002", "force": false}
+    path('sir/es-sync/',             views.api_sir_es_sync,        name='api_sir_es_sync'),
 
     path('update-voter/',            views.api_update_voter,       name='api_update_voter'),
     path('update-survey/',           views.api_update_survey,      name='api_update_survey'),

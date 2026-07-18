@@ -188,6 +188,17 @@ try:
 except ImportError:
     _RAPIDFUZZ_AVAILABLE = False
 
+# ── Elasticsearch — powers the DK-wide (Dakshina Kannada) SIR search engine ────
+# below. Optional import, same reasoning as rapidfuzz above: the app should
+# still start (and every non-SIR endpoint still work) even if the package or
+# the cluster isn't reachable at import time; SIR search functions degrade
+# to an explicit error rather than crashing the whole process.
+try:
+    from elasticsearch import Elasticsearch as _Elasticsearch
+    _ELASTICSEARCH_PKG_AVAILABLE = True
+except ImportError:
+    _ELASTICSEARCH_PKG_AVAILABLE = False
+
 # ── 2002 voter list — loaded from local xlsx (backend/2002.xlsx) ──────────────
 import os as _os
 
@@ -285,6 +296,76 @@ except Exception as _e:
     import logging as _logging
     _logging.getLogger('views').error('[DB] _client_main1 failed to initialise: %s', _e)
     _client_main1 = None
+
+# ── DK (entire Dakshina Kannada) SIR dataset — separate Mongo client ──────────
+# The old SIR module below only ever covered the Mangalore South subset that
+# lives in 2025_new_mapped_notmapped_hmc / 2002. As of this upgrade, SIR
+# search runs against the full Dakshina Kannada 2002/2025 rolls instead,
+# which live in their own collections (possibly their own cluster — kept as
+# a separate client rather than assumed to be the same as MONGODB_URL, so a
+# wrong assumption here fails loudly instead of silently querying empty
+# collections). Same eager-at-import-time reasoning as the clients above.
+DK_MONGO_URL = _os.getenv(
+    'DK_SIR_MONGO_URL',
+    'mongodb+srv://ravindraacharya0512:2Dlb9csFBkM9n9Bs@cluster0.ynaiaut.mongodb.net/?appName=Cluster0',
+)
+DK_MONGO_DB_2002   = _os.getenv('DK_SIR_MONGO_DB_2002', 'SurveyDataBase')
+DK_MONGO_COL_2002  = _os.getenv('DK_SIR_MONGO_COL_2002', 'DK_2002_new2')
+DK_MONGO_DB_2025   = _os.getenv('DK_SIR_MONGO_DB_2025', 'SurveyDataBase')
+DK_MONGO_COL_2025  = _os.getenv('DK_SIR_MONGO_COL_2025', 'DK')
+
+try:
+    _client_dk = MongoClient(
+        DK_MONGO_URL,
+        maxPoolSize=5, minPoolSize=1,
+        **_MONGO_OPTS,
+    )
+except Exception as _e:
+    import logging as _logging
+    _logging.getLogger('views').error('[DB] _client_dk failed to initialise: %s', _e)
+    _client_dk = None
+
+
+def get_dk_db_2002():
+    """DK-wide 2002 baseline roll (may be a different cluster/db than get_db())."""
+    if _client_dk is None:
+        raise RuntimeError('DK MongoDB client not initialised. Check DK_SIR_MONGO_URL and server logs.')
+    return _client_dk.get_database(DK_MONGO_DB_2002)
+
+
+def get_dk_db_2025():
+    """DK-wide 2025 current roll (may be a different cluster/db than get_db())."""
+    if _client_dk is None:
+        raise RuntimeError('DK MongoDB client not initialised. Check DK_SIR_MONGO_URL and server logs.')
+    return _client_dk.get_database(DK_MONGO_DB_2025)
+
+
+# ── DK SIR — Elasticsearch client ──────────────────────────────────────────────
+# Powers prefix/fuzzy search across the full DK dataset. The old module's Mongo
+# regex-prefix scans (_gen_prefixes + $regex '^prefix') worked at
+# single-constituency scale but don't scale to the full district — this is
+# exactly the edge_ngram-indexed search built in the standalone SIR
+# all-in-one script (search_engine.py / es_sync.py), ported in below.
+SIR_ES_HOSTS       = _os.getenv('SIR_ES_HOSTS', 'http://localhost:9200').split(',')
+SIR_ES_INDEX_2025  = _os.getenv('SIR_ES_INDEX_2025', 'voters_2025')
+SIR_ES_INDEX_2002  = _os.getenv('SIR_ES_INDEX_2002', 'voters_2002')
+SIR_ES_USERNAME    = _os.getenv('SIR_ES_USERNAME') or None
+SIR_ES_PASSWORD    = _os.getenv('SIR_ES_PASSWORD') or None
+
+if _ELASTICSEARCH_PKG_AVAILABLE:
+    try:
+        _es_client = _Elasticsearch(
+            SIR_ES_HOSTS,
+            basic_auth=(SIR_ES_USERNAME, SIR_ES_PASSWORD) if SIR_ES_USERNAME else None,
+            request_timeout=30,
+            retry_on_timeout=True, max_retries=3,
+        )
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger('views').error('[DB] _es_client failed to initialise: %s', _e)
+        _es_client = None
+else:
+    _es_client = None
 
 
 def get_db():
@@ -3457,11 +3538,697 @@ def api_house_search(request):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SIR — SUMMARY INTENSIVE REVISION
-# 2002 voter list → MongoDB  SurveyDataBase.2002
-# 2025 voter list → MongoDB  SurveyDataBase.2025
+# DK-WIDE SIR SEARCH ENGINE (Elasticsearch) — replaces the old Mangalore-South-
+# only Mongo lookup as the primary search/match engine for the SIR module below.
+#
+# Context: the old SIR module (next section) was hand-built and hand-tuned
+# against a single-constituency dataset (Mangalore South) living in the
+# `2025_new_mapped_notmapped_hmc` / `2002` Mongo collections, using Mongo
+# regex-prefix scans for candidate retrieval. That approach doesn't scale to
+# the full Dakshina Kannada district (regex prefix scans without a real text
+# index get slow/expensive at district scale) — hence the move to
+# Elasticsearch, ported in from the standalone SIR all-in-one script
+# (config.py / schema_mapping.py / name_variants.py / search_engine.py /
+# es_sync.py) that was already built and verified against the DK collections.
+#
+# Design: Elasticsearch is used for CANDIDATE RETRIEVAL ONLY (broad recall,
+# powered by its edge_ngram + fuzzy tiering) — the actual accept/reject and
+# ranking decisions reuse this file's own `_name_score()` composite fuzzy
+# scorer (phonetic-norm + rapidfuzz + Levenshtein, already tuned against real
+# OCR'd voter-roll data below), so retrieved candidates are judged by the
+# same scoring the old module used, just against a much larger candidate
+# pool than a Mongo regex scan could efficiently produce at this scale.
+#
+# What's intentionally NOT changed by this: the confirm-and-save workflow,
+# GCS photo upload, JWT auth, category taxonomy (NEW_ADDITION / DELETION /
+# MODIFICATION / RETAINED / NOT_FOUND / SUSPICIOUS), and SIR_* Mongo
+# collection writes in _run_sir_analysis — all of that stays exactly as it
+# was; only "how do we find/rank matching voter records" changes.
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── DK schema mapping — ported from schema_mapping.py ─────────────────────────
+# The DK 2002/2025 collections use different real field names from each other
+# (different digitization pipelines) AND from the old Mangalore-South
+# collections — this maps both into one canonical shape at ES INDEX time
+# (see _dk_normalize_doc / _dk_sync_timeline below), so nothing downstream of
+# Elasticsearch needs to know about raw Mongo field names at all.
+
+def _dk_clean_value(v):
+    """ES's bulk API requires strict JSON — NaN/Infinity floats (which some
+    OCR/pandas pipeline steps leave behind) get rejected; convert to None."""
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    return v
+
+
+def _dk_corrected(doc, raw_key, changed_key, corrected_key):
+    raw = (doc.get(raw_key) or '').strip() if raw_key else ''
+    if changed_key and corrected_key and doc.get(changed_key):
+        corrected = (doc.get(corrected_key) or '').strip()
+        if corrected:
+            return corrected
+    return raw
+
+
+DK_SCHEMA_2002 = {
+    'epic_no': 'voter_id_/_epic_no',
+    # door_no/part_no: OCR'd across ~600+ PDF pages in separate batches, key
+    # punctuation drifts between batches — lists here are tried in order,
+    # first key present wins. DO NOT collapse this to a single hardcoded key.
+    'door_no': ['house_/_flat_no', 'house_/flat_no', 'house_flat_no'],
+    'name_raw': 'voter_name_(english)',
+    'name_changed': 'Name_Changed',
+    'name_corrected': 'Name_Corrected',
+    'relation_name_raw': 'relative_name_(english)',
+    'relation_name_changed': 'RelativeName_Changed',
+    'relation_name_corrected': 'RelativeName_Corrected',
+    'relation_type': 'relationship',
+    'age': 'age',
+    'gender': 'gender',
+    'part_no': ['part_no_(ಭಾಗ)', 'part_no(ಭಾಗ)', 'part_no'],
+    'serial_no': 'serial_no',
+    'constituency': 'constituency',
+    'status': None,
+    'religion': 'Religion',
+    'community': 'Community',
+}
+
+DK_SCHEMA_2025 = {
+    'epic_no': 'voterid',
+    'door_no': 'address',
+    'name_raw': 'name',
+    'name_changed': 'Name_Changed',
+    'name_corrected': 'Name_Corrected',
+    'relation_name_raw': 'relative_name',
+    'relation_name_changed': 'Relative Name_Changed',
+    'relation_name_corrected': 'Relative Name_Corrected',
+    'relation_type': 'relation_type',
+    'age': 'age',
+    'gender': 'gender',
+    'part_no': 'part_no',
+    'serial_no': None,
+    'constituency': 'assembly_constituency_name',
+    'status': None,
+    'religion': 'Religion',
+    'community': 'Community',
+}
+
+
+def _dk_normalize_doc(doc, schema):
+    """Raw Mongo doc (DK schema) → canonical dict. Used at ES-index time
+    (_dk_sync_timeline) so every downstream consumer only ever sees this
+    canonical shape, never the raw per-collection field names."""
+    name = _dk_corrected(doc, schema['name_raw'], schema['name_changed'], schema['name_corrected'])
+    relation_name = _dk_corrected(doc, schema['relation_name_raw'],
+                                   schema['relation_name_changed'], schema['relation_name_corrected'])
+
+    def g(key):
+        field = schema.get(key)
+        if not field:
+            return None
+        candidates = field if isinstance(field, list) else [field]
+        for cand in candidates:
+            if cand in doc and doc.get(cand) not in (None, ''):
+                return doc.get(cand)
+        return None
+
+    epic = g('epic_no')
+    canon = {
+        'epic_no': (str(epic).strip() if epic else None) or None,
+        'door_no': g('door_no'),
+        'voter_name': name or None,
+        'relation_name': relation_name or None,
+        'relation_type': g('relation_type'),
+        'age': g('age'),
+        'gender': g('gender'),
+        'part_no': g('part_no'),
+        'serial_no': g('serial_no'),
+        'constituency': g('constituency') or 'Dakshina Kannada',
+        'status': g('status') or 'ACTIVE',
+        'religion': g('religion'),
+        'community': g('community'),
+        'mongo_id': str(doc.get('_id')),
+    }
+    return {k: _dk_clean_value(v) for k, v in canon.items()}
+
+
+# ── DK name-variant widening — ported from name_variants.py ───────────────────
+# Widens the ES query for name/relation fields only (nickname + mechanical
+# transliteration substitutions). NOT used for anything decisional (SIR
+# category, confirmed-match) — only to widen what candidate pool ES returns,
+# same as the standalone script's stated design ("low stakes to widen what a
+# human/scorer sees, high stakes to widen what's auto-treated as a match").
+DK_NICKNAMES = {
+    'ravindra': ['ravi'], 'ravindran': ['ravi'], 'surendra': ['suri'], 'narendra': ['naren'],
+    'rajendra': ['raju', 'raja'], 'devendra': ['deva'], 'virendra': ['viru'], 'dharmendra': ['dharma'],
+    'yashwanth': ['yash'], 'yashwant': ['yash'],
+    'krishnamurthy': ['krishna', 'murthy'], 'krishnappa': ['krishna'],
+    'ramakrishna': ['ram', 'krishna'], 'gopalakrishna': ['gopal', 'krishna'],
+    'venkataramana': ['venkat', 'venky'], 'venkataraman': ['venkat', 'venky'], 'venkatesh': ['venkat', 'venky'],
+    'lakshminarayana': ['lakshman', 'narayan'], 'sathyanarayana': ['sathya'],
+    'chandrashekhar': ['chandra'], 'chandrasekhara': ['chandra'],
+    'vishwanatha': ['vishu'], 'vishwanath': ['vishu'],
+    'manjunatha': ['manju'], 'manjunath': ['manju'],
+    'puttaswamy': ['putta'], 'basavaraju': ['basu'],
+    'subramanya': ['subbu'], 'subramaniam': ['subbu'],
+    'narasimha': ['simha'], 'jayarama': ['jaya'], 'jayaram': ['jaya'], 'mahalakshmi': ['lakshmi'],
+}
+_DK_REVERSE_NICKNAMES = {}
+for _dk_full, _dk_shorts in DK_NICKNAMES.items():
+    for _dk_short in _dk_shorts:
+        _DK_REVERSE_NICKNAMES.setdefault(_dk_short, []).append(_dk_full)
+
+_DK_SUFFIX_RULES = [
+    ('endra', 'endar'), ('endar', 'endra'), ('indra', 'indar'), ('indar', 'indra'),
+    ('achar', 'acharya'), ('acharya', 'achar'),
+]
+_DK_SUBSTRING_RULES = [
+    ('ee', 'i'), ('oo', 'u'), ('dh', 'd'), ('th', 't'), ('ph', 'f'), ('sh', 's'), ('v', 'w'),
+]
+
+
+def _dk_transliteration_variants(name_lower):
+    variants = set()
+    for find, replace in _DK_SUFFIX_RULES:
+        if name_lower.endswith(find):
+            variants.add(name_lower[:-len(find)] + replace)
+    for find, replace in _DK_SUBSTRING_RULES:
+        if find in name_lower:
+            variants.add(name_lower.replace(find, replace))
+        if replace in name_lower:
+            variants.add(name_lower.replace(replace, find))
+    variants.discard(name_lower)
+    return sorted(variants)
+
+
+def _dk_nickname_variants(name_lower):
+    variants = set(DK_NICKNAMES.get(name_lower, []) + _DK_REVERSE_NICKNAMES.get(name_lower, []))
+    variants.discard(name_lower)
+    return sorted(variants)
+
+
+def dk_generate_name_variants(name, max_variants=6):
+    name = (name or '').strip()
+    if not name:
+        return []
+    first_token = name.split()[0]
+    rest = name[len(first_token):]
+    lower = first_token.lower()
+    seen = {lower}
+    candidates = []
+    for v in _dk_nickname_variants(lower) + _dk_transliteration_variants(lower):
+        if v not in seen:
+            seen.add(v)
+            candidates.append(v)
+    return [name] + [v + rest for v in candidates[:max_variants]]
+
+
+# ── DK config / thresholds ──────────────────────────────────────────────────────
+DK_PREFIX_MIN_CHARS       = 3
+DK_FUZZINESS              = 'AUTO'
+DK_EXACT_MATCH_BOOST      = 50.0
+DK_RESULT_SIZE            = 100
+DK_MAX_VOTERS_PER_HOUSE   = 15
+DK_MIN_VALID_AGE          = 18
+DK_MAX_VALID_AGE          = 115
+DK_DUPLICATE_FUZZY_MIN    = 90   # rapidfuzz-scale score to treat as "same person" (DUPLICATE_PERSON)
+DK_RELATION_DRIFT_MAX     = 60   # below this relation-name similarity = drift flag
+
+
+def _dk_es():
+    if _es_client is None:
+        raise RuntimeError(
+            'Elasticsearch client not initialised for DK SIR search. '
+            'Check the elasticsearch package is installed and SIR_ES_HOSTS is reachable.'
+        )
+    return _es_client
+
+
+def _dk_index_for(timeline):
+    return SIR_ES_INDEX_2025 if timeline == '2025' else SIR_ES_INDEX_2002
+
+
+# ── Canonical-shape adapter — ES hit → the same dict shape _flat_2025/_flat_2002
+# already produce, so _run_sir_analysis / api_check_sir barely have to change. ──
+def _dk_normalize_hit(hit):
+    src = hit.get('_source', hit) if isinstance(hit, dict) and '_source' in hit else hit
+    age = src.get('age')
+    return {
+        'name':      _norm(src.get('voter_name') or ''),
+        'relation':  _norm(src.get('relation_name') or ''),
+        'house':     _norm(src.get('door_no') or ''),
+        'voterid':   _norm(src.get('epic_no') or ''),
+        'gender':    _norm(src.get('gender') or ''),
+        'age':       '' if age in (None, '') else str(age),
+        'booth':     '',                                   # not present in DK schema
+        'ward':      str(src.get('part_no') or ''),         # mirrors old code's Ward/Part conflation
+        'part_no':   str(src.get('part_no') or ''),
+        'constituency': src.get('constituency') or '',
+        'mapping_status': '',                               # classifier-only field, not in DK schema
+        'serial':    str(src.get('serial_no') or ''),
+        'ward_name': '',
+        'community': src.get('community') or '',
+        'category':  '',
+        'ward_classification': '',
+        'risk_status': '',
+        'action_priority': '',
+        'poll_status_2023': '',
+        'religion':  src.get('religion') or '',
+        'section_name': '',
+        'polling_station_name': '',
+        'polling_station_address': '',
+        'voter_address': '',
+        '_es_score': hit.get('_score', 0) if isinstance(hit, dict) else 0,
+    }
+
+
+# ── ES query building — ported from search_engine.py's SIRQueryBuilder ────────
+def _dk_field_clause_tiers(field, value, boost=1.0):
+    raw_field = f'{field}.raw'
+    value_lower = value.lower()
+    clauses = [
+        {'term': {raw_field: {'value': value_lower, 'boost': boost * DK_EXACT_MATCH_BOOST}}},
+        {'match': {field: {'query': value, 'analyzer': 'search_analyzer', 'boost': boost}}},
+    ]
+    if len(value) >= DK_PREFIX_MIN_CHARS:
+        clauses.append({'match': {field: {'query': value, 'boost': boost}}})
+    if field in ('voter_name', 'relation_name'):
+        clauses.append({'match': {f'{field}.std': {
+            'query': value, 'fuzziness': DK_FUZZINESS, 'prefix_length': 1, 'boost': boost * 0.4,
+        }}})
+    else:
+        clauses.append({'fuzzy': {raw_field: {
+            'value': value_lower, 'fuzziness': DK_FUZZINESS, 'prefix_length': 1, 'boost': boost * 0.4,
+        }}})
+    return clauses
+
+
+def _dk_name_clause(field, value, expand_variants=False):
+    value = value.strip()
+    should = []
+    variants = dk_generate_name_variants(value) if expand_variants else [value]
+    for i, v in enumerate(variants):
+        should.extend(_dk_field_clause_tiers(field, v, boost=(1.0 if i == 0 else 0.5)))
+    return {'bool': {'should': should, 'minimum_should_match': 1}}
+
+
+def _dk_candidate_query(voterid='', name='', relation='', house='', constituency='', size=DK_RESULT_SIZE):
+    """Broad OR-recall candidate query — mirrors the old module's Phase 3/4
+    'fetch everything plausible, score in Python' philosophy, just retrieving
+    from Elasticsearch instead of Mongo regex scans."""
+    should = []
+    if voterid:
+        should.append({'term': {'epic_no': voterid.strip().lower()}})
+    if name:
+        should.append(_dk_name_clause('voter_name', name, expand_variants=True))
+    if relation:
+        should.append(_dk_name_clause('relation_name', relation, expand_variants=True))
+    if house:
+        should.extend(_dk_field_clause_tiers('door_no', house))
+    if constituency:
+        should.extend(_dk_field_clause_tiers('constituency', constituency))
+    if not should:
+        return None
+    return {'query': {'bool': {'should': should, 'minimum_should_match': 1}}, 'size': size}
+
+
+def _dk_search_index(timeline, body):
+    try:
+        resp = _dk_es().search(index=_dk_index_for(timeline), body=body)
+    except Exception as e:
+        print(f'[DK SIR] ES search failed on {timeline}: {e}')
+        return []
+    return resp.get('hits', {}).get('hits', [])
+
+
+def _dk_epic_exact(timeline, voterid):
+    body = {'query': {'term': {'epic_no': voterid.strip().lower()}}, 'size': 5}
+    hits = _dk_search_index(timeline, body)
+    return _dk_normalize_hit(hits[0]) if hits else None
+
+
+def _dk_count_exact(timeline, field, value):
+    """ES-backed replacement for the old col.count_documents({field: value})
+    checks used by DUPLICATE_EPIC / HOUSE_FLOOD below."""
+    try:
+        resp = _dk_es().count(index=_dk_index_for(timeline),
+                               body={'query': {'term': {f'{field}.raw': value.strip().lower()}}})
+        return resp.get('count', 0)
+    except Exception as e:
+        print(f'[DK SIR] ES count failed on {timeline}.{field}: {e}')
+        return 0
+
+
+# ── Confirmed-match lookup — replaces _find_voter_in_2025 / _find_voter_in_2002 ──
+def _dk_find_voter(timeline, voterid, name, house, relation=''):
+    """
+    Tier 1: EPIC exact (via ES term query).
+    Tier 2: AND-combined query on whichever of name/house/relation are given,
+            validated against the top hit with _name_score() before accepting
+            it as "confirmed" — same acceptance philosophy as the old
+            per-tier thresholds, just sourced from ES candidates instead of
+            Mongo regex scans.
+    Returns a _flat_2025/_flat_2002-shaped dict, or None.
+    """
+    voterid, name, house, relation = (voterid or '').strip(), (name or '').strip(), (house or '').strip(), (relation or '').strip()
+
+    if voterid:
+        hit = _dk_epic_exact(timeline, voterid)
+        if hit:
+            return hit
+
+    if not (name or house or relation):
+        return None
+
+    body = _dk_candidate_query(voterid='', name=name, relation=relation, house=house, size=25)
+    if body is None:
+        return None
+    # Tighten to AND semantics for a "confirmed" lookup: whichever fields were
+    # supplied must ALL contribute to the should-clause's minimum_should_match.
+    n_fields = sum(1 for v in (name, house, relation) if v)
+    body['query']['bool']['minimum_should_match'] = max(1, n_fields)
+    hits = _dk_search_index(timeline, body)
+    if not hits:
+        return None
+
+    best, best_score = None, 0.0
+    for hit in hits:
+        cand = _dk_normalize_hit(hit)
+        n_sc = _name_score(name, cand['name']) if (name and cand['name']) else (100.0 if not name else 0.0)
+        r_sc = _name_score(relation, cand['relation']) if (relation and cand['relation']) else (100.0 if not relation else 0.0)
+        h_ok = (not house) or (cand['house'].upper() == house.upper())
+        if not h_ok:
+            continue
+        comp = (n_sc + r_sc) / (2 if (name and relation) else 1) if (name or relation) else 100.0
+        if comp > best_score:
+            best, best_score = cand, comp
+    threshold = 88 if relation else (78 if house else 90)
+    return best if (best and best_score >= threshold) else None
+
+
+# ── Matched-by tag derivation — mirrors the old module's _flags25()-style logic ──
+def _dk_matched_by(cand, voterid='', name='', relation='', house='', constituency='', name_tokens=None):
+    flags = []
+    if voterid and cand['voterid'] and voterid.upper() == cand['voterid'].upper():
+        flags.append('voterid')
+    if name and len(name) >= 2:
+        n_sc = _name_score(name, cand['name'])
+        tokens = name_tokens or [t for t in name.split() if len(t) >= 2]
+        cov = sum(1 for t in tokens if t.upper() in cand['name'].upper()) if tokens else 0
+        if n_sc >= 60 or (tokens and cov == len(tokens)):
+            flags.append('name')
+        elif cov > 0:
+            flags.append('partial')
+    if house and cand['house'] and (cand['house'].upper() == house.upper() or cand['house'].upper().startswith(house.upper())):
+        flags.append('house')
+    if relation and len(relation) >= 2 and cand['relation']:
+        r_sc = _name_score(relation, cand['relation'])
+        if r_sc >= 60:
+            rel_toks = [t for t in relation.split() if len(t) >= 2]
+            if len(rel_toks) >= 2:
+                rel_cov = sum(1 for t in rel_toks if t in cand['relation'])
+                if rel_cov / len(rel_toks) > 0.5:
+                    flags.append('relation')
+            else:
+                flags.append('relation')
+    if constituency and cand['constituency'] and constituency.upper() in cand['constituency'].upper():
+        flags.append('constituency')
+    return flags
+
+
+# ── Broad candidate search — replaces the Phase 3/4 blocks in api_check_sir ────
+def _dk_search_similar(timeline, voterid='', name='', house='', relation='', constituency='',
+                        exclude_voterid='', limit=100):
+    name_tokens = [t for t in (name.split() if name else []) if len(t) >= 2]
+    body = _dk_candidate_query(voterid=voterid, name=name, relation=relation,
+                                house=house, constituency=constituency, size=DK_RESULT_SIZE)
+    if body is None:
+        return []
+    hits = _dk_search_index(timeline, body)
+
+    scored = []
+    seen_epics = {exclude_voterid.upper()} if exclude_voterid else set()
+    for hit in hits:
+        cand = _dk_normalize_hit(hit)
+        if cand['voterid'] and cand['voterid'].upper() in seen_epics:
+            continue
+        flags = _dk_matched_by(cand, voterid, name, relation, house, constituency, name_tokens)
+        if not flags:
+            continue
+        if cand['voterid']:
+            seen_epics.add(cand['voterid'].upper())
+        weighted = len([f for f in flags if f != 'partial'])
+        cand['matched_by'] = flags
+        cand['score'] = round(min(100.0, cand['_es_score'] * 10))  # rough 0-100 normalisation of ES's own score
+        scored.append((weighted, cand['_es_score'], cand))
+
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    return [c for _, _, c in scored[:limit]]
+
+
+# ── Targeted anomaly checks — ported from anomaly_detector.py, run per-search ──
+# (not a full district-wide bulk scan — these run only against the specific
+# voter/house just looked up, which is the right performance shape for a
+# live request; see anomaly_detector.py's run_full_audit() for the batch
+# equivalent if a scheduled/offline audit job is ever wired up separately.)
+def _dk_check_age_anomaly(cand, timeline):
+    try:
+        age = int(cand['age'])
+    except (TypeError, ValueError):
+        return None
+    if age < DK_MIN_VALID_AGE or age > DK_MAX_VALID_AGE:
+        return {'flag': 'AGE_ANOMALY', 'label': 'Implausible Age',
+                'detail': f'Age {age} is outside the plausible {DK_MIN_VALID_AGE}-{DK_MAX_VALID_AGE} range in the {timeline} roll.',
+                'value': age}
+    return None
+
+
+def _dk_check_duplicate_person(cand, timeline):
+    """Fuzzy name+relation+age cross-EPIC check — DUPLICATE_PERSON from
+    anomaly_detector.py, run targeted against the one matched candidate
+    rather than a full district scan."""
+    if not (cand.get('name') and cand.get('voterid')):
+        return None
+    body = _dk_candidate_query(name=cand['name'], relation=cand.get('relation', ''), size=10)
+    if body is None:
+        return None
+    for hit in _dk_search_index(timeline, body):
+        other = _dk_normalize_hit(hit)
+        if not other['voterid'] or other['voterid'] == cand['voterid']:
+            continue
+        name_score = _name_score(cand['name'], other['name'])
+        rel_score = _name_score(cand.get('relation', ''), other.get('relation', '')) if (cand.get('relation') and other.get('relation')) else 0
+        same_age = cand.get('age') and cand['age'] == other.get('age')
+        if name_score >= DK_DUPLICATE_FUZZY_MIN and rel_score >= DK_DUPLICATE_FUZZY_MIN and same_age:
+            return {'flag': 'DUPLICATE_PERSON', 'label': 'Possible Duplicate Enrolment',
+                    'detail': f'Name/relation/age match (score {round(name_score)}/{round(rel_score)}) '
+                              f'found under a different EPIC "{other["voterid"]}" in the {timeline} roll.',
+                    'value': other['voterid']}
+    return None
+
+
+def _dk_check_relation_drift(rel_2002, rel_2025):
+    if not (rel_2002 and rel_2025):
+        return None
+    score = _name_score(rel_2002, rel_2025)
+    if score < DK_RELATION_DRIFT_MAX:
+        return {'flag': 'RELATION_NAME_DRIFT', 'label': 'Relation Name Drift',
+                'detail': f'Relation name changed drastically ("{rel_2002}" \u2192 "{rel_2025}", '
+                          f'similarity={round(score)}) under the same EPIC — possible EPIC re-use, verify manually.',
+                'value': round(score)}
+    return None
+
+
+# ── DK read-only preview — replaces api_check_sir's Phase1-4 block wholesale ────
+def _dk_run_check_preview(voterid, name, house, relation, constituency='',
+                           name_only_search=False, relation_only_search=False):
+    """Returns the exact _response_data shape api_check_sir already sends to
+    the frontend (results/suspicious/changes/similar_2025/suggestions_2002/
+    record_2002/record_2025) — just sourced from the DK-wide ES indices."""
+    r25 = r02 = None
+    if not (name_only_search or relation_only_search):
+        _res = [None, None]
+        _t25 = threading.Thread(target=lambda: _res.__setitem__(0, _dk_find_voter('2025', voterid, name, house, relation)), daemon=True)
+        _t02 = threading.Thread(target=lambda: _res.__setitem__(1, _dk_find_voter('2002', voterid, name, house, relation)), daemon=True)
+        _t25.start(); _t02.start(); _t25.join(); _t02.join()
+        r25, r02 = _res[0], _res[1]
+
+    in_2025, in_2002 = bool(r25), bool(r02)
+    results, changes = [], []
+
+    if in_2025 and not in_2002:
+        results.append({'category': 'NEW_ADDITION', 'label': 'New Addition', 'color': '#22d3ee', 'icon': '➕',
+                         'detail': 'Voter appears in 2025 but was absent from 2002.'})
+    elif in_2002 and not in_2025:
+        results.append({'category': 'DELETION', 'label': 'Deletion', 'color': '#ef4444', 'icon': '🗑️',
+                         'detail': 'Voter was in 2002 but removed from 2025.'})
+    elif in_2025 and in_2002:
+        for field, v02, v25 in [('Name', r02['name'], r25['name']), ('Relation', r02['relation'], r25['relation']),
+                                 ('House No', r02['house'], r25['house']), ('Gender', r02['gender'], r25['gender'])]:
+            if v02 and v25 and v02 != v25:
+                changes.append({'field': field, 'from': v02, 'to': v25})
+        try:
+            a25, a02 = int(r25['age']), int(r02['age'])
+            diff = abs(a25 - (a02 + 23))
+            if diff > 5:
+                changes.append({'field': 'Age', 'from': str(a02), 'to': str(a25),
+                                 'note': f'Expected ~{a02+23} in 2025, got {a25} (\u0394{diff} yrs)'})
+        except (ValueError, TypeError):
+            pass
+        if changes:
+            results.append({'category': 'MODIFICATION', 'label': 'Modification', 'color': '#f59e0b', 'icon': '✏️',
+                             'detail': f'{len(changes)} field(s) changed between rolls.', 'changes': changes})
+        else:
+            results.append({'category': 'RETAINED', 'label': 'Long-term Voter', 'color': '#10b981', 'icon': '\u2713',
+                             'detail': 'Voter is consistently registered in both 2002 and 2025 rolls — 23-year continuous voter.'})
+    else:
+        if name_only_search:
+            results.append({'category': 'NAME_SEARCH', 'label': 'Name Search', 'color': '#6366f1', 'icon': '🔍',
+                             'detail': 'Showing all records matching this name. Add House No or EPIC for an exact match.'})
+        elif relation_only_search:
+            results.append({'category': 'NAME_SEARCH', 'label': 'Relation Search', 'color': '#6366f1', 'icon': '🔍',
+                             'detail': 'Showing all records with this relative name. Add Voter Name or House No for an exact match.'})
+        else:
+            results.append({'category': 'NOT_FOUND', 'label': 'Unregistered / Not Traced', 'color': '#6b7fa0', 'icon': '?',
+                             'detail': 'Voter not found in either roll. May be unregistered, new to the area, or try different spelling.'})
+
+    # ── Suspicious / anomaly flags ────────────────────────────────────────────
+    suspicious = []
+    if voterid:
+        prefix = _epic_prefix(voterid)
+        if prefix and prefix not in _KA_PREFIXES:
+            suspicious.append({'flag': 'OUT_OF_STATE_EPIC', 'label': 'Out-of-State EPIC',
+                                'detail': f'Prefix "{prefix}" is not a recognised Karnataka EPIC code.', 'value': voterid})
+        dup = _dk_count_exact('2025', 'epic_no', voterid)
+        if dup > 1:
+            suspicious.append({'flag': 'DUPLICATE_EPIC', 'label': 'Duplicate EPIC',
+                                'detail': f'EPIC "{voterid}" appears {dup} times in the DK 2025 roll.', 'value': dup})
+    if house:
+        t25 = _dk_count_exact('2025', 'door_no', house)
+        t02 = _dk_count_exact('2002', 'door_no', house)
+        if t25 > DK_MAX_VOTERS_PER_HOUSE:
+            suspicious.append({'flag': 'OVERCROWDED_HOUSE', 'label': 'House Overcrowding',
+                                'detail': f'House {house} has {t25} registered voters in the 2025 roll (threshold={DK_MAX_VOTERS_PER_HOUSE}).',
+                                'value': t25})
+        net = t25 - t02
+        if net > 5:
+            suspicious.append({'flag': 'HOUSE_FLOOD', 'label': 'House Growth',
+                                'detail': f'House {house}: 2002 had {t02}, 2025 has {t25} (+{net} entries).', 'value': net})
+    for cand, timeline in ((r25, '2025'), (r02, '2002')):
+        if cand:
+            age_flag = _dk_check_age_anomaly(cand, timeline)
+            if age_flag:
+                suspicious.append(age_flag)
+    if r25:
+        dup_person = _dk_check_duplicate_person(r25, '2025')
+        if dup_person:
+            suspicious.append(dup_person)
+    if in_2025 and in_2002:
+        drift = _dk_check_relation_drift(r02['relation'], r25['relation'])
+        if drift:
+            suspicious.append(drift)
+
+    # ── Broad candidate lists for the UI's "similar records" panels ──────────
+    similar_2025 = _dk_search_similar('2025', voterid, name, house, relation, constituency,
+                                       exclude_voterid=r25['voterid'] if in_2025 else '')
+    suggestions_2002 = _dk_search_similar('2002', voterid, name, house, relation, constituency,
+                                           exclude_voterid=r02['voterid'] if in_2002 else '')
+
+    return {
+        'results': results, 'suspicious': suspicious, 'changes': changes,
+        'stored': False, 'in_2025': in_2025, 'in_2002': in_2002,
+        'similar_2025': similar_2025, 'suggestions_2002': suggestions_2002,
+        'record_2002': {k: r02.get(k, '') for k in ('name', 'relation', 'house', 'gender', 'age', 'voterid', 'booth')} if in_2002 else {},
+        'record_2025': {k: r25.get(k, '') for k in ('name', 'relation', 'house', 'gender', 'age', 'voterid', 'booth', 'ward', 'mapping_status')} if in_2025 else {},
+    }
+
+
+# ── ES index sync — ported from es_sync.py, triggers a rebuild from the DK
+# Mongo collections. Not run automatically; call via the admin-only
+# api_sir_es_sync endpoint (see urls.py: sir/es-sync/) whenever the DK Mongo
+# data changes and the ES indices need to catch up. ────────────────────────────
+def _dk_es_index_mapping():
+    return {
+        'settings': {
+            'analysis': {
+                'filter': {'edge_ngram_filter': {'type': 'edge_ngram', 'min_gram': 3, 'max_gram': 20}},
+                'normalizer': {'lowercase_normalizer': {'type': 'custom', 'filter': ['lowercase']}},
+                'analyzer': {
+                    'prefix_analyzer': {'type': 'custom', 'tokenizer': 'standard', 'filter': ['lowercase', 'edge_ngram_filter']},
+                    'search_analyzer': {'type': 'custom', 'tokenizer': 'standard', 'filter': ['lowercase']},
+                },
+            },
+            'number_of_shards': 1, 'number_of_replicas': 0, 'refresh_interval': '-1',
+        },
+        'mappings': {'properties': {
+            'epic_no': {'type': 'keyword', 'normalizer': 'lowercase_normalizer'},
+            'door_no': {'type': 'text', 'analyzer': 'prefix_analyzer', 'search_analyzer': 'search_analyzer',
+                        'fields': {'raw': {'type': 'keyword', 'normalizer': 'lowercase_normalizer'}}},
+            'voter_name': {'type': 'text', 'analyzer': 'prefix_analyzer', 'search_analyzer': 'search_analyzer',
+                           'fields': {'raw': {'type': 'keyword', 'normalizer': 'lowercase_normalizer'}, 'std': {'type': 'text'}}},
+            'relation_name': {'type': 'text', 'analyzer': 'prefix_analyzer', 'search_analyzer': 'search_analyzer',
+                               'fields': {'raw': {'type': 'keyword', 'normalizer': 'lowercase_normalizer'}, 'std': {'type': 'text'}}},
+            'relation_type': {'type': 'keyword'}, 'age': {'type': 'integer'}, 'gender': {'type': 'keyword'},
+            'part_no': {'type': 'keyword'}, 'serial_no': {'type': 'keyword'},
+            'constituency': {'type': 'text', 'analyzer': 'prefix_analyzer', 'search_analyzer': 'search_analyzer',
+                              'fields': {'raw': {'type': 'keyword', 'normalizer': 'lowercase_normalizer'}}},
+            'status': {'type': 'keyword'}, 'religion': {'type': 'keyword'}, 'community': {'type': 'keyword'},
+            'timeline_year': {'type': 'keyword'}, 'mongo_id': {'type': 'keyword'},
+        }},
+    }
+
+
+def _dk_sync_timeline(timeline, force=False):
+    from elasticsearch import helpers as _es_helpers
+    es = _dk_es()
+    index_name = _dk_index_for(timeline)
+
+    if es.indices.exists(index=index_name):
+        if force:
+            es.indices.delete(index=index_name)
+            es.indices.create(index=index_name, body=_dk_es_index_mapping())
+    else:
+        es.indices.create(index=index_name, body=_dk_es_index_mapping())
+
+    if timeline == '2025':
+        coll, schema = get_dk_db_2025()[DK_MONGO_COL_2025], DK_SCHEMA_2025
+    else:
+        coll, schema = get_dk_db_2002()[DK_MONGO_COL_2002], DK_SCHEMA_2002
+
+    total = coll.count_documents({})
+
+    def _actions():
+        for doc in coll.find({}, batch_size=1000):
+            canon = _dk_normalize_doc(doc, schema)
+            canon['timeline_year'] = timeline
+            yield {'_index': index_name, '_id': canon['mongo_id'], '_source': canon}
+
+    success, errors = _es_helpers.bulk(es, _actions(), chunk_size=500, raise_on_error=False, stats_only=False)
+    try:
+        es.indices.put_settings(index=index_name, settings={'refresh_interval': '1s'})
+        es.indices.refresh(index=index_name)
+    except Exception as e:
+        print(f'[DK SIR] Could not restore refresh_interval on {index_name}: {e}')
+    return {'timeline': timeline, 'total': total, 'indexed': success,
+            'errors': len(errors) if isinstance(errors, list) else errors}
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OLD SIR MODULE (Mangalore South only) — LEGACY
+# 2002 voter list → MongoDB  SurveyDataBase.2002
+# 2025 voter list → MongoDB  SurveyDataBase.2025
+#
+# Superseded by the DK-wide Elasticsearch engine above. The functions below
+# (_find_voter_in_2025, _find_voter_in_2002, _score_candidates, etc.) are no
+# longer called by _run_sir_analysis or api_check_sir — kept in place,
+# unused, as a reference/rollback path rather than deleted outright, since
+# this logic was hand-tuned against real production data over time and
+# neither of us can fully re-verify that tuning without live traffic.
+# ═══════════════════════════════════════════════════════════════════════════════
 _KA_PREFIXES = {
     'NUX','KAX','KAP','SCX','SXK','JWX','XKA','ZMK','YHX','TFX',
     'KXA','NUK','KAZ','SKA','KAS','AKA','NAX','ZKA',
@@ -4143,16 +4910,15 @@ def _run_sir_analysis(voterid, name, house, ward, booth, serial, relation='',
     if write_db is None:
         write_db = read_db
 
-    col_2025 = read_db['2025_new_mapped_notmapped_hmc']
-    col_2002 = get_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
-
-    # ── Look up in both rolls — parallel threads ─────────────────────────────────
+    # ── Look up in both DK-wide rolls (Elasticsearch-backed) — parallel threads ──
+    # Was: col_2025 = read_db['2025_new_mapped_notmapped_hmc']; col_2002 = get_db()['2002']
+    #      + _find_voter_in_2025 / _find_voter_in_2002 (Mangalore-South-only, legacy below).
     _rr = [None, None]
-    _tA = threading.Thread(target=lambda: _rr.__setitem__(0, _find_voter_in_2025(col_2025, voterid, name, house, relation)), daemon=True)
-    _tB = threading.Thread(target=lambda: _rr.__setitem__(1, _find_voter_in_2002(col_2002, voterid, name, house, relation)), daemon=True)
+    _tA = threading.Thread(target=lambda: _rr.__setitem__(0, _dk_find_voter('2025', voterid, name, house, relation)), daemon=True)
+    _tB = threading.Thread(target=lambda: _rr.__setitem__(1, _dk_find_voter('2002', voterid, name, house, relation)), daemon=True)
     _tA.start(); _tB.start(); _tA.join(); _tB.join()
-    r25 = _flat_2025(_rr[0])
-    r02 = _flat_2002(_rr[1])
+    r25 = _rr[0] or {}
+    r02 = _rr[1] or {}
 
     in_2025 = bool(r25)
     in_2002 = bool(r02)
@@ -4269,20 +5035,43 @@ def _run_sir_analysis(voterid, name, house, ward, booth, serial, relation='',
             suspicious.append({'flag': 'OUT_OF_STATE_EPIC', 'label': 'Out-of-State EPIC',
                                 'detail': f'Prefix "{prefix}" is not a Karnataka code.',
                                 'value': voterid})
-        dup = col_2025.count_documents({'$or': [{'Epic NO': voterid}, {'Epic No': voterid}, {'EPIC No': voterid}]})
+        # Was: col_2025.count_documents({'$or': [{'Epic NO': voterid}, ...]})
+        dup = _dk_count_exact('2025', 'epic_no', voterid)
         if dup > 1:
             suspicious.append({'flag': 'DUPLICATE_EPIC', 'label': 'Duplicate EPIC',
-                                'detail': f'EPIC "{voterid}" appears {dup} times in the 2025 list.',
+                                'detail': f'EPIC "{voterid}" appears {dup} times in the DK 2025 roll.',
                                 'value': dup})
 
     if house:
-        t25 = col_2025.count_documents({'House No': house})
-        t02 = col_2002.count_documents({'House / Flat No': house})  # correct 2002 field
+        # Was: col_2025.count_documents({'House No': house}) / col_2002.count_documents({'House / Flat No': house})
+        t25 = _dk_count_exact('2025', 'door_no', house)
+        t02 = _dk_count_exact('2002', 'door_no', house)
+        if t25 > DK_MAX_VOTERS_PER_HOUSE:
+            suspicious.append({'flag': 'OVERCROWDED_HOUSE', 'label': 'House Overcrowding',
+                                'detail': f'House {house} has {t25} registered voters in the DK 2025 roll (threshold={DK_MAX_VOTERS_PER_HOUSE}).',
+                                'value': t25})
         net = t25 - t02
         if net > 5:
-            suspicious.append({'flag': 'HOUSE_FLOOD', 'label': 'House Overcrowding',
+            suspicious.append({'flag': 'HOUSE_FLOOD', 'label': 'House Growth',
                                 'detail': f'House {house} gained {net} new entries (2002: {t02} → 2025: {t25}).',
                                 'value': net})
+
+    # ── Additional anomaly checks ported from anomaly_detector.py — AGE_ANOMALY,
+    # DUPLICATE_PERSON, RELATION_NAME_DRIFT. Targeted at this specific voter,
+    # not a full district-wide scan (see _dk_run_check_preview's docstring). ──
+    for _cand, _tl in ((r25, '2025'), (r02, '2002')):
+        if _cand:
+            _age_flag = _dk_check_age_anomaly(_cand, _tl)
+            if _age_flag:
+                suspicious.append(_age_flag)
+    if r25:
+        _dup_person = _dk_check_duplicate_person(r25, '2025')
+        if _dup_person:
+            suspicious.append(_dup_person)
+    if in_2025 and in_2002:
+        _drift = _dk_check_relation_drift(r02.get('relation', ''), r25.get('relation', ''))
+        if _drift:
+            suspicious.append(_drift)
 
     for s in suspicious:
         doc = {**base, 'category': 'SUSPICIOUS',
@@ -4356,548 +5145,25 @@ def api_check_sir(request):
         sir = _run_sir_analysis(voterid, name, house, ward, booth, serial, relation, db=db)
         return _sir_cors(request, JsonResponse({'success': True, **sir}))
 
-    # ── Read-only preview (no DB writes) ──────────────────────────────────────
-    col_2025 = db['2025_new_mapped_notmapped_hmc']
-    col_2002 = get_db()['2002']  # 2002 roll lives on the _SURVEY_URL cluster
+    # ── Read-only preview (no DB writes) — DK-wide Elasticsearch engine ───────
+    # Was: col_2025 = db['2025_new_mapped_notmapped_hmc']; col_2002 = get_db()['2002']
+    #      + ~550 lines of Mongo regex-scan candidate fetching/scoring (Phase 1-4),
+    #      now in _dk_run_check_preview() in the DK SIR engine section above,
+    #      which returns this exact same response shape.
+    constituency = _norm(body.get('constituency', ''))
 
-    # ── Pre-compute name tokens and prefix variants ─────────────────────────────────────────
-    # Split name into individual tokens used by all 4 parallel phases.
-    # Filter out single-char initials (e.g. "A." or "K") from token list since
-    # they produce too many false positives in a contains search.
-    _name_tokens_list = [t for t in (name.split() if name else []) if len(t) >= 2]
-    _name_tok         = _name_tokens_list[0] if _name_tokens_list else ''
-    _name_prefixes    = _gen_prefixes(_name_tok) if _name_tok else ()
-
-    _PROJ_25 = {
-        'Name': 1,
-        'Relation Name': 1, 'Relative Name': 1,   # old / new schema
-        'Epic NO': 1,       'Epic No': 1,  'EPIC No': 1,  # old / new schema
-        'House No': 1, 'Gender': 1, 'Age': 1,
-        'Booth No': 1, 'Part No': 1, 'Ward No': 1,
-        'Mapping Status': 1,
-        'Serial No': 1, 'Ward Name': 1, 'Community': 1, 'Category': 1,
-        'Ward Classification': 1, 'Risk Status': 1, 'Action Priority': 1,
-        'Poll Status 2023': 1, 'Religion': 1, 'Section Name': 1,
-        'Polling Station Name': 1, 'Polling Station Address': 1,
-        'Voter Address': 1,
-    }
-    _PROJ_02 = {'Voter Name':1,'Name':1,'Relative Name':1,'Relation Name':1,
-                'House / Flat No':1,'House No':1,'Voter ID / EPIC No':1,'Epic NO':1,
-                'Gender':1,'Age':1,'Booth No':1,'Part No':1,'Serial No':1}
-
-    # ── Phase 1+2: confirmed-match lookups ────────────────────────────────────
-    # Skip confirmed-match lookup when ONLY name is provided (no EPIC, no house,
-    # no relation). In that case there are too many candidates to pick one —
-    # we return 100 similar records instead and let the user choose.
     _name_only_search     = bool(name     and not voterid and not house and not relation)
-    # Relation-only: only relation provided, nothing else — confirmed-match lookups
-    # can't pin a single voter, so skip them and rely on similarity scoring instead.
     _relation_only_search = bool(relation and not name   and not voterid and not house)
 
-    _res = [None, None]
-    def _t25(): _res[0] = (None if (_name_only_search or _relation_only_search) else _find_voter_in_2025(col_2025, voterid, name, house, relation))
-    def _t02(): _res[1] = (None if (_name_only_search or _relation_only_search) else _find_voter_in_2002(col_2002, voterid, name, house, relation))
-
-    # ── Phase 3: fetch ALL 2002 candidates – token-aware contains + intersection ────────
-    _raw02 = []
-    def _t_sugg02():
-        try:
-            seen = set()
-            def _add(cur):
-                for d in cur:
-                    oid = str(d.get('_id',''))
-                    if oid not in seen: seen.add(oid); _raw02.append(d)
-
-            # a) EPIC exact
-            if voterid:
-                _add(col_2002.find({'$or':[{'Voter ID / EPIC No':voterid},{'Epic NO':voterid}]}, _PROJ_02).limit(5))
-
-            # b) House exact + prefix
-            if house:
-                _add(col_2002.find({'$or':[{'House / Flat No':house},{'House No':house}]}, _PROJ_02).limit(60))
-                h_pfx = {'$regex':f'^{re.escape(house)}','$options':'i'}
-                _add(col_2002.find({'$or':[{'House / Flat No':h_pfx},{'House No':h_pfx}]}, _PROJ_02).limit(60))
-
-            if _name_tokens_list:
-                # c) Single-token search: contains each token anywhere in name
-                #    This catches "AKSHAYA RAJESH", "B RAJESH BALIGA" etc.
-                _tok_lim = 150 if _name_only_search else 80
-                for tok in _name_tokens_list:
-                    rx = {'$regex': re.escape(tok), '$options': 'i'}
-                    _add(col_2002.find({'$or':[{'Voter Name':rx},{'Name':rx}]}, _PROJ_02).limit(_tok_lim))
-
-                # d) Multi-token AND: all tokens must appear somewhere in the name
-                #    "RAJESH SHETTY" -> Name contains RAJESH AND Name contains SHETTY
-                #    Produces the most relevant results for multi-word queries
-                if len(_name_tokens_list) >= 2:
-                    and_clauses = []
-                    for tok in _name_tokens_list:
-                        rx = {'$regex': re.escape(tok), '$options': 'i'}
-                        and_clauses.append({'$or':[{'Voter Name':rx},{'Name':rx}]})
-                    _add(col_2002.find({'$and': and_clauses}, _PROJ_02).limit(200))
-
-                # e) Phonetic prefix variants (original fallback for transliteration)
-                if _name_tok:
-                    clauses = []
-                    for p in _name_prefixes:
-                        rx = {'$regex':f'^{re.escape(p)}','$options':'i'}
-                        clauses.append({'Voter Name':rx}); clauses.append({'Name':rx})
-                    _add(col_2002.find({'$or':clauses}, _PROJ_02).limit(150))
-
-            # f) Relation prefix — greatly expanded for relation-only searches
-            if relation and len(relation) >= 2:
-                frt = relation.split()[0]
-                rpfx = {'$regex':f'^{re.escape(frt[:min(5,len(frt))])}','$options':'i'}
-                _rel_lim = 500 if _relation_only_search else 100
-                _add(col_2002.find({'$or':[{'Relative Name':rpfx},{'Relation Name':rpfx}]}, _PROJ_02).limit(_rel_lim))
-                # For relation-only: also fetch all tokens of the relation name individually
-                if _relation_only_search:
-                    for _rtok in relation.split():
-                        if len(_rtok) >= 3:
-                            _rx = {'$regex': re.escape(_rtok), '$options': 'i'}
-                            _add(col_2002.find({'$or':[{'Relative Name':_rx},{'Relation Name':_rx}]}, _PROJ_02).limit(100))
-        except Exception:
-            pass
-
-    # ── Phase 4: fetch ALL 2025 similar candidates – token-aware contains + intersection ────
-    _raw25 = []
-    def _t_sim25():
-        try:
-            seen = set()
-            def _add(cur):
-                for d in cur:
-                    oid = str(d.get('_id',''))
-                    if oid not in seen: seen.add(oid); _raw25.append(bson_clean(d))
-
-            if voterid:
-                _add(col_2025.find(
-                    {'$or': [{'Epic NO': voterid}, {'Epic No': voterid}, {'EPIC No': voterid}]},
-                    _PROJ_25
-                ).limit(5))
-
-            if house:
-                _add(col_2025.find({'House No':house}, _PROJ_25).limit(60))
-                h_pfx = {'$regex':f'^{re.escape(house)}','$options':'i'}
-                _add(col_2025.find({'House No':h_pfx}, _PROJ_25).limit(60))
-
-            if _name_tokens_list:
-                # c) Contains search for each token — catches mid-name occurrences
-                _tok_lim25 = 150 if _name_only_search else 80
-                for tok in _name_tokens_list:
-                    rx = {'$regex': re.escape(tok), '$options': 'i'}
-                    _add(col_2025.find({'Name': rx}, _PROJ_25).limit(_tok_lim25))
-
-                # d) Multi-token AND intersection — highest precision for multi-word queries
-                if len(_name_tokens_list) >= 2:
-                    and_clauses = [{'Name':{'$regex':re.escape(tok),'$options':'i'}} for tok in _name_tokens_list]
-                    _add(col_2025.find({'$and': and_clauses}, _PROJ_25).limit(200))
-
-                # e) Phonetic prefix variants fallback
-                if _name_tok:
-                    clauses = [{'Name':{'$regex':f'^{re.escape(p)}','$options':'i'}} for p in _name_prefixes]
-                    _add(col_2025.find({'$or':clauses}, _PROJ_25).limit(150))
-
-            if relation and len(relation) >= 3:
-                frt = relation.split()[0]
-                rpfx = {'$regex':f'^{re.escape(frt[:min(5,len(frt))])}','$options':'i'}
-                _rel_lim25 = 500 if _relation_only_search else 100
-                _add(col_2025.find({'Relation Name':rpfx}, _PROJ_25).limit(_rel_lim25))
-                # For relation-only: also fetch per-token contains matches
-                if _relation_only_search:
-                    for _rtok in relation.split():
-                        if len(_rtok) >= 3:
-                            _rx = {'$regex': re.escape(_rtok), '$options': 'i'}
-                            _add(col_2025.find({'Relation Name': _rx}, _PROJ_25).limit(100))
-        except Exception:
-            pass
-
-    # Launch all 4 phases in parallel
-    _ta = threading.Thread(target=_t25,      daemon=True)
-    _tb = threading.Thread(target=_t02,      daemon=True)
-    _tc = threading.Thread(target=_t_sugg02, daemon=True)
-    _td = threading.Thread(target=_t_sim25,  daemon=True)
-    _ta.start(); _tb.start(); _tc.start(); _td.start()
-    _ta.join();  _tb.join();  _tc.join();  _td.join()
-
-    r25 = _flat_2025(_res[0])
-    r02 = _flat_2002(_res[1])
-
-    in_2025 = bool(r25)
-    in_2002 = bool(r02)
-    results = []
-    changes = []
-
-    if in_2025 and not in_2002:
-        results.append({'category': 'NEW_ADDITION', 'label': 'New Addition',
-                        'color': '#22d3ee', 'icon': '➕',
-                        'detail': 'Voter appears in 2025 but was absent from 2002.'})
-
-    elif in_2002 and not in_2025:
-        results.append({'category': 'DELETION', 'label': 'Deletion',
-                        'color': '#ef4444', 'icon': '🗑️',
-                        'detail': 'Voter was in 2002 but removed from 2025.'})
-
-    elif in_2025 and in_2002:
-        for field, v02, v25 in [
-            ('Name',     r02['name'],     r25['name']),
-            ('Relation', r02['relation'], r25['relation']),
-            ('House No', r02['house'],    r25['house']),
-            ('Gender',   r02['gender'],   r25['gender']),
-        ]:
-            if v02 and v25 and v02 != v25:
-                changes.append({'field': field, 'from': v02, 'to': v25})
-        try:
-            a25, a02 = int(r25['age']), int(r02['age'])
-            diff = abs(a25 - (a02 + 23))
-            if diff > 5:
-                changes.append({
-                    'field': 'Age', 'from': str(a02), 'to': str(a25),
-                    'note': 'Expected ~{} in 2025, got {} (Δ{} yrs)'.format(a02 + 23, a25, diff)
-                })
-        except (ValueError, TypeError):
-            pass
-
-        if changes:
-            results.append({'category': 'MODIFICATION', 'label': 'Modification',
-                            'color': '#f59e0b', 'icon': '✏️',
-                            'detail': '{} field(s) changed between rolls.'.format(len(changes)),
-                            'changes': changes})
-        else:
-            results.append({'category': 'RETAINED', 'label': 'Long-term Voter',
-                            'color': '#10b981', 'icon': '✓',
-                            'detail': 'Voter is consistently registered in both 2002 and 2025 rolls — 23-year continuous voter.'})
-    else:
-        if _name_only_search:
-            results.append({'category': 'NAME_SEARCH', 'label': 'Name Search',
-                            'color': '#6366f1', 'icon': '🔍',
-                            'detail': 'Showing all records matching this name. Add House No or EPIC for an exact match.'})
-        elif _relation_only_search:
-            results.append({'category': 'NAME_SEARCH', 'label': 'Relation Search',
-                            'color': '#6366f1', 'icon': '🔍',
-                            'detail': 'Showing all records with this relative name. Add Voter Name or House No for an exact match.'})
-        else:
-            results.append({'category': 'NOT_FOUND', 'label': 'Unregistered / Not Traced',
-                            'color': '#6b7fa0', 'icon': '?',
-                            'detail': 'Voter not found in either roll. May be unregistered, new to the area, or try different spelling.'})
-
-    # ── Anomaly flags ─────────────────────────────────────────────────────────
-    suspicious = []
-    if voterid:
-        prefix = _epic_prefix(voterid)
-        if prefix and prefix not in _KA_PREFIXES:
-            suspicious.append({
-                'flag': 'OUT_OF_STATE_EPIC', 'label': 'Out-of-State EPIC',
-                'detail': 'Prefix "{}" is not a recognised Karnataka EPIC code.'.format(prefix),
-                'value': voterid,
-            })
-        dup = col_2025.count_documents({'$or': [{'Epic NO': voterid}, {'Epic No': voterid}, {'EPIC No': voterid}]})
-        if dup > 1:
-            suspicious.append({
-                'flag': 'DUPLICATE_EPIC', 'label': 'Duplicate EPIC',
-                'detail': 'EPIC "{}" appears {} times in the 2025 roll.'.format(voterid, dup),
-                'value': dup,
-            })
-    if house:
-        t25 = col_2025.count_documents({'House No': house})
-        t02 = col_2002.count_documents({'House / Flat No': house})
-        net = t25 - t02
-        if net > 5:
-            suspicious.append({
-                'flag': 'HOUSE_FLOOD', 'label': 'House Overcrowding',
-                'detail': 'House {}: 2002 had {}, 2025 has {} (+{} entries).'.format(house, t02, t25, net),
-                'value': net,
-            })
-
-    def _token_coverage(tokens, candidate_name):
-        """How many search tokens appear (as substring) in the candidate name."""
-        cn = candidate_name.upper()
-        return sum(1 for t in tokens if t.upper() in cn)
-
-    # ── Score suggestions_2002 from pre-fetched _raw02 ───────────────────────────
-    has_name  = bool(name)
-    has_house = bool(house)
-    has_rel   = bool(relation)
-    has_epic  = bool(voterid)
-
-    suggestions_2002 = []
-    _scored02 = []
-    for doc in _raw02:
-        flat = _flat_2002(doc)
-        n_sc = _name_score(name, flat['name'])         if has_name else 0.0
-        r_sc = _name_score(relation, flat['relation']) if has_rel  else 0.0
-        h_ok = (flat['house'].upper() == house.upper()) if has_house else False
-        e_ok = bool(has_epic and flat['voterid'] and flat['voterid'].upper() == voterid.upper())
-
-        # ── Token coverage: how many search tokens appear as substrings in candidate name ──
-        cov02        = _token_coverage(_name_tokens_list, flat['name']) if (_name_tokens_list and has_name) else 0
-        total_toks02 = len(_name_tokens_list)
-        full_cov02   = (total_toks02 > 0 and cov02 == total_toks02)
-
-        # ── First-word prefix bonus ────────────────────────────────────────────────
-        # "VEDA VYASA KAMATH" → first word "VEDA" starts with query "VEDA" → bonus.
-        # "SHRIMATHI VEDA VATHI" → first word "SHRIMATHI" ≠ "VEDA" → NO bonus.
-        # This correctly separates records where the query matches the primary name token
-        # from records where the query appears as a secondary/middle word.
-        _cand_words02 = flat['name'].upper().split() if flat['name'] else []
-        # Leading-word check: ALL query tokens must be prefixes of the corresponding
-        # positional word in the candidate (query token 0 → candidate word 0, etc.)
-        _first_word_pfx02 = bool(
-            _name_tokens_list and _cand_words02 and
-            _cand_words02[0].startswith(_name_tokens_list[0].upper())
-        )
-        # Fallback any-word prefix (weaker — any word in candidate starts with token)
-        _any_word_pfx02 = bool(_name_tokens_list and any(
-            w.startswith(_name_tokens_list[0].upper()) for w in _cand_words02
-        ))
-        _full_pfx02 = _first_word_pfx02   # used for bonus — only reward leading match
-
-        # Bonus: first word of candidate starts with query's first token → strong signal.
-        # Multi-token full substring coverage keeps 15 pt bonus unchanged.
-        coverage_bonus02 = (15.0 if (total_toks02 > 1 and full_cov02)  else
-                            10.0 if _first_word_pfx02                   else
-                             4.0 if _any_word_pfx02                     else 0.0)
-
-        # ── Relation quality score — used as a fine-grained tiebreaker ────────────
-        # When multiple records tie on flag count + prefix rank, the one whose relation
-        # most closely matches the query floats to the top.
-        # Scale: 0 at r_sc=60 threshold, up to 10 pts at r_sc=100.
-        _rel_quality02 = max(0.0, (r_sc - 60) / 4.0) if (has_rel and r_sc >= 60) else 0.0
-
-        # ── Composite relevance score ─────────────────────────────────────────────
-        if has_name and has_house and has_rel:
-            comp = 0.55*n_sc + 0.25*r_sc + 0.20*(100.0 if h_ok else 0.0) + coverage_bonus02
-        elif has_name and has_house:
-            comp = 0.70*n_sc + 0.30*(100.0 if h_ok else 0.0) + coverage_bonus02
-        elif has_name and has_rel:
-            comp = 0.60*n_sc + 0.40*r_sc + coverage_bonus02
-        elif has_name:
-            comp = min(100.0, n_sc + coverage_bonus02)
-        elif has_house:
-            comp = 100.0
-        elif has_rel:
-            comp = r_sc
-        else:
-            comp = 100.0 if e_ok else 0.0
-        if e_ok: comp = max(comp, 95.0)
-
-        # Gate: must have at least partial token coverage, EPIC match, or house match
-        if has_name and n_sc < 20 and cov02 == 0 and not e_ok and not h_ok: continue
-        # Relation-only gate: accept anything with even partial relation similarity
-        _rel_gate = 20 if _relation_only_search else 30
-        if has_rel and not has_name and r_sc < _rel_gate and not e_ok: continue
-
-        matched_by = []
-        if e_ok:                                                        matched_by.append('voterid')
-        # 'name' flag: good fuzzy score, full substring coverage, or full prefix coverage
-        if has_name and (n_sc >= 60 or full_cov02 or _full_pfx02):     matched_by.append('name')
-        elif has_name and cov02 > 0:                                     matched_by.append('partial')
-        if has_house and h_ok:                                           matched_by.append('house')
-        _rel_match_threshold = 35 if _relation_only_search else 60
-        if has_rel and r_sc >= _rel_match_threshold:
-            # Token-coverage guard: for multi-token relation queries, strictly
-            # more than half the tokens must appear in the candidate relation.
-            _rel_toks02 = [t for t in relation.split() if len(t) >= 2]
-            _cand_rel02 = flat.get('relation', '') or ''
-            if len(_rel_toks02) >= 2:
-                _rel_cov02 = sum(1 for t in _rel_toks02 if t in _cand_rel02)
-                _rel_ok02 = _rel_cov02 / len(_rel_toks02) > 0.5
-            else:
-                _rel_ok02 = True
-            if _rel_ok02:
-                matched_by.append('relation')
-            elif _relation_only_search:
-                matched_by.append('partial')
-
-        _scored02.append({
-            'comp':        comp,
-            'flat':        flat,
-            'doc':         doc,
-            # prefix_rank: 2=first-word prefix, 1=any-word prefix, 0=no prefix
-            # Used as sort tiebreaker between records with same flag count + comp score.
-            'prefix_rank':   2 if _first_word_pfx02 else (1 if _any_word_pfx02 else 0),
-            'rel_quality':   _rel_quality02,
-            'field_scores': {
-                'name':     round(n_sc) if has_name  else 0,
-                'relation': round(r_sc) if has_rel   else 0,
-                'house':    100 if h_ok and has_house else 0,
-                'voterid':  100 if e_ok else 0,
-            },
-            'matched_by': matched_by,
-        })
-
-    # Sort: (1) most matched fields, (2) first-word prefix rank, (3) relation quality, (4) composite score
-    _scored02.sort(key=lambda x: (
-        -len([f for f in x['matched_by'] if f != 'partial']),
-        -x['prefix_rank'],
-        -x['rel_quality'],
-        -x['comp'],
-    ))
-    _seen_sigs02 = set()
-    for item in _scored02[:100]:
-        f   = item['flat']
-        doc = item['doc']
-        sig = (f['name'], f['house'])
-        if sig in _seen_sigs02: continue
-        _seen_sigs02.add(sig)
-        suggestions_2002.append({
-            'name':         f['name'],
-            'relation':     f['relation'],
-            'house':        f['house'],
-            'gender':       f['gender'],
-            'age':          f['age'],
-            'voterid':      f['voterid'],
-            'booth':        str(doc.get('Booth No', doc.get('Part No',''))).strip(),
-            'serial':       str(doc.get('Serial No','')).strip(),
-            'score':        round(item['comp']),
-            'source':       'mongodb',
-            'field_scores': item['field_scores'],
-            'matched_by':   item['matched_by'],
-            'prefix_rank':  item['prefix_rank'],
-            'rel_quality':  item['rel_quality'],
-        })
-
-    suggestions_2002.sort(key=lambda x: (
-        -len([f for f in x.get('matched_by',[]) if f != 'partial']),
-        -x.get('prefix_rank', 0),
-        -x.get('rel_quality', 0),
-        -x['score'],
-    ))
-    suggestions_2002 = suggestions_2002[:100]
-
-    # ── Score similar_2025 from pre-fetched _raw25 ────────────────────────────────────
-    similar_2025 = []
-    _seen25_epics = {r25.get('voterid','')} if in_2025 else set()
-    _conf25_epic  = r25.get('voterid','') if in_2025 else ''
-
-    def _flags25(rn, rr, rh, re_):
-        flags = []
-        if voterid and re_ and voterid.upper() == re_.upper():
-            flags.append('voterid')
-        if name and len(name) >= 2:
-            full_sc = _name_score(name, rn)
-            # Token coverage: every search token found in candidate name
-            cov = _token_coverage(_name_tokens_list, rn) if _name_tokens_list else 0
-            total_toks = len(_name_tokens_list)
-            if full_sc >= 60 or (total_toks > 0 and cov == total_toks):
-                # All tokens found OR fuzzy score good: mark as 'name' match
-                flags.append('name')
-            elif total_toks > 0 and cov > 0:
-                # Partial token coverage: at least one token matched
-                flags.append('partial')
-        if house and rh and (rh.upper() == house.upper() or rh.upper().startswith(house.upper())):
-            flags.append('house')
-        if relation and len(relation) >= 2:
-            # For relation-only searches use a lower threshold (35) so transliteration
-            # variants like VAMANA / VAMAN don't fall below the gate entirely.
-            _rel_threshold = 35 if _relation_only_search else 60
-            if _name_score(relation, rr) >= _rel_threshold:
-                # Token-coverage guard: for multi-token relation queries, strictly
-                # more than half the tokens must appear in the candidate relation.
-                # Prevents a shared surname ("KAMATH") from flagging unrelated people.
-                _rel_toks25 = [t for t in relation.split() if len(t) >= 2]
-                if len(_rel_toks25) >= 2:
-                    _rel_cov25 = sum(1 for t in _rel_toks25 if t in (rr or ''))
-                    _rel_ok25 = _rel_cov25 / len(_rel_toks25) > 0.5
-                else:
-                    _rel_ok25 = True  # single-token query — trust the score
-                if _rel_ok25:
-                    flags.append('relation')
-                elif _relation_only_search:
-                    flags.append('partial')
-        return flags
-
-    _scored25 = []
-    for d in _raw25:
-        # Use _flat_2025 so field-name aliases (Relative Name / Relation Name,
-        # Epic No / Epic NO) are resolved the same way throughout.
-        _f25     = _flat_2025(d)
-        rn  = _f25['name']
-        rr  = _f25['relation']
-        rh  = _f25['house']
-        re_ = _f25['voterid']
-        flags = _flags25(rn, rr, rh, re_)
-        if not flags: continue
-        n_sc25 = _name_score(name, rn)     if name     else 0.0
-        r_sc25 = _name_score(relation, rr) if relation else 0.0
-        # Boost score for full token coverage (all search words found in name)
-        cov25 = _token_coverage(_name_tokens_list, rn) if _name_tokens_list else 0
-        total_toks25 = len(_name_tokens_list)
-        coverage_bonus = 15.0 if (total_toks25 > 1 and cov25 == total_toks25) else 0.0
-        if name and relation:
-            _c25 = 0.60*n_sc25 + 0.40*r_sc25 + coverage_bonus
-        elif name:
-            _c25 = min(100.0, n_sc25 + coverage_bonus)
-        elif relation:
-            _c25 = r_sc25
-        else:
-            _c25 = 100.0
-        # Downrank partial matches so clean matches surface first
-        if 'name' not in flags and 'partial' in flags:
-            _c25 = min(_c25, 55.0)
-        _scored25.append((len([f for f in flags if f != 'partial']), _c25, {
-            'name': rn, 'relation': rr, 'house': rh, 'voterid': re_,
-            'gender': _f25['gender'],
-            'age':    _f25['age'],
-            'booth':  _f25['booth'],
-            'part':   _f25['ward'],
-            'score':  round(min(100.0, _c25)),
-            'matched_by': flags,
-            'mapping_status':           _f25['mapping_status'],
-            'serial':                   _f25['serial'],
-            'ward_name':                _f25['ward_name'],
-            'community':                _f25['community'],
-            'category':                 _f25['category'],
-            'ward_classification':      _f25['ward_classification'],
-            'risk_status':              _f25['risk_status'],
-            'action_priority':          _f25['action_priority'],
-            'poll_status_2023':         _f25['poll_status_2023'],
-            'religion':                 _f25['religion'],
-            'section_name':             _f25['section_name'],
-            'polling_station_name':     _f25['polling_station_name'],
-            'polling_station_address':  _f25['polling_station_address'],
-            'voter_address':            _f25['voter_address'],
-        }))
-
-    _scored25.sort(key=lambda x: (-x[0], -x[1]))
-    for _, _, rec in _scored25:
-        epic = rec['voterid']
-        if epic and epic in _seen25_epics: continue
-        if _conf25_epic and epic == _conf25_epic: continue
-        _seen25_epics.add(epic)
-        similar_2025.append(rec)
-        if len(similar_2025) >= 100: break
-
-    _response_data = {
-        'success':    True,
-        'results':    results,
-        'suspicious': suspicious,
-        'changes':    changes,
-        'stored':     False,
-        'in_2025':    in_2025,
-        'in_2002':    in_2002,
-        'similar_2025': similar_2025,
-        'suggestions_2002': suggestions_2002,
-        'record_2002': {
-            'name':     r02.get('name',     ''),
-            'relation': r02.get('relation', ''),
-            'house':    r02.get('house',    ''),
-            'gender':   r02.get('gender',   ''),
-            'age':      r02.get('age',      ''),
-            'voterid':  r02.get('voterid',  ''),
-            'booth':    r02.get('booth',    ''),
-        } if in_2002 else {},
-        'record_2025': {
-            'name':           r25.get('name',           ''),
-            'relation':       r25.get('relation',       ''),
-            'house':          r25.get('house',          ''),
-            'gender':         r25.get('gender',         ''),
-            'age':            r25.get('age',            ''),
-            'voterid':        r25.get('voterid',        ''),
-            'booth':          r25.get('booth',          ''),
-            'ward':           r25.get('ward',           ''),
-            'mapping_status': r25.get('mapping_status', ''),
-        } if in_2025 else {},
-    }
+    try:
+        _response_data = {'success': True, **_dk_run_check_preview(
+            voterid, name, house, relation, constituency,
+            name_only_search=_name_only_search, relation_only_search=_relation_only_search,
+        )}
+    except RuntimeError as e:
+        # Elasticsearch not reachable/configured — fail clearly rather than
+        # silently falling back to stale Mangalore-South-only data.
+        return _sir_cors(request, JsonResponse({'success': False, 'message': str(e)}, status=503))
     # Cache the result — persists to MongoDB so it survives server restarts/sleep
     _sir_cache_set(_sir_cache_key, _response_data)
     return _sir_cors(request, JsonResponse(_response_data))
@@ -5778,6 +6044,42 @@ def api_sir_bulk(request):
 
     return JsonResponse({'success': True, 'processed': processed,
                          'errors': errors, 'total': processed + errors})
+
+
+# ─── DK SIR — Elasticsearch index sync (admin only) ───────────────────────────
+# Rebuilds the DK-wide voters_2025 / voters_2002 ES indices from the DK Mongo
+# collections (DK_SIR_MONGO_COL_2025 / DK_SIR_MONGO_COL_2002). Run this once
+# to bootstrap the indices, and again any time the underlying DK Mongo data
+# changes — api_check_sir / _run_sir_analysis read from ES, not Mongo
+# directly, so they won't see new DK Mongo data until this has been run.
+# NOTE: api_sir_bulk above still iterates the OLD legacy Mangalore-South-only
+# collections ('2025' / '2002') — it was intentionally left untouched rather
+# than pointed at DK-wide data, since a synchronous full-collection scan over
+# what could be 1M+ district-wide records would very likely time out the
+# request; that would need a background task queue (Celery/RQ) first, which
+# is out of scope here.
+@require_http_methods(['POST'])
+@_require_superuser
+def api_sir_es_sync(request):
+    try:
+        body = json.loads(request.body or b'{}')
+    except Exception:
+        body = {}
+    timeline = body.get('timeline', 'both')
+    force    = bool(body.get('force', False))
+    timelines = ['2025', '2002'] if timeline == 'both' else [timeline]
+    if any(t not in ('2025', '2002') for t in timelines):
+        return JsonResponse({'success': False, 'message': "timeline must be '2025', '2002', or 'both'"}, status=400)
+    results = []
+    try:
+        for t in timelines:
+            results.append(_dk_sync_timeline(t, force=force))
+    except RuntimeError as e:
+        return JsonResponse({'success': False, 'message': str(e)}, status=503)
+    except Exception as e:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(e)}, status=500)
+    return JsonResponse({'success': True, 'synced': results})
 
 
 # ─── UPDATE VOTER ─────────────────────────────────────────────────────────────
