@@ -3842,6 +3842,19 @@ def _dk_name_clause(field, value, expand_variants=False):
     return {'bool': {'should': should, 'minimum_should_match': 1}}
 
 
+def _dk_single_field_clause(field, value):
+    """Wraps _dk_field_clause_tiers' exact/search/prefix/fuzzy tiers into
+    exactly ONE should-item, same as _dk_name_clause does for voter_name/
+    relation_name. Without this, a field with multiple internal tiers
+    (house/constituency) contributes multiple raw items to the outer
+    should list instead of one — which breaks _dk_find_voter's AND-style
+    lookup below, since minimum_should_match is set to the number of
+    FIELDS supplied, not the number of raw ES clauses. Mirrors how the
+    original search_engine.py's SIRQueryBuilder.build() wraps every
+    field (including door_no) through the same _name_clause helper."""
+    return {'bool': {'should': _dk_field_clause_tiers(field, value), 'minimum_should_match': 1}}
+
+
 def _dk_candidate_query(voterid='', name='', relation='', house='', constituency='', size=DK_RESULT_SIZE):
     """Broad OR-recall candidate query — mirrors the old module's Phase 3/4
     'fetch everything plausible, score in Python' philosophy, just retrieving
@@ -3854,9 +3867,9 @@ def _dk_candidate_query(voterid='', name='', relation='', house='', constituency
     if relation:
         should.append(_dk_name_clause('relation_name', relation, expand_variants=True))
     if house:
-        should.extend(_dk_field_clause_tiers('door_no', house))
+        should.append(_dk_single_field_clause('door_no', house))
     if constituency:
-        should.extend(_dk_field_clause_tiers('constituency', constituency))
+        should.append(_dk_single_field_clause('constituency', constituency))
     if not should:
         return None
     return {'query': {'bool': {'should': should, 'minimum_should_match': 1}}, 'size': size}
