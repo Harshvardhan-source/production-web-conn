@@ -6081,6 +6081,7 @@ def api_sir_bulk(request):
 # what could be 1M+ district-wide records would very likely time out the
 # request; that would need a background task queue (Celery/RQ) first, which
 # is out of scope here.
+@csrf_exempt
 @require_http_methods(['POST'])
 @_require_superuser
 def api_sir_es_sync(request):
