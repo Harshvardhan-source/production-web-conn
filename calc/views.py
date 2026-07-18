@@ -193,10 +193,20 @@ except ImportError:
 # still start (and every non-SIR endpoint still work) even if the package or
 # the cluster isn't reachable at import time; SIR search functions degrade
 # to an explicit error rather than crashing the whole process.
+#
+# NOTE: catches Exception, not just ImportError. A version-mismatched
+# elasticsearch package (e.g. against urllib3/elastic-transport) can throw
+# something other than a clean ImportError at import time — if that happens
+# uncaught, it crashes THIS ENTIRE FILE's import, which takes down every
+# view in the app (not just SIR ones), since Django imports views.py once
+# as a whole module. This guard is what keeps a bad elasticsearch install
+# from being a whole-app outage instead of a SIR-search-only degradation.
 try:
     from elasticsearch import Elasticsearch as _Elasticsearch
     _ELASTICSEARCH_PKG_AVAILABLE = True
-except ImportError:
+except Exception as _e:
+    import logging as _logging
+    _logging.getLogger('views').error('[DB] elasticsearch package import failed: %s', _e)
     _ELASTICSEARCH_PKG_AVAILABLE = False
 
 # ── 2002 voter list — loaded from local xlsx (backend/2002.xlsx) ──────────────
