@@ -1591,6 +1591,221 @@ def api_large_families(request):
         return JsonResponse({'success': False, 'message': str(exc)}, status=500)
  
 
+# ─── FAMILY SIZE ANALYTICS (2025) ───────────────────────────────────────────────
+# GET /api/family-size-analytics/
+#
+# Mirrors the "2.6 Family size" report section:
+#   2.6.1  Assembly-wide family size distribution
+#   2.6.2  Ward-wise family size distribution
+#   2.6.3  Average family size by ward
+#   2.6.4  Ward-wise family size percent (derived client-side from 2.6.2)
+#   2.6.5  Single voters analysis at ward level
+#   2.6.6  Gender-wise single voters at ward level
+#   2.6.7  Percentage of large families (6+) by ward
+#   2.6.8  Top wards by average family size
+#
+# "Family size" = number of voter rows sharing the same House No.
+#
+# Optional query params:
+#   ?ward=25      — restrict to a single ward (still returns assembly totals
+#                    scoped to that ward so the UI can reuse the same shape)
+#   ?refresh=1    — bypass cache
+#
+# Add to urls.py:
+#   path('family-size-analytics/', views.api_family_size_analytics, name='api_family_size_analytics'),
+# ─────────────────────────────────────────────────────────────────────────────────
+
+_FAMILY_SIZE_BUCKETS = ['1', '2-3', '4-5', '6-8', '9-12', '12+']
+
+_family_size_cache     = {}   # key ('global' or ward number) → {'data': {...}, 'ts': float}
+_FAMILY_SIZE_CACHE_TTL = 600  # 10 minutes — voter roll changes infrequently
+
+
+def _family_size_bucket_stage():
+    """Shared $group accumulators for one bucket of per-house documents."""
+    return {
+        'totalFamilies': {'$sum': 1},
+        'totalMembers':  {'$sum': '$size'},
+        'singleVoters':  {'$sum': {'$cond': [{'$eq': ['$size', 1]}, 1, 0]}},
+        'singleMale':    {'$sum': {'$cond': [
+            {'$and': [{'$eq': ['$size', 1]}, {'$eq': ['$gender', 'Male']}]}, 1, 0]}},
+        'singleFemale':  {'$sum': {'$cond': [
+            {'$and': [{'$eq': ['$size', 1]}, {'$eq': ['$gender', 'Female']}]}, 1, 0]}},
+        'b_1':     {'$sum': {'$cond': [{'$eq': ['$size', 1]}, 1, 0]}},
+        'b_2_3':   {'$sum': {'$cond': [{'$and': [{'$gte': ['$size', 2]}, {'$lte': ['$size', 3]}]}, 1, 0]}},
+        'b_4_5':   {'$sum': {'$cond': [{'$and': [{'$gte': ['$size', 4]}, {'$lte': ['$size', 5]}]}, 1, 0]}},
+        'b_6_8':   {'$sum': {'$cond': [{'$and': [{'$gte': ['$size', 6]}, {'$lte': ['$size', 8]}]}, 1, 0]}},
+        'b_9_12':  {'$sum': {'$cond': [{'$and': [{'$gte': ['$size', 9]}, {'$lte': ['$size', 12]}]}, 1, 0]}},
+        'b_12p':   {'$sum': {'$cond': [{'$gte': ['$size', 13]}, 1, 0]}},
+        'large6p': {'$sum': {'$cond': [{'$gte': ['$size', 6]}, 1, 0]}},
+    }
+
+
+def _family_size_buckets_from_row(row, total_families):
+    counts = {
+        '1':    row.get('b_1', 0),
+        '2-3':  row.get('b_2_3', 0),
+        '4-5':  row.get('b_4_5', 0),
+        '6-8':  row.get('b_6_8', 0),
+        '9-12': row.get('b_9_12', 0),
+        '12+':  row.get('b_12p', 0),
+    }
+    return [
+        {
+            'group':   g,
+            'families': counts[g],
+            'percent': round((counts[g] / total_families) * 100, 2) if total_families else 0.0,
+        }
+        for g in _FAMILY_SIZE_BUCKETS
+    ]
+
+
+def _pct(num, den, digits=1):
+    return round((num / den) * 100, digits) if den else 0.0
+
+
+@require_http_methods(['GET'])
+def api_family_size_analytics(request):
+    import time as _t
+    global _family_size_cache
+
+    filter_ward   = request.GET.get('ward', '').strip()
+    force_refresh = request.GET.get('refresh') == '1'
+    cache_key     = filter_ward or 'global'
+
+    if not force_refresh:
+        cached = _family_size_cache.get(cache_key)
+        if cached and (_t.time() - cached['ts']) < _FAMILY_SIZE_CACHE_TTL:
+            return JsonResponse({'success': True, **cached['data']})
+
+    try:
+        db  = get_db()
+        col = db['2025']
+
+        base_match = {'House No': {'$exists': True, '$ne': None, '$ne': ''}}
+        if filter_ward:
+            w_int = int(filter_ward) if filter_ward.isdigit() else None
+            ward_vals = [filter_ward]
+            if w_int is not None:
+                ward_vals.append(w_int)
+            base_match['Ward No'] = {'$in': ward_vals}
+
+        pipeline = [
+            {'$match': base_match},
+            # ── Step 1: collapse to one document per house (family) ─────────
+            {'$group': {
+                '_id':       '$House No',
+                'size':      {'$sum': 1},
+                'ward_no':   {'$first': '$Ward No'},
+                'ward_name': {'$first': '$Ward Name'},
+                'gender':    {'$first': '$Gender'},
+            }},
+            # ── Step 2: fan out into ward-level and assembly-level rollups ──
+            {'$facet': {
+                'byWard': [
+                    {'$group': {
+                        '_id':      '$ward_no',
+                        'wardName': {'$first': '$ward_name'},
+                        **_family_size_bucket_stage(),
+                    }},
+                ],
+                'assembly': [
+                    {'$group': {
+                        '_id': None,
+                        **_family_size_bucket_stage(),
+                    }},
+                ],
+            }},
+        ]
+
+        raw = list(col.aggregate(pipeline, allowDiskUse=True))
+        facet = raw[0] if raw else {'byWard': [], 'assembly': []}
+
+        # ── Assembly-wide (2.6.1) ────────────────────────────────────────────
+        a_row = facet['assembly'][0] if facet['assembly'] else {}
+        a_total_families = a_row.get('totalFamilies', 0)
+        a_total_members  = a_row.get('totalMembers', 0)
+        assembly = {
+            'totalFamilies':     a_total_families,
+            'totalMembers':      a_total_members,
+            'averageFamilySize': round(a_total_members / a_total_families, 2) if a_total_families else 0.0,
+            'buckets':           _family_size_buckets_from_row(a_row, a_total_families),
+            'singleVoters':      a_row.get('singleVoters', 0),
+            'singlePercent':     _pct(a_row.get('singleVoters', 0), a_total_families),
+            'largeFamilies':     a_row.get('large6p', 0),
+            'largePercent':      _pct(a_row.get('large6p', 0), a_total_families),
+            'genderSingle': {
+                'male':          a_row.get('singleMale', 0),
+                'female':        a_row.get('singleFemale', 0),
+                'na':            a_row.get('singleVoters', 0) - a_row.get('singleMale', 0) - a_row.get('singleFemale', 0),
+                'malePercent':   _pct(a_row.get('singleMale', 0),   a_row.get('singleVoters', 0)),
+                'femalePercent': _pct(a_row.get('singleFemale', 0), a_row.get('singleVoters', 0)),
+            },
+        }
+
+        # ── Ward-wise (2.6.2 – 2.6.7) ────────────────────────────────────────
+        wards = []
+        for row in facet['byWard']:
+            ward_no_raw = row.get('_id')
+            ward_no = str(ward_no_raw).strip() if ward_no_raw not in (None, '') else 'Unknown'
+            ward_name = (row.get('wardName') or '').strip() or WARD_NUM_TO_NAME.get(
+                ward_no, WARD_NUM_TO_NAME.get(
+                    str(int(ward_no)) if ward_no.isdigit() else ward_no,
+                    f'Ward {ward_no}' if ward_no != 'Unknown' else 'Unknown'
+                )
+            )
+            total_families = row.get('totalFamilies', 0)
+            total_members  = row.get('totalMembers', 0)
+            single_voters  = row.get('singleVoters', 0)
+            large_families = row.get('large6p', 0)
+            single_male    = row.get('singleMale', 0)
+            single_female  = row.get('singleFemale', 0)
+
+            wards.append({
+                'wardNumber':        ward_no,
+                'wardName':          ward_name,
+                'totalFamilies':     total_families,
+                'totalMembers':      total_members,
+                'averageFamilySize': round(total_members / total_families, 2) if total_families else 0.0,
+                'buckets':           _family_size_buckets_from_row(row, total_families),
+                'singleVoters':      single_voters,
+                'singlePercent':     _pct(single_voters, total_families),
+                'singleMale':        single_male,
+                'singleFemale':      single_female,
+                'singleMalePercent':   _pct(single_male,   single_voters),
+                'singleFemalePercent': _pct(single_female, single_voters),
+                'largeFamilies':     large_families,
+                'largePercent':      _pct(large_families, total_families),
+            })
+
+        # Main table order: numeric ward number ascending, 'Unknown' last
+        wards_by_number = sorted(
+            wards, key=lambda w: (w['wardNumber'] == 'Unknown',
+                                   int(w['wardNumber']) if w['wardNumber'].isdigit() else 0,
+                                   w['wardNumber'])
+        )
+
+        # Top wards by average family size (2.6.7)
+        top_wards_by_avg = sorted(
+            [w for w in wards if w['totalFamilies'] > 0],
+            key=lambda w: w['averageFamilySize'], reverse=True
+        )
+
+        result = {
+            'assembly':        assembly,
+            'wards':           wards_by_number,
+            'topWardsByAvg':   top_wards_by_avg[:10],
+            'wardScope':       filter_ward or None,
+        }
+
+        _family_size_cache[cache_key] = {'data': result, 'ts': _t.time()}
+        return JsonResponse({'success': True, **result})
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+
+
 # ─── COMMUNITY RECORDS (2025_cst_com_hmc) ───────────────────────────────────────
 
 @require_http_methods(['GET'])

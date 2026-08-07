@@ -58,6 +58,7 @@ urlpatterns = [
     path('update-voter/',            views.api_update_voter,       name='api_update_voter'),
     path('update-survey/',           views.api_update_survey,      name='api_update_survey'),
     path('large-families/',          views.api_large_families,     name='api_large_families'),
+    path('family-size-analytics/',   views.api_family_size_analytics, name='api_family_size_analytics'),
 
     # ── Community Records (2025_cst_com_hmc) ────────────────────────────────────
     path('community-records/',       views.api_community_records,       name='api_community_records'),
