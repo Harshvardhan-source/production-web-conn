@@ -6121,6 +6121,19 @@ def api_wards(request):
 @csrf_exempt
 @require_http_methods(['POST', 'OPTIONS'])
 def api_upload_voter_list(request):
+    """
+    Streams the uploaded CSV/XLSX straight into MongoDB in small batches instead
+    of materialising the whole file in memory. The old implementation read the
+    entire file into bytes, then into a pandas DataFrame, then into a Python
+    list of dicts — three full copies alive at once, which is what was causing
+    the Render free-tier instance (512MB RAM) to OOM-crash on larger uploads.
+
+    CSV path uses pandas' native chunked reader (chunksize=BATCH_SIZE), so at
+    most one batch's worth of rows is ever in memory.
+
+    XLSX path uses openpyxl in read_only streaming mode (no pandas involved),
+    which reads rows directly off disk instead of loading the whole workbook.
+    """
     if request.method == 'OPTIONS':
         return JsonResponse({})
 
@@ -6132,34 +6145,60 @@ def api_upload_voter_list(request):
         name = uploaded.name.lower()
         print(f"Reading file: {uploaded.name}, size: {uploaded.size/1024/1024:.1f} MB")
 
-        import io
-        file_bytes = uploaded.read()
+        db         = get_db()
+        coll       = db['2025']
+        BATCH_SIZE = 2000   # kept small deliberately — peak memory ≈ one batch, not the file
+        inserted   = 0
+        total_rows = 0
 
         if name.endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(file_bytes), low_memory=False, dtype=str)
+            # pandas streams the file itself (chunksize) — `uploaded` is a
+            # file-like object, never read into a single bytes blob.
+            for chunk in pd.read_csv(uploaded, low_memory=False, dtype=str, chunksize=BATCH_SIZE):
+                chunk = chunk.where(pd.notnull(chunk), None)
+                batch = chunk.to_dict(orient='records')
+                total_rows += len(batch)
+                if batch:
+                    coll.insert_many(batch, ordered=False)
+                    inserted += len(batch)
+                    print(f"  Inserted {inserted:,} records so far...")
+                del chunk, batch
+
         elif name.endswith(('.xls', '.xlsx')):
-            df = pd.read_excel(io.BytesIO(file_bytes), dtype=str, engine='openpyxl')
+            from openpyxl import load_workbook
+            wb = load_workbook(uploaded, read_only=True, data_only=True)
+            try:
+                ws = wb.active
+                rows_iter = ws.iter_rows(values_only=True)
+                header = next(rows_iter, None)
+                if not header:
+                    return JsonResponse({'success': False, 'message': 'File is empty.'}, status=400)
+                header = [str(h).strip() if h is not None else f'col_{i}' for i, h in enumerate(header)]
+
+                batch = []
+                for row in rows_iter:
+                    if row is None or all(v is None for v in row):
+                        continue
+                    doc = {header[i]: (None if v is None else str(v))
+                           for i, v in enumerate(row) if i < len(header)}
+                    batch.append(doc)
+                    total_rows += 1
+                    if len(batch) >= BATCH_SIZE:
+                        coll.insert_many(batch, ordered=False)
+                        inserted += len(batch)
+                        print(f"  Inserted {inserted:,} records so far...")
+                        batch = []
+                if batch:
+                    coll.insert_many(batch, ordered=False)
+                    inserted += len(batch)
+            finally:
+                wb.close()
+
         else:
             return JsonResponse({'success': False, 'message': 'Unsupported format. Use CSV or .xlsx'}, status=400)
 
-        if df.empty:
+        if total_rows == 0:
             return JsonResponse({'success': False, 'message': 'File is empty.'}, status=400)
-
-        df = df.where(pd.notnull(df), None)
-        records = df.to_dict(orient='records')
-        total   = len(records)
-        print(f"Total records to insert: {total:,}")
-
-        db         = get_db()
-        coll       = db['2025']
-        BATCH_SIZE = 5000
-        inserted   = 0
-
-        for i in range(0, total, BATCH_SIZE):
-            batch = records[i : i + BATCH_SIZE]
-            coll.insert_many(batch, ordered=False)
-            inserted += len(batch)
-            print(f"  Inserted {inserted:,}/{total:,} records...")
 
         print(f"Upload complete: {inserted:,} records inserted.")
         return JsonResponse({
