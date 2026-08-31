@@ -1,7 +1,10 @@
 from pathlib import Path
 import os
 
+from dotenv import load_dotenv
+
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / '.env')
 
 SECRET_KEY = 'django-insecure-r6-h00_g4!pl4txejr5#$@zsg$p8bs^2yqs6rjt_v4-lm9xir2'
 DEBUG = True
@@ -18,6 +21,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'corsheaders',
     'calc',
+    'socialintel',
     'whitenoise.runserver_nostatic',
 ]
 
@@ -133,3 +137,8 @@ ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
 # ── GCS ───────────────────────────────────────────────────────────────────────
 GCS_BUCKET_NAME      = os.getenv('GCS_BUCKET_NAME')
 GCS_CREDENTIALS_JSON = os.getenv('GCS_CREDENTIALS_JSON')
+
+# ── Social Intelligence module ─────────────────────────────────────────────────
+# Optional: without it, the YouTube connector is skipped and the rest of the
+# module (news RSS + demo data) still works.
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY', '')
