@@ -73,6 +73,7 @@ def fetch(keywords, max_results=15):
             'account_followers': stats.get('subscriberCount', 0),
             'text': f"{snippet.get('title', '')}\n{snippet.get('description', '')}".strip(),
             'media_url': f'https://www.youtube.com/watch?v={vid}',
+            'image_url': (snippet.get('thumbnails', {}).get('high') or snippet.get('thumbnails', {}).get('default') or {}).get('url', ''),
             'posted_at': snippet.get('publishedAt'),
             'tagged_accounts': [],
         })

@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pymongo.errors import DuplicateKeyError
 
 from . import db
-from .connectors import mock_social, news, youtube
+from .connectors import mock_social, news, web_search, youtube
 from .nlp import analyzer, transcribe
 
 logger = logging.getLogger('socialintel.jobs')
@@ -29,7 +29,13 @@ _LOCK_ID = 'ingestion_scheduler'
 _scheduler_thread_started = False
 _scheduler_lock = threading.Lock()
 
-KEYWORDS = ['Mangalore South constituency', 'Mangaluru South MLA', 'Mangaluru South ward']
+# Constituency + party + candidate-surname coverage. "Kamath" and "BJP" are
+# kept as surname/party-only (not a fabricated full name) — tighten this to
+# the exact candidate name whenever you have it confirmed.
+KEYWORDS = [
+    'Mangalore South constituency', 'Mangaluru South MLA', 'Mangaluru South ward',
+    'Mangaluru South BJP', 'Mangaluru South Kamath',
+]
 
 
 def _ward_names():
@@ -105,6 +111,7 @@ def run_ingestion_cycle():
     raw_posts = []
     raw_posts += _safe_fetch('youtube', lambda: youtube.fetch(KEYWORDS))
     raw_posts += _safe_fetch('news', lambda: news.fetch(KEYWORDS))
+    raw_posts += _safe_fetch('web_search', lambda: web_search.fetch(KEYWORDS))
     raw_posts += _safe_fetch('mock', lambda: mock_social.fetch(ward_names))
 
     inserted = 0

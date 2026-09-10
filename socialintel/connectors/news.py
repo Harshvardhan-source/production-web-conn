@@ -41,6 +41,7 @@ def fetch(keywords, max_results=15):
             'account_followers': 0,
             'text': entry.get('title', ''),
             'media_url': link,
+            'image_url': '',
             'posted_at': entry.get('published', None),
             'tagged_accounts': [],
         })

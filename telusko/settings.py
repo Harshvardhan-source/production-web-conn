@@ -142,3 +142,9 @@ GCS_CREDENTIALS_JSON = os.getenv('GCS_CREDENTIALS_JSON')
 # Optional: without it, the YouTube connector is skipped and the rest of the
 # module (news RSS + demo data) still works.
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY', '')
+
+# Optional: free-tier (100 queries/day) Google Programmable Search Engine —
+# https://programmablesearchengine.google.com/ — set both to enable the
+# web_search connector; without them it's skipped like YouTube above.
+GOOGLE_CSE_API_KEY = os.getenv('GOOGLE_CSE_API_KEY', '')
+GOOGLE_CSE_CX = os.getenv('GOOGLE_CSE_CX', '')

@@ -183,6 +183,64 @@ def api_social_swot(request):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Consolidated report — text + image + video clip, grouped and highlighted
+# ─────────────────────────────────────────────────────────────────────────────
+
+REPORT_CACHE_MINUTES = 30
+
+
+@require_http_methods(['GET'])
+def api_social_report(request):
+    user, err = _require_approved(request)
+    if err:
+        return err
+
+    cached = db.get_db()['social_report'].find_one({'_id': 'latest'})
+    stale = (
+        not cached
+        or cached.get('generated_at', datetime.min.replace(tzinfo=timezone.utc))
+        < datetime.now(timezone.utc) - timedelta(minutes=REPORT_CACHE_MINUTES)
+    )
+
+    if not stale:
+        return _ai_cors(request, JsonResponse({
+            'success': True,
+            'generated_at': bson_clean(cached['generated_at']),
+            'groups': cached['groups'],
+        }))
+
+    recent = list(db.posts().find({'posted_at': {'$gte': _recent_cutoff().isoformat()}}))
+    by_category = {}
+    for p in recent:
+        by_category.setdefault(p.get('category', 'other'), []).append(p)
+
+    groups = []
+    for category, posts in sorted(by_category.items(), key=lambda kv: -len(kv[1])):
+        ranked = sorted(posts, key=lambda p: p.get('outrage_score', 0), reverse=True)
+        overview = analyzer.summarize_category(category, ranked)
+        groups.append({
+            'category': category,
+            'count': len(posts),
+            'overview': overview,
+            'highlighted_cases': [bson_clean(p, keep_id=True) for p in ranked[:6]],
+        })
+
+    generated_at = datetime.now(timezone.utc)
+    db.get_db()['social_report'].update_one(
+        {'_id': 'latest'},
+        {'$set': {'generated_at': generated_at, 'groups': groups}},
+        upsert=True,
+    )
+
+    return _ai_cors(request, JsonResponse({
+        'success': True,
+        'generated_at': bson_clean(generated_at),
+        'groups': groups,
+        'is_ai_assessed': True,
+    }))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Outrage / trending
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -270,17 +328,26 @@ def api_social_sources(request):
         return err
 
     youtube_live = bool(getattr(settings, 'YOUTUBE_API_KEY', ''))
+    web_search_live = bool(getattr(settings, 'GOOGLE_CSE_API_KEY', '')) and bool(getattr(settings, 'GOOGLE_CSE_CX', ''))
     last_synced = {row['source']: row.get('last_synced') for row in db.sync_log().find({})}
 
     sources = [
         {'platform': 'youtube', 'source_type': 'live' if youtube_live else 'not_configured',
-         'note': 'YouTube Data API v3' if youtube_live else 'Set YOUTUBE_API_KEY to enable.'},
-        {'platform': 'news', 'source_type': 'live', 'note': 'Google News RSS (public, no key required).'},
-        {'platform': 'x', 'source_type': 'mock', 'note': 'Demo data — no practical free public-search API.'},
-        {'platform': 'instagram', 'source_type': 'mock', 'note': 'Demo data — no practical free public-search API.'},
-        {'platform': 'facebook', 'source_type': 'mock', 'note': 'Demo data — no practical free public-search API.'},
+         'note': 'YouTube Data API v3' if youtube_live else 'Set YOUTUBE_API_KEY to enable.',
+         '_sync_key': 'youtube'},
+        {'platform': 'news', 'source_type': 'live', 'note': 'Google News RSS (public, no key required).',
+         '_sync_key': 'news'},
+        {'platform': 'web', 'source_type': 'live' if web_search_live else 'not_configured',
+         'note': 'Google Programmable Search (free tier)' if web_search_live else 'Set GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX to enable.',
+         '_sync_key': 'web_search'},
+        {'platform': 'x', 'source_type': 'mock', 'note': 'Demo data — no practical free public-search API.',
+         '_sync_key': 'mock'},
+        {'platform': 'instagram', 'source_type': 'mock', 'note': 'Demo data — no practical free public-search API.',
+         '_sync_key': 'mock'},
+        {'platform': 'facebook', 'source_type': 'mock', 'note': 'Demo data — no practical free public-search API.',
+         '_sync_key': 'mock'},
     ]
     for s in sources:
-        s['last_synced'] = bson_clean(last_synced.get(s['platform']) or last_synced.get('mock'))
+        s['last_synced'] = bson_clean(last_synced.get(s.pop('_sync_key')))
 
     return _ai_cors(request, JsonResponse({'success': True, 'sources': sources}))

@@ -88,6 +88,7 @@ def fetch(ward_names, count=12):
             'account_followers': followers,
             'text': text,
             'media_url': '',
+            'image_url': '',
             'posted_at': posted_at.isoformat(),
             'tagged_accounts': [],
             '_category_hint': category,   # analyzer may use this as a strong prior

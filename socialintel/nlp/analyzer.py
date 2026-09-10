@@ -85,6 +85,37 @@ def analyze_post(text, category_hint=None):
         return _fallback_result()
 
 
+def summarize_category(category, posts):
+    """One-paragraph AI overview of what's happening in one category, for the
+    consolidated report. `posts` should already be classified documents."""
+    if not posts:
+        return ''
+
+    bullets = '\n'.join(f"- {p.get('summary') or (p.get('text') or '')[:140]}" for p in posts[:25])
+    system_prompt = (
+        f"You are drafting one section of a consolidated public-monitoring briefing for "
+        f"{CONSTITUENCY_NAME} constituency, covering the '{category}' category. Given the "
+        "bullet points below (already-classified public posts/news), write ONE plain-language "
+        "paragraph (3-5 sentences) summarising the overall pattern — what's happening, how "
+        "serious it looks, and whether it's escalating. This is AI-assisted triage for a "
+        "campaign/administrative team, not a factual verdict on any individual. Return plain "
+        "text only, no markdown, no JSON."
+    )
+    try:
+        client = _get_anthropic()
+        message = client.messages.create(
+            model=MODEL,
+            max_tokens=220,
+            system=system_prompt,
+            messages=[{'role': 'user', 'content': bullets}],
+            timeout=20.0,
+        )
+        return ''.join(b.text for b in message.content if hasattr(b, 'text')).strip()
+    except Exception as exc:
+        logger.warning('[analyzer] category summary failed for %s: %s', category, exc)
+        return ''
+
+
 def synthesize_swot(perspective, classified_posts):
     """Roll up recent classified posts into a 2x2 SWOT board for one
     perspective ("political" or "administrative") using Claude."""
