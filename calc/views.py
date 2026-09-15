@@ -5156,6 +5156,85 @@ def api_sir_records(request):
 
 
 @csrf_exempt
+@require_http_methods(['GET', 'OPTIONS'])
+def api_sir_discrepancy_records(request):
+    """
+    GET /api/sir/discrepancy-records/
+    Drill-down for the SIR discrepancy dashboards — individual voter rows
+    behind a ward/category cell (Polled&Mapped=PM, Polled&Unmapped=PU,
+    Unpolled&Mapped=UM, Unpolled&Unmapped=UU), sourced from the pre-loaded
+    SIR_dta.voters collection (same cluster as the survey DB, different
+    database — this collection has no Category field, so PM/PU/UM/UU is
+    derived from '2023 Poll Status' x 'SIR Mapping Status' below; verified
+    against the known constituency-wide totals: PM=5209 PU=8146 UM=2282 UU=5432).
+
+    Query params: ward (Ward No, int), category (PM|PU|UM|UU), booth
+    (Booth No, int), q (free-text on Elector Name / EPIC Number),
+    page, limit (default 25, max 100).
+    """
+    if request.method == 'OPTIONS':
+        return _sir_options(request)
+
+    col = _client_survey.get_database('SIR_dta')['voters']
+
+    filt = {}
+    ward = request.GET.get('ward')
+    if ward:
+        try:
+            filt['Ward No'] = int(ward)
+        except ValueError:
+            return _sir_cors(request, JsonResponse({'success': False, 'message': 'ward must be a number.'}, status=400))
+
+    category = request.GET.get('category')
+    if category:
+        cat = category.strip().upper()
+        polled_filter   = {'2023 Poll Status': 'POLLED'}
+        unpolled_filter = {'2023 Poll Status': {'$ne': 'POLLED'}}
+        mapped_filter   = {'SIR Mapping Status': 'MAPPED'}
+        unmapped_filter = {'SIR Mapping Status': {'$ne': 'MAPPED'}}
+        cat_filters = {
+            'PM': {**polled_filter, **mapped_filter},
+            'PU': {**polled_filter, **unmapped_filter},
+            'UM': {**unpolled_filter, **mapped_filter},
+            'UU': {**unpolled_filter, **unmapped_filter},
+        }
+        if cat not in cat_filters:
+            return _sir_cors(request, JsonResponse({'success': False, 'message': "category must be one of PM, PU, UM, UU."}, status=400))
+        filt.update(cat_filters[cat])
+
+    booth = request.GET.get('booth')
+    if booth:
+        try:
+            filt['Booth No'] = int(booth)
+        except ValueError:
+            return _sir_cors(request, JsonResponse({'success': False, 'message': 'booth must be a number.'}, status=400))
+
+    q = request.GET.get('q', '').strip()
+    if q:
+        filt['$or'] = [
+            {'Elector Name': {'$regex': re.escape(q), '$options': 'i'}},
+            {'EPIC Number':  {'$regex': re.escape(q), '$options': 'i'}},
+        ]
+
+    try:
+        page  = max(1, int(request.GET.get('page', 1)))
+        limit = min(100, max(1, int(request.GET.get('limit', 25))))
+    except ValueError:
+        page, limit = 1, 25
+    skip = (page - 1) * limit
+
+    total = col.count_documents(filt)
+    docs = [
+        bson_clean(d, keep_id=True) for d in
+        col.find(filt).sort([('Booth No', 1), ('Part Serial No', 1)]).skip(skip).limit(limit)
+    ]
+
+    return _sir_cors(request, JsonResponse({
+        'success': True, 'records': docs, 'total': total, 'page': page, 'limit': limit,
+    }))
+
+
+@csrf_exempt
 @require_http_methods(['POST'])
 def api_sir_suggest(request):
     """Fuzzy Excel search — uses cached DataFrame + O(1) house index."""

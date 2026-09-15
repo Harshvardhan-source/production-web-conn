@@ -53,6 +53,7 @@ urlpatterns = [
     path('sir-data/',                views.api_sir_data,           name='api_sir_data'),
     path('sir-bulk/',                views.api_sir_bulk,           name='api_sir_bulk'),
     path('sir/records/',             views.api_sir_records,        name='api_sir_records'),
+    path('sir/discrepancy-records/', views.api_sir_discrepancy_records, name='api_sir_discrepancy_records'),
     path('sir/stats/',               views.api_sir_stats,          name='api_sir_stats'),
 
     path('update-voter/',            views.api_update_voter,       name='api_update_voter'),
