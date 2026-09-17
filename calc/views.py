@@ -8531,6 +8531,99 @@ def _ai_ctx_socio_economic_data():
         return f'[Socio-Economic Data error: {e}]'
 
 
+# ── Builder 17: Social Media & News Monitoring (live, socialintel module) ────
+#
+# Lazy-imports `socialintel.db` rather than importing at module load time:
+# socialintel/views.py already imports from calc.views, so a top-level
+# `from socialintel import db` here would be a circular import. By the time
+# this function actually runs (a chat request), both modules are fully
+# loaded, so the import inside the function body resolves fine.
+
+def _ai_ctx_social_monitor():
+    """Live rollup of the public social-media/news monitoring feed —
+    sentiment, risk/outrage, category mix, top outrage posts, cached SWOT
+    boards, and connector sync status. Everything here is AI-assessed
+    triage on PUBLIC posts, not a factual verdict on any individual."""
+    try:
+        from socialintel import db as _si_db
+
+        total = _si_db.posts().count_documents({})
+        if not total:
+            return '[Social Media & News Monitoring: no posts ingested yet]'
+
+        sentiment_split = {
+            row['_id']: row['count']
+            for row in _si_db.posts().aggregate(
+                [{'$group': {'_id': '$sentiment', 'count': {'$sum': 1}}}])
+        }
+        risk_split = {
+            row['_id']: row['count']
+            for row in _si_db.posts().aggregate(
+                [{'$group': {'_id': '$risk_level', 'count': {'$sum': 1}}}])
+        }
+        category_split = {
+            row['_id']: row['count']
+            for row in _si_db.posts().aggregate(
+                [{'$group': {'_id': '$category', 'count': {'$sum': 1}}}])
+        }
+        platform_split = {
+            row['_id']: row['count']
+            for row in _si_db.posts().aggregate(
+                [{'$group': {'_id': '$platform', 'count': {'$sum': 1}}}])
+        }
+
+        top_outrage = list(
+            _si_db.posts().find({'outrage_score': {'$gt': 0}})
+            .sort('outrage_score', -1).limit(15)
+        )
+
+        lines = [
+            '=== Social Media & News Monitoring (Live — socialintel module) ===',
+            f'Total posts/items monitored: {total:,}',
+            '',
+            'Sentiment split: ' + ', '.join(f'{k}={v}' for k, v in sentiment_split.items()),
+            'Risk level split: ' + ', '.join(f'{k}={v}' for k, v in risk_split.items()),
+            'Category split: ' + ', '.join(f'{k}={v}' for k, v in category_split.items()),
+            'Platform split: ' + ', '.join(f'{k}={v}' for k, v in platform_split.items()),
+        ]
+
+        if top_outrage:
+            lines.append('\nTop outrage / highest-risk items (score, platform, ward(s), summary):')
+            for p in top_outrage:
+                wards = ','.join(p.get('wards') or []) or '-'
+                summary = (p.get('summary') or p.get('text') or '')[:140]
+                lines.append(
+                    f"  [{p.get('outrage_score', 0):>3}] {p.get('platform','?'):<10} "
+                    f"ward={wards:<12} risk={p.get('risk_level','-'):<6} {summary}"
+                )
+
+        for perspective in ('political', 'administrative'):
+            board = _si_db.swot().find_one({'perspective': perspective})
+            if board and board.get('board'):
+                b = board['board']
+                lines.append(f"\n{perspective.title()} SWOT (from live monitoring, AI-synthesised):")
+                for quadrant in ('strength', 'weakness', 'opportunity', 'threat'):
+                    items = b.get(quadrant) or []
+                    if items:
+                        lines.append(f"  {quadrant.upper()}:")
+                        for it in items[:6]:
+                            lines.append(f"    - {it}")
+
+        last_synced = {row['source']: row.get('last_synced') for row in _si_db.sync_log().find({})}
+        if last_synced:
+            lines.append('\nConnector last-synced:')
+            for src, ts in last_synced.items():
+                lines.append(f"  {src:<12}: {ts}")
+
+        lines.append(
+            '\n[All monitoring labels above are AI-assessed triage on PUBLIC posts/news, '
+            'not a factual verdict on any individual — surface accordingly.]'
+        )
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[Social Media & News Monitoring error: {e}]'
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # PARALLEL MONGO CONTEXT LOADER
 # ════════════════════════════════════════════════════════════════════════════════
@@ -9021,6 +9114,15 @@ _RAG_INTENT_MAP = {
         'mongo': ['SWOT Query Stack (NewQueryStack1)', '2023 Polling Data'],
         'files': [],
     },
+    'social_monitor': {
+        'kw': ['social media', 'social monitoring', 'monitoring', 'outrage',
+               'sentiment', 'viral', 'trending', 'news', 'youtube', 'instagram',
+               'facebook', 'twitter', ' x post', 'complaint', 'complaints',
+               'public opinion', 'perception', 'reputation', 'buzz', 'chatter',
+               'what people are saying', 'negative press', 'controversy'],
+        'mongo': ['Social Media & News Monitoring (Live)'],
+        'files': [],
+    },
 }
 
 # All existing mongo context builder labels → callable map
@@ -9041,6 +9143,7 @@ _RAG_MONGO_ALL = {
     '2002 Voter Roll':                         _ai_ctx_voter_roll_2002,
     'Genuine Voters (SIR Verified)':           _ai_ctx_genuine_voters,
     'Socio-Economic Data (Data collection)':   _ai_ctx_socio_economic_data,
+    'Social Media & News Monitoring (Live)':   _ai_ctx_social_monitor,
 }
 
 
@@ -9670,6 +9773,8 @@ You have access to LIVE data from MongoDB (aggregated summaries in the MONGODB D
 | SIR_NotFound | SIR: voters not found |
 | SIR_Suspicious | SIR: suspicious entries |
 | genuine_voters | SIR: confirmed genuine voters |
+| social_posts (SocialIntelDB) | Live public social-media/news monitoring: sentiment, risk level, outrage score, category, ward tags, per-platform SWOT |
+| social_swot (SocialIntelDB) | AI-synthesised political & administrative SWOT boards rolled up from the live monitoring feed |
 
 ## Data Files (Anthropic Files API — full content available as attached documents)
 
@@ -9708,6 +9813,31 @@ Each file is structured with per-sheet headers:
 - SIR / BLO mapping % → **Mangaluru_Election_Strategy_Report** (SIR & VOTER STATUS sheet)
 - Ward Strength Index / WSI → **BJP_Political_Intelligence_System** (WSI SCORE sheet)
 - Flip targets → **Mangaluru_FULLSCALE** (FLIP TARGETS sheet)
+- Social media / news buzz, outrage, public sentiment, viral posts, complaints → **social_posts / social_swot (SocialIntelDB, live)** — this is real-time, separate from the historical election files above
+
+## How You Reason — Multi-Level Political Lens (apply on every substantive answer)
+
+You are not just a data lookup — you read, analyse, understand, predict, and advise. On any
+question beyond small talk, blend all four levels below into one coherent answer instead of
+picking just one (skip a level only if it's genuinely not relevant to the question):
+
+1. **MLA / strategic level** — the big picture: constituency-wide trends, resource allocation
+   priorities, which wards decide the election, medium/long-term positioning.
+2. **Corporator / ward level** — what this means for one ward or a handful of wards: local
+   issues, ward-specific risks and openings, what a corporator should be telling residents.
+3. **Booth-level worker** — the operational layer: which booths need attention, turnout/voter-
+   list mechanics, what a booth agent should physically do this week.
+4. **Karyakartha / grassroots** — door-to-door, person-to-person action: which households or
+   communities to reach, what message resonates locally, how a volunteer converts insight into
+   a conversation on the ground.
+
+For every non-trivial answer: state what the data shows (analysis), what it implies (reasoning
+— why it's happening, second-order effects), what's likely next if nothing changes (prediction),
+and a concrete recommended action per relevant level above (suggestion). Always ground every
+claim in a real number, ward, or post from the data — never fabricate a figure. Flag explicitly
+when something is a prediction/inference vs. a fact directly in the data. Treat all social-media/
+news monitoring labels (sentiment, risk, outrage) as AI-assessed triage, not verified fact about
+any individual.
 
 ## Output Formats
 
