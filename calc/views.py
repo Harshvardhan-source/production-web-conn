@@ -286,6 +286,24 @@ except Exception as _e:
     _logging.getLogger('views').error('[DB] _client_main1 failed to initialise: %s', _e)
     _client_main1 = None
 
+# Generated/synthetic socio-economic primary reference — its own cluster
+# (SurveyDataBase.Generated_data, ~252k docs), supplied by the user for the
+# AI chat's socio-economic political/administrative predictions.
+_GENERATED_URL = _os.getenv(
+    'MONGODB_GENERATED_URL',
+    'mongodb+srv://ravindraacharya0512:2Dlb9csFBkM9n9Bs@cluster1.zpsv8lb.mongodb.net/?appName=Cluster1'
+)
+try:
+    _client_generated = MongoClient(
+        _GENERATED_URL,
+        maxPoolSize=5, minPoolSize=1,
+        **_MONGO_OPTS,
+    )
+except Exception as _e:
+    import logging as _logging
+    _logging.getLogger('views').error('[DB] _client_generated failed to initialise: %s', _e)
+    _client_generated = None
+
 
 def get_db():
     """Original cluster — voter rolls, SIR, 2002/2025, WardReference (pooled)."""
@@ -298,6 +316,12 @@ def get_survey_db():
     if _client_survey is None:
         raise RuntimeError('Survey MongoDB client not initialised. Check MONGODB_SURVEY_URL and server logs.')
     return _client_survey.get_database('SurveyDataBase')
+
+def get_generated_db():
+    """Generated/synthetic data cluster — Generated_data (socio-economic primary reference), DK_2025 (pooled)."""
+    if _client_generated is None:
+        raise RuntimeError('Generated-data MongoDB client not initialised. Check MONGODB_GENERATED_URL and server logs.')
+    return _client_generated.get_database('SurveyDataBase')
 
 def get_db1():
     """Original cluster — MainB / CollDB (pooled)."""
@@ -8531,6 +8555,130 @@ def _ai_ctx_socio_economic_data():
         return f'[Socio-Economic Data error: {e}]'
 
 
+# ── Builder 16b: Socio-Economic PRIMARY Reference (SurveyDataBase.Generated_data, generated-data cluster) ──
+#
+# ~252k docs, supplied by the user — explicitly GENERATED/SYNTHETIC data for
+# modelling, not real citizen records. This is the AI's primary, always-loaded
+# socio-economic reference (see _rag_fetch_context, which force-includes it on
+# every message) — it's the base the model should reason from for
+# socio-economic-driven political and administrative predictions. Field names
+# below match the collection as stored (mixed camelCase / "Title Case With
+# Spaces" — not normalised, to avoid a second multi-hundred-MB rewrite).
+
+def _ai_ctx_socioeconomic_primary():
+    try:
+        db    = get_generated_db()
+        coll  = db['Generated_data']
+        total = _safe_count(coll)
+        if not total:
+            return '[Socio-Economic Primary Reference: not loaded yet]'
+
+        agg = list(coll.aggregate([{'$facet': {
+            'by_poll_status': [
+                {'$group': {'_id': '$Poll Status 2023', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+            'by_economic': [
+                {'$group': {'_id': '$economicStatus', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}},
+            ],
+            # Turnout by economic bracket — which income class actually voted in 2023
+            'econ_x_poll': [
+                {'$match': {'economicStatus': {'$nin': [None, '']}, 'Poll Status 2023': {'$nin': [None, '']}}},
+                {'$group': {'_id': {'econ': '$economicStatus', 'poll': '$Poll Status 2023'}, 'n': {'$sum': 1}}},
+            ],
+            # Not-polled volume by ward — mobilisation opportunity ranking
+            'ward_not_polled': [
+                {'$match': {'Poll Status 2023': 'NOT POLLED'}},
+                {'$group': {'_id': '$Ward No', 'n': {'$sum': 1}}},
+                {'$sort': {'n': -1}}, {'$limit': 15},
+            ],
+            'by_community':    [{'$match': {'Community': {'$nin': [None, '']}}},
+                                 {'$group': {'_id': '$Community', 'n': {'$sum': 1}}},
+                                 {'$sort': {'n': -1}}, {'$limit': 15}],
+            'by_category':     [{'$match': {'Category': {'$nin': [None, '']}}},
+                                 {'$group': {'_id': '$Category', 'n': {'$sum': 1}}},
+                                 {'$sort': {'n': -1}}, {'$limit': 15}],
+            'by_action_priority': [{'$match': {'Action Priority': {'$nin': [None, '']}}},
+                                    {'$group': {'_id': '$Action Priority', 'n': {'$sum': 1}}},
+                                    {'$sort': {'n': -1}}],
+            'by_mapping_status':  [{'$group': {'_id': '$Mapping Status', 'n': {'$sum': 1}}},
+                                    {'$sort': {'n': -1}}],
+            'by_employment':   [{'$group': {'_id': '$employmentStatus', 'n': {'$sum': 1}}},
+                                 {'$sort': {'n': -1}}],
+            'minority_poll':   [{'$match': {'minority': 'Yes', 'Poll Status 2023': {'$nin': [None, '']}}},
+                                 {'$group': {'_id': '$Poll Status 2023', 'n': {'$sum': 1}}}],
+            'diff_abled':      [{'$match': {'differentlyAbled': 'Yes'}}, {'$count': 'n'}],
+            'sir_suspicious':  [{'$match': {'sir_suspicious': True}}, {'$count': 'n'}],
+            'avg_income':      [{'$match': {'annualIncome': {'$type': ['int', 'long', 'double']}}},
+                                 {'$group': {'_id': None, 'avg': {'$avg': '$annualIncome'}}}],
+        }}]))[0]
+
+        def _pct(n):
+            return f" ({round(n / total * 100, 1)}%)" if total else ''
+
+        def _sec(title, items):
+            if not items:
+                return []
+            out = [f'\n{title}:']
+            for r in items:
+                lbl = str(r['_id']) if r.get('_id') not in (None, '') else 'Unknown'
+                out.append(f"  {lbl:<28}: {r['n']:,}{_pct(r['n'])}")
+            return out
+
+        lines = [
+            '=== Socio-Economic PRIMARY Reference (GENERATED/SYNTHETIC data, 2025) ===',
+            f'Total records: {total:,} — this supersedes/extends the legacy Socio-Economic Data '
+            'collection and is the primary base for socio-economic-driven predictions.',
+            '[NOTE: every name/ID/address in this dataset is a generated placeholder for modelling '
+            '— not a real person. Safe to cite specific field values when explaining a prediction.]',
+        ]
+        lines += _sec('2023 Poll Status', agg.get('by_poll_status', []))
+        lines += _sec('Economic Status',  agg.get('by_economic', []))
+
+        econ_poll = agg.get('econ_x_poll', [])
+        if econ_poll:
+            pivot = {}
+            for r in econ_poll:
+                econ, poll = r['_id'].get('econ', '?'), r['_id'].get('poll', '?')
+                pivot.setdefault(econ, {})[poll] = r['n']
+            lines.append('\nTurnout by Economic Bracket (2023 poll status × economic status):')
+            for econ, polls in sorted(pivot.items()):
+                seg = ', '.join(f'{k}={v:,}' for k, v in sorted(polls.items()))
+                lines.append(f"  {econ:<8}: {seg}")
+
+        ward_np = agg.get('ward_not_polled', [])
+        if ward_np:
+            lines.append('\nTop 15 wards by NOT-POLLED volume in 2023 (mobilisation opportunity):')
+            for w in ward_np:
+                wname = WARD_NUM_TO_NAME.get(str(w['_id']), str(w['_id']))
+                lines.append(f"  Ward {str(w['_id']):>3} ({wname:<20}): {w['n']:,} not polled")
+
+        lines += _sec('Community (top 15)',        agg.get('by_community', []))
+        lines += _sec('Category (top 15)',         agg.get('by_category', []))
+        lines += _sec('Action Priority',           agg.get('by_action_priority', []))
+        lines += _sec('Ward Mapping Status',       agg.get('by_mapping_status', []))
+        lines += _sec('Employment Status',         agg.get('by_employment', []))
+
+        minority_poll = agg.get('minority_poll', [])
+        if minority_poll:
+            lines.append('\nMinority (Yes) — 2023 poll status: ' +
+                         ', '.join(f"{r['_id']}={r['n']:,}" for r in minority_poll))
+
+        da_n  = agg['diff_abled'][0]['n']     if agg.get('diff_abled')     else 0
+        sus_n = agg['sir_suspicious'][0]['n'] if agg.get('sir_suspicious') else 0
+        avg_inc = agg['avg_income'][0]['avg'] if agg.get('avg_income') else None
+        lines.append('')
+        lines.append(f'Differently Abled : {da_n:,}{_pct(da_n)}')
+        lines.append(f'SIR Suspicious    : {sus_n:,}{_pct(sus_n)}')
+        if avg_inc:
+            lines.append(f'Avg annual income : ₹{avg_inc:,.0f}')
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'[Socio-Economic Primary Reference error: {e}]'
+
+
 # ── Builder 17: Social Media & News Monitoring (live, socialintel module) ────
 #
 # Lazy-imports `socialintel.db` rather than importing at module load time:
@@ -9144,7 +9292,13 @@ _RAG_MONGO_ALL = {
     'Genuine Voters (SIR Verified)':           _ai_ctx_genuine_voters,
     'Socio-Economic Data (Data collection)':   _ai_ctx_socio_economic_data,
     'Social Media & News Monitoring (Live)':   _ai_ctx_social_monitor,
+    'Socio-Economic Primary Reference (Generated 2025)': _ai_ctx_socioeconomic_primary,
 }
+
+# Always loaded on every chat message regardless of matched intent — the user
+# has designated this generated/synthetic socio-economic dataset as the AI's
+# primary reference for political & administrative prediction.
+_RAG_ALWAYS_ON = ['Socio-Economic Primary Reference (Generated 2025)']
 
 
 def _rag_fetch_context(message: str) -> tuple:
@@ -9154,7 +9308,7 @@ def _rag_fetch_context(message: str) -> tuple:
     Returns (context_text, sources_list).
     """
     msg_lower      = message.lower()
-    needed_mongo   = []   # ordered, deduped labels
+    needed_mongo   = list(_RAG_ALWAYS_ON)   # ordered, deduped labels — force-included every time
     needed_files   = []   # ordered, deduped file keys
     matched_intents = []
 
@@ -9750,7 +9904,22 @@ _AI_CHAT_SYSTEM = """You are an expert political data analyst and constituency i
 
 **Important behavioural rule**: If the user sends a simple greeting (e.g. "hi", "hello", "thanks", "bye") or a purely conversational message, reply warmly and naturally — do NOT reference data sources, tables, charts, or MongoDB context. Reserve data analysis only for questions that actually require it.
 
-You have access to LIVE data from MongoDB (aggregated summaries in the MONGODB DATA section below) PLUS the full content of data files supplied as document attachments via Anthropic Files API. All data is real and current.
+You have access to LIVE data from MongoDB (aggregated summaries in the MONGODB DATA section below) PLUS the full content of data files supplied as document attachments via Anthropic Files API. All data is real and current, with ONE explicit exception — see "Primary Socio-Economic Reference" below.
+
+## Primary Socio-Economic Reference (ALWAYS loaded — read this first)
+
+The section below headed `=== Socio-Economic PRIMARY Reference (GENERATED/SYNTHETIC data, 2025) ===`
+is loaded into every single chat turn, not just when the user asks about it. It is GENERATED/
+SYNTHETIC modelling data (~252k records) — every name, Aadhaar number, and address in it is a
+placeholder, not a real person, and the user has explicitly authorised citing individual field
+values freely (this is unlike the live voter-roll data, which is real). Treat it as your primary
+base for reasoning about socio-economic drivers of political and administrative outcomes: use its
+2023 poll-status, economic-status, community, action-priority and ward fields to explain *why*
+turnout/sentiment patterns exist and to predict what's likely next (e.g. which economic bracket or
+ward is under-mobilised, which community segment is persuadable, which ward needs an
+administrative intervention). Cross-reference it with the live MongoDB/file data below for a
+complete picture, but always ground a prediction in this dataset's numbers when the question is
+socio-economic in nature.
 
 ## MongoDB Collections (Live Aggregated Summaries)
 
@@ -9773,8 +9942,20 @@ You have access to LIVE data from MongoDB (aggregated summaries in the MONGODB D
 | SIR_NotFound | SIR: voters not found |
 | SIR_Suspicious | SIR: suspicious entries |
 | genuine_voters | SIR: confirmed genuine voters |
-| social_posts (SocialIntelDB) | Live public social-media/news monitoring: sentiment, risk level, outrage score, category, ward tags, per-platform SWOT |
-| social_swot (SocialIntelDB) | AI-synthesised political & administrative SWOT boards rolled up from the live monitoring feed |
+| social_posts (SocialIntelDB) | Public social-media/news monitoring: sentiment, risk level, outrage score, category, ward tags, per-platform SWOT — NOTE: the paid connector APIs (YouTube/Google CSE) are not currently active, so this collection may be thin/stale. Use your web_search tool (below) to fill this gap with live results when asked about current social/news sentiment. |
+| social_swot (SocialIntelDB) | AI-synthesised political & administrative SWOT boards rolled up from the monitoring feed above — same staleness caveat applies |
+
+## Live Web Search (use this tool directly — you have real internet access)
+
+You have a `web_search` tool. Use it whenever a question needs information that isn't in the
+MongoDB data or files above — anything current: recent news, what's being said about the MLA/
+candidates/constituency right now, a scheme's latest status, a fact you're unsure of, or a topic
+the monitoring collections above don't cover because their connectors are inactive. Don't ask the
+user for permission first — just search. Prefer it over guessing or saying "I don't have that
+information." When you use it, ground your answer in what the search actually returned (cite the
+source/date inline) and be clear about what's from live search vs. from the constituency database,
+since the two can go stale at different rates. Still apply the Multi-Level Political Lens below to
+whatever you find.
 
 ## Data Files (Anthropic Files API — full content available as attached documents)
 
@@ -9876,6 +10057,24 @@ Religion: H=Hindu, M=Muslim, C=Christian.
 ## LIVE MONGODB DATA:
 {MONGO_CONTEXT}
 """
+
+# Anthropic's server-executed web search tool — no third-party API key needed
+# (unlike the socialintel connectors, which need paid YouTube/Google CSE keys
+# that aren't currently provisioned). Billed per-search through the Anthropic
+# account already in use for chat. max_uses caps searches per turn so one
+# message can't spiral into an unbounded number of calls.
+_WEB_SEARCH_TOOL = {
+    'type': 'web_search_20250305',
+    'name': 'web_search',
+    'max_uses': 5,
+    'user_location': {
+        'type': 'approximate',
+        'city': 'Mangaluru',
+        'region': 'Karnataka',
+        'country': 'IN',
+        'timezone': 'Asia/Kolkata',
+    },
+}
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -10133,8 +10332,11 @@ def api_ai_chat(request):
             max_tokens = 4096,
             system     = system_prompt,
             messages   = messages,
+            tools      = [_WEB_SEARCH_TOOL],
         )
         reply_text = ''.join(b.text for b in response.content if hasattr(b, 'text'))
+        if any(getattr(b, 'type', '') == 'web_search_tool_result' for b in response.content):
+            all_sources.append('Web:live-search')
     except Exception as e:
         traceback.print_exc()
         return _ai_err(request, f'Anthropic API error: {e}', 500)
